@@ -835,8 +835,10 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
       const auto accumulated = self->blockStyleStack.back().getCombinedBlockStyle(userAlignmentBlockStyle,
                                                                                   BlockStyle::CombineAxis::Horizontal);
       if (strcmp(name, "li") == 0) {
-        // Hanging indent: indent all wrapped lines so they align with text, not bullet.
-        const int16_t hangPx = static_cast<int16_t>(self->renderer.getLineHeight(self->fontId) * self->lineCompression);
+        // Hanging indent: indent wrapped lines to align with text after the bullet.
+        // Use actual bullet+space width so the indent matches the real rendered offset.
+        const int16_t bulletW = static_cast<int16_t>(self->renderer.getTextWidth(self->fontId, "\xe2\x80\xa2"));
+        const int16_t hangPx  = static_cast<int16_t>(bulletW + self->renderer.getSpaceWidth(self->fontId));
         auto liStyle = accumulated;
         liStyle.paddingLeft = static_cast<int16_t>(liStyle.paddingLeft + hangPx);
         liStyle.textIndent = static_cast<int16_t>(-hangPx);
