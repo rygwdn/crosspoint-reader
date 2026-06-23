@@ -273,12 +273,16 @@ void EpubReaderActivity::loop() {
       const int bookProgressPercent = clampPercent(static_cast<int>(bookProgress + 0.5f));
       startActivityForResult(std::make_unique<EpubReaderMenuActivity>(
                                  renderer, mappedInput, epub->getTitle(), currentPage, totalPages, bookProgressPercent,
-                                 SETTINGS.orientation, !currentPageFootnotes.empty()),
+                                 SETTINGS.orientation, SETTINGS.fadingFix, !currentPageFootnotes.empty()),
                              [this](const ActivityResult& result) {
-                               // Always apply orientation change even if the menu was cancelled
+                               // Always apply orientation and sunlight changes even if the menu was cancelled
                                const auto& menu = std::get<MenuResult>(result.data);
                                applyOrientation(menu.orientation);
                                toggleAutoPageTurn(menu.pageTurnOption);
+                               if (SETTINGS.fadingFix != menu.sunlightMode) {
+                                 SETTINGS.fadingFix = menu.sunlightMode;
+                                 SETTINGS.saveToFile();
+                               }
                                if (!result.isCancelled) {
                                  onReaderMenuConfirm(static_cast<EpubReaderMenuActivity::MenuAction>(menu.action));
                                }
@@ -314,6 +318,13 @@ void EpubReaderActivity::loop() {
           ignoreNextConfirmRelease = true;
           activityManager.goToSleep();
           return;
+        }
+        break;
+      case CrossPointSettings::LP_MENU_FORCE_REFRESH:
+        if (mappedInput.getHeldTime() >= ReaderUtils::BOOKMARK_HOLD_MS) {
+          pagesUntilFullRefresh = 0;
+          ignoreNextConfirmRelease = true;
+          requestUpdate();
         }
         break;
       case CrossPointSettings::LP_MENU_DISABLED:
@@ -429,6 +440,12 @@ void EpubReaderActivity::loop() {
         nextTriggered ? (SETTINGS.orientation - 1 + SETTINGS.ORIENTATION_COUNT) % SETTINGS.ORIENTATION_COUNT
                       : (SETTINGS.orientation + 1) % SETTINGS.ORIENTATION_COUNT;
     applyOrientation(newOrientation);
+    requestUpdate();
+    return;
+  }
+
+  if (longPress && SETTINGS.longPressButtonBehavior == SETTINGS.FORCE_REFRESH) {
+    pagesUntilFullRefresh = 0;
     requestUpdate();
     return;
   }

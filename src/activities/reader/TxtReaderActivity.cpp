@@ -78,6 +78,13 @@ void TxtReaderActivity::loop() {
     return;
   }
 
+  if (!fromTilt && SETTINGS.longPressButtonBehavior == SETTINGS.FORCE_REFRESH &&
+      mappedInput.getHeldTime() > ReaderUtils::SKIP_HOLD_MS) {
+    pagesUntilFullRefresh = 0;
+    requestUpdate();
+    return;
+  }
+
   if (prevTriggered && currentPage > 0) {
     currentPage--;
     requestUpdate();

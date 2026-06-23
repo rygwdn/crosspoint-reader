@@ -96,6 +96,13 @@ void XtcReaderActivity::loop() {
     return;
   }
 
+  if (!fromTilt && SETTINGS.longPressButtonBehavior == SETTINGS.FORCE_REFRESH &&
+      mappedInput.getHeldTime() > ReaderUtils::SKIP_HOLD_MS) {
+    pagesUntilFullRefresh = 0;
+    requestUpdate();
+    return;
+  }
+
   const bool skipPages = !fromTilt && SETTINGS.longPressButtonBehavior == SETTINGS.CHAPTER_SKIP &&
                          mappedInput.getHeldTime() > ReaderUtils::SKIP_HOLD_MS;
   const int skipAmount = skipPages ? 10 : 1;
