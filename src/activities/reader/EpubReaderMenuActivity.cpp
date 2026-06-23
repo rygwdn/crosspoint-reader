@@ -10,24 +10,26 @@
 EpubReaderMenuActivity::EpubReaderMenuActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
                                                const std::string& title, const int currentPage, const int totalPages,
                                                const int bookProgressPercent, const uint8_t currentOrientation,
-                                               const bool hasFootnotes)
+                                               const uint8_t currentSunlightMode, const bool hasFootnotes)
     : Activity("EpubReaderMenu", renderer, mappedInput),
       menuItems(buildMenuItems(hasFootnotes)),
       title(title),
       pendingOrientation(currentOrientation),
+      pendingSunlightMode(currentSunlightMode),
       currentPage(currentPage),
       totalPages(totalPages),
       bookProgressPercent(bookProgressPercent) {}
 
 std::vector<EpubReaderMenuActivity::MenuItem> EpubReaderMenuActivity::buildMenuItems(bool hasFootnotes) {
   std::vector<MenuItem> items;
-  items.reserve(11);
+  items.reserve(12);
   items.push_back({MenuAction::SELECT_CHAPTER, StrId::STR_SELECT_CHAPTER});
   if (hasFootnotes) {
     items.push_back({MenuAction::FOOTNOTES, StrId::STR_FOOTNOTES});
   }
   items.push_back({MenuAction::BOOKMARKS, StrId::STR_BOOKMARKS});
   items.push_back({MenuAction::ROTATE_SCREEN, StrId::STR_ORIENTATION});
+  items.push_back({MenuAction::SUNLIGHT_MODE, StrId::STR_SUNLIGHT_FADING_FIX});
   items.push_back({MenuAction::AUTO_PAGE_TURN, StrId::STR_AUTO_TURN_PAGES_PER_MIN});
   items.push_back({MenuAction::GO_TO_PERCENT, StrId::STR_GO_TO_PERCENT});
   items.push_back({MenuAction::SCREENSHOT, StrId::STR_SCREENSHOT_BUTTON});
@@ -66,19 +68,26 @@ void EpubReaderMenuActivity::loop() {
       return;
     }
 
+    if (selectedAction == MenuAction::SUNLIGHT_MODE) {
+      pendingSunlightMode = pendingSunlightMode ? 0 : 1;
+      requestUpdate();
+      return;
+    }
+
     if (selectedAction == MenuAction::AUTO_PAGE_TURN) {
       selectedPageTurnOption = (selectedPageTurnOption + 1) % pageTurnLabels.size();
       requestUpdate();
       return;
     }
 
-    setResult(MenuResult{static_cast<int>(selectedAction), pendingOrientation, selectedPageTurnOption});
+    setResult(
+        MenuResult{static_cast<int>(selectedAction), pendingOrientation, selectedPageTurnOption, pendingSunlightMode});
     finish();
     return;
   } else if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
     ActivityResult result;
     result.isCancelled = true;
-    result.data = MenuResult{-1, pendingOrientation, selectedPageTurnOption};
+    result.data = MenuResult{-1, pendingOrientation, selectedPageTurnOption, pendingSunlightMode};
     setResult(std::move(result));
     finish();
     return;
@@ -116,10 +125,10 @@ void EpubReaderMenuActivity::render(RenderLock&&) {
       [this](int index) {
         const auto value = menuItems[index].action;
         if (value == MenuAction::ROTATE_SCREEN) {
-          // Render current orientation value on the right edge of the content area.
           return I18N.get(orientationLabels[pendingOrientation]);
+        } else if (value == MenuAction::SUNLIGHT_MODE) {
+          return I18N.get(pendingSunlightMode ? StrId::STR_STATE_ON : StrId::STR_STATE_OFF);
         } else if (value == MenuAction::AUTO_PAGE_TURN) {
-          // Render current page turn value on the right edge of the content area.
           return pageTurnLabels[selectedPageTurnOption];
         } else {
           return "";
