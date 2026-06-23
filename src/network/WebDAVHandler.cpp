@@ -328,7 +328,25 @@ void WebDAVHandler::handleGet(WebServer& s) {
   s.send(200, contentType.c_str(), "");
 
   NetworkClient client = s.client();
-  client.write(file);
+  constexpr size_t CHUNK = 4096;
+  uint8_t buffer[CHUNK];
+  bool sendOk = true;
+  while (sendOk && file.available()) {
+    int result = file.read(buffer, CHUNK);
+    if (result <= 0) break;
+    size_t bytesRead = static_cast<size_t>(result);
+    size_t totalWritten = 0;
+    while (totalWritten < bytesRead) {
+      esp_task_wdt_reset();
+      size_t wrote = client.write(buffer + totalWritten, bytesRead - totalWritten);
+      if (wrote == 0) {
+        sendOk = false;
+        break;
+      }
+      totalWritten += wrote;
+    }
+  }
+  client.clear();
   file.close();
 }
 
