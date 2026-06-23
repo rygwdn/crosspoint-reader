@@ -20,6 +20,7 @@
 
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
+#include "DiskLogger.h"
 #include "KOReaderCredentialStore.h"
 #include "MappedInputManager.h"
 #include "OpdsServerStore.h"
@@ -345,6 +346,7 @@ void setup() {
   HalSystem::checkPanic();
 
   SETTINGS.loadFromFile();
+  DiskLogger::begin();
   APP_STATE.loadFromFile();
   RECENT_BOOKS.loadFromFile();
   I18N.setLanguage(static_cast<Language>(SETTINGS.language));

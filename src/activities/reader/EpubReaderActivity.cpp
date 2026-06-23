@@ -281,12 +281,16 @@ void EpubReaderActivity::loop() {
       const int bookProgressPercent = clampPercent(static_cast<int>(bookProgress + 0.5f));
       startActivityForResult(std::make_unique<EpubReaderMenuActivity>(
                                  renderer, mappedInput, epub->getTitle(), currentPage, totalPages, bookProgressPercent,
-                                 SETTINGS.orientation, !currentPageFootnotes.empty()),
+                                 SETTINGS.orientation, SETTINGS.fadingFix, !currentPageFootnotes.empty()),
                              [this](const ActivityResult& result) {
-                               // Always apply orientation change even if the menu was cancelled
+                               // Always apply orientation and sunlight changes even if the menu was cancelled
                                const auto& menu = std::get<MenuResult>(result.data);
                                applyOrientation(menu.orientation);
                                toggleAutoPageTurn(menu.pageTurnOption);
+                               if (SETTINGS.fadingFix != menu.sunlightMode) {
+                                 SETTINGS.fadingFix = menu.sunlightMode;
+                                 SETTINGS.saveToFile();
+                               }
                                if (!result.isCancelled) {
                                  onReaderMenuConfirm(static_cast<EpubReaderMenuActivity::MenuAction>(menu.action));
                                }
@@ -322,6 +326,13 @@ void EpubReaderActivity::loop() {
           ignoreNextConfirmRelease = true;
           activityManager.goToSleep();
           return;
+        }
+        break;
+      case CrossPointSettings::LP_MENU_FORCE_REFRESH:
+        if (mappedInput.getHeldTime() >= ReaderUtils::BOOKMARK_HOLD_MS) {
+          pagesUntilFullRefresh = 0;
+          ignoreNextConfirmRelease = true;
+          requestUpdate();
         }
         break;
       case CrossPointSettings::LP_MENU_DISABLED:
@@ -437,6 +448,12 @@ void EpubReaderActivity::loop() {
         nextTriggered ? (SETTINGS.orientation - 1 + SETTINGS.ORIENTATION_COUNT) % SETTINGS.ORIENTATION_COUNT
                       : (SETTINGS.orientation + 1) % SETTINGS.ORIENTATION_COUNT;
     applyOrientation(newOrientation);
+    requestUpdate();
+    return;
+  }
+
+  if (longPress && SETTINGS.longPressButtonBehavior == CrossPointSettings::LP_BTN_FORCE_REFRESH) {
+    pagesUntilFullRefresh = 0;
     requestUpdate();
     return;
   }
@@ -822,6 +839,11 @@ void EpubReaderActivity::render(RenderLock&& lock) {
   const uint16_t viewportWidth = renderer.getScreenWidth() - orientedMarginLeft - orientedMarginRight;
   const uint16_t viewportHeight = renderer.getScreenHeight() - orientedMarginTop - orientedMarginBottom;
 
+  // Track whether the target page was rendered during indexing so the final render can be skipped.
+  // Declared here so it's visible after the if (!section) block closes.
+  bool earlyRenderDone = false;
+  int earlyRenderTargetPage = -1;
+
   if (!section) {
     const auto filepath = epub->getSpineItem(currentSpineIndex).href;
     LOG_DBG("ERS", "Loading file: %s, index: %d", filepath.c_str(), currentSpineIndex);
@@ -837,10 +859,33 @@ void EpubReaderActivity::render(RenderLock&& lock) {
 
       const auto popupFn = [this]() { GUI.drawPopup(renderer, tr(STR_INDEXING)); };
 
+      // Determine if we can show the target page as soon as it's laid out, before
+      // the rest of the chapter finishes indexing. The target must be a specific
+      // integer page known before parsing begins; anchor and percent-based jumps
+      // cannot be resolved until after the full chapter is indexed.
+      const bool canEarlyRender = pendingAnchor.empty() && !pendingPercentJump;
+      earlyRenderTargetPage = canEarlyRender ? (pendingPageJump.has_value() ? static_cast<int>(*pendingPageJump)
+                                                                            : std::max(0, nextPageNumber))
+                                             : -1;
+
+      std::function<void(std::unique_ptr<Page>)> firstPageReadyFn = nullptr;
+      if (earlyRenderTargetPage >= 0) {
+        firstPageReadyFn = [this, &earlyRenderDone, earlyRenderTargetPage, orientedMarginTop, orientedMarginRight,
+                            orientedMarginBottom, orientedMarginLeft](std::unique_ptr<Page> page) {
+          section->currentPage = earlyRenderTargetPage;
+          currentPageFootnotes = std::move(page->footnotes);
+          renderer.clearScreen();
+          renderContents(std::move(page), orientedMarginTop, orientedMarginRight, orientedMarginBottom,
+                         orientedMarginLeft);
+          earlyRenderDone = true;
+        };
+      }
+
       if (!section->createSectionFile(SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(),
                                       SETTINGS.extraParagraphSpacing, SETTINGS.paragraphAlignment, viewportWidth,
                                       viewportHeight, SETTINGS.hyphenationEnabled, SETTINGS.embeddedStyle,
-                                      SETTINGS.imageRendering, SETTINGS.focusReadingEnabled, popupFn)) {
+                                      SETTINGS.imageRendering, SETTINGS.focusReadingEnabled, popupFn, firstPageReadyFn,
+                                      earlyRenderTargetPage)) {
         LOG_ERR("ERS", "Failed to persist page data to SD");
         section.reset();
         showPendingSyncSaveError();
@@ -899,47 +944,55 @@ void EpubReaderActivity::render(RenderLock&& lock) {
     }
   }
 
-  renderer.clearScreen();
-
-  if (section->pageCount == 0) {
-    LOG_DBG("ERS", "No pages to render");
-    renderer.drawCenteredText(UI_12_FONT_ID, 300, tr(STR_EMPTY_CHAPTER), true, EpdFontFamily::BOLD);
+  if (earlyRenderDone && section->currentPage == earlyRenderTargetPage) {
+    // Target page is already on screen from the early render. The framebuffer
+    // still has that content, so just redraw the status bar (now with the correct
+    // final page count) and do a fast differential refresh.
     renderStatusBar();
     renderer.displayBuffer();
-    automaticPageTurnActive = false;
-    showPendingSyncSaveError();
-    return;
-  }
+  } else {
+    renderer.clearScreen();
 
-  if (section->currentPage < 0 || section->currentPage >= section->pageCount) {
-    LOG_DBG("ERS", "Page out of bounds: %d (max %d)", section->currentPage, section->pageCount);
-    renderer.drawCenteredText(UI_12_FONT_ID, 300, tr(STR_OUT_OF_BOUNDS), true, EpdFontFamily::BOLD);
-    renderStatusBar();
-    renderer.displayBuffer();
-    automaticPageTurnActive = false;
-    showPendingSyncSaveError();
-    return;
-  }
-
-  {
-    auto p = section->loadPageFromSectionFile();
-    if (!p) {
-      LOG_ERR("ERS", "Failed to load page from SD - clearing section cache");
-      section->clearCache();
-      section.reset();
-      requestUpdate();  // Try again after clearing cache
-                        // TODO: prevent infinite loop if the page keeps failing to load for some reason
+    if (section->pageCount == 0) {
+      LOG_DBG("ERS", "No pages to render");
+      renderer.drawCenteredText(UI_12_FONT_ID, 300, tr(STR_EMPTY_CHAPTER), true, EpdFontFamily::BOLD);
+      renderStatusBar();
+      renderer.displayBuffer();
       automaticPageTurnActive = false;
       showPendingSyncSaveError();
       return;
     }
 
-    // Collect footnotes from the loaded page
-    currentPageFootnotes = std::move(p->footnotes);
+    if (section->currentPage < 0 || section->currentPage >= section->pageCount) {
+      LOG_DBG("ERS", "Page out of bounds: %d (max %d)", section->currentPage, section->pageCount);
+      renderer.drawCenteredText(UI_12_FONT_ID, 300, tr(STR_OUT_OF_BOUNDS), true, EpdFontFamily::BOLD);
+      renderStatusBar();
+      renderer.displayBuffer();
+      automaticPageTurnActive = false;
+      showPendingSyncSaveError();
+      return;
+    }
 
-    const auto start = millis();
-    renderContents(std::move(p), orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft);
-    LOG_DBG("ERS", "Rendered page in %dms", millis() - start);
+    {
+      auto p = section->loadPageFromSectionFile();
+      if (!p) {
+        LOG_ERR("ERS", "Failed to load page from SD - clearing section cache");
+        section->clearCache();
+        section.reset();
+        requestUpdate();  // Try again after clearing cache
+                          // TODO: prevent infinite loop if the page keeps failing to load for some reason
+        automaticPageTurnActive = false;
+        showPendingSyncSaveError();
+        return;
+      }
+
+      // Collect footnotes from the loaded page
+      currentPageFootnotes = std::move(p->footnotes);
+
+      const auto start = millis();
+      renderContents(std::move(p), orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft);
+      LOG_DBG("ERS", "Rendered page in %dms", millis() - start);
+    }
   }
   silentIndexNextChapterIfNeeded(viewportWidth, viewportHeight);
   saveProgress(currentSpineIndex, section->currentPage, section->pageCount);

@@ -30,6 +30,10 @@ void addToLogRingBuffer(const char* message) {
   logHead = (logHead + 1) % MAX_LOG_LINES;
 }
 
+static void (*diskLogCallback)(const char*) = nullptr;
+
+void setDiskLogCallback(void (*cb)(const char*)) { diskLogCallback = cb; }
+
 // Since logging can take a large amount of flash, we want to make the format string as short as possible.
 // This logPrintf prepend the timestamp, level and origin to the user-provided message, so that the user only needs to
 // provide the format string for the message itself.
@@ -63,6 +67,9 @@ void logPrintf(const char* level, const char* origin, const char* format, ...) {
     logSerial.print(buf);
   }
   addToLogRingBuffer(buf);
+  if (diskLogCallback) {
+    diskLogCallback(buf);
+  }
 }
 
 std::string getLastLogs() {
