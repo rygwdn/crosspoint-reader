@@ -130,6 +130,13 @@ class CrossPointWebServer {
     FontUploadState() { buffer.resize(BUFFER_SIZE); }
   } fontUpload;
 
+  // Log management handlers
+  void handleLogsPage() const;
+  void handleLogsRecent() const;
+  void handleLogsFlush();
+  void handleLogsDownload() const;
+  void handleLogsClear();
+
   // OPDS server handlers
   void handleGetOpdsServers() const;
   void handlePostOpdsServer();
