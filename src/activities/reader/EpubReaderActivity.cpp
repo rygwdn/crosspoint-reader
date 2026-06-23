@@ -444,7 +444,7 @@ void EpubReaderActivity::loop() {
     return;
   }
 
-  if (longPress && SETTINGS.longPressButtonBehavior == SETTINGS.FORCE_REFRESH) {
+  if (longPress && SETTINGS.longPressButtonBehavior == CrossPointSettings::LP_BTN_FORCE_REFRESH) {
     pagesUntilFullRefresh = 0;
     requestUpdate();
     return;

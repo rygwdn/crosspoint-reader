@@ -157,7 +157,7 @@ class CrossPointSettings {
     OFF = 0,
     CHAPTER_SKIP = 1,
     ORIENTATION_CHANGE = 2,
-    FORCE_REFRESH = 3,
+    LP_BTN_FORCE_REFRESH = 3,
     LONG_PRESS_BUTTON_BEHAVIOR_COUNT
   };
 

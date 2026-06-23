@@ -78,7 +78,7 @@ void TxtReaderActivity::loop() {
     return;
   }
 
-  if (!fromTilt && SETTINGS.longPressButtonBehavior == SETTINGS.FORCE_REFRESH &&
+  if (!fromTilt && SETTINGS.longPressButtonBehavior == CrossPointSettings::LP_BTN_FORCE_REFRESH &&
       mappedInput.getHeldTime() > ReaderUtils::SKIP_HOLD_MS) {
     pagesUntilFullRefresh = 0;
     requestUpdate();
