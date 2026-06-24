@@ -115,22 +115,28 @@ HttpDownloader::DownloadError runGet(const std::string& url, const std::string& 
     return HttpDownloader::HTTP_ERROR;
   }
 
+  uint32_t netMs = 0;   // time blocked in esp_http_client_read()
+  uint32_t diskMs = 0;  // time blocked in sink.write()
   while (true) {
     if (sink.cancelFlag && *sink.cancelFlag) {
       esp_http_client_cleanup(client);
       return HttpDownloader::ABORTED;
     }
+    const uint32_t t0 = millis();
     const int read = esp_http_client_read(client, buf.get(), READ_CHUNK);
+    netMs += millis() - t0;
     if (read < 0) {
       LOG_ERR("HTTP", "read error after %zu bytes", sink.downloaded);
       esp_http_client_cleanup(client);
       return HttpDownloader::HTTP_ERROR;
     }
     if (read == 0) break;  // all data received
+    const uint32_t t1 = millis();
     if (!sink.write(reinterpret_cast<const uint8_t*>(buf.get()), read)) {
       esp_http_client_cleanup(client);
       return HttpDownloader::FILE_ERROR;
     }
+    diskMs += millis() - t1;
     sink.downloaded += read;
     if (sink.progress && sink.total > 0) sink.progress(sink.downloaded, sink.total);
   }
@@ -147,7 +153,8 @@ HttpDownloader::DownloadError runGet(const std::string& url, const std::string& 
   const uint32_t transferMs = tDone - tConnected;
   // bytes/ms == KB/s (1000 ms/s ÷ 1024 B/KB ≈ 1); use exact integer arithmetic.
   const uint32_t kbps = transferMs > 0 ? (uint32_t)((uint64_t)sink.downloaded * 1000 / 1024 / transferMs) : 0;
-  LOG_INF("HTTP", "connect %ums, %u bytes in %ums (%u KB/s)", connectMs, (unsigned)sink.downloaded, transferMs, kbps);
+  LOG_INF("HTTP", "connect %ums, %u bytes in %ums (%u KB/s) [net %ums, disk %ums]",
+          connectMs, (unsigned)sink.downloaded, transferMs, kbps, netMs, diskMs);
 
   return HttpDownloader::OK;
 }
