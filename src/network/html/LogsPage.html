@@ -169,17 +169,10 @@
       try {
         const res = await fetch('/api/settings');
         if (!res.ok) return;
-        const text = await res.text();
-        // Parse streaming JSON lines for diskLogsEnabled
-        const lines = text.split('\n');
-        for (const line of lines) {
-          try {
-            const obj = JSON.parse(line);
-            if (obj.key === 'diskLogsEnabled') {
-              document.getElementById('disk-logs-toggle').checked = obj.value === 1;
-              break;
-            }
-          } catch (_) {}
+        const settings = await res.json();
+        const s = settings.find(function(s) { return s.key === 'diskLogsEnabled'; });
+        if (s) {
+          document.getElementById('disk-logs-toggle').checked = s.value === 1;
         }
       } catch (e) {
         console.error('Failed to load settings:', e);
@@ -190,10 +183,11 @@
       try {
         const res = await fetch('/api/settings', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: 'diskLogsEnabled=' + (enabled ? '1' : '0'),
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ diskLogsEnabled: enabled ? 1 : 0 }),
         });
         if (!res.ok) throw new Error(await res.text());
+        setStatus(enabled ? 'Disk logging enabled.' : 'Disk logging disabled.', false);
       } catch (e) {
         setStatus('Failed to update setting: ' + e.message, true);
       }
