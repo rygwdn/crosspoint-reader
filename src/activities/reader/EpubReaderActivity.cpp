@@ -843,6 +843,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
   // Declared here so it's visible after the if (!section) block closes.
   bool earlyRenderDone = false;
   int earlyRenderTargetPage = -1;
+  std::unique_ptr<Page> earlyRenderedPage = nullptr;  // page captured during indexing, rendered after
 
   if (!section) {
     const auto filepath = epub->getSpineItem(currentSpineIndex).href;
@@ -870,17 +871,13 @@ void EpubReaderActivity::render(RenderLock&& lock) {
 
       std::function<void(std::unique_ptr<Page>)> firstPageReadyFn = nullptr;
       if (earlyRenderTargetPage >= 0) {
-        firstPageReadyFn = [this, &earlyRenderDone, earlyRenderTargetPage, orientedMarginTop, orientedMarginRight,
-                            orientedMarginBottom, orientedMarginLeft](std::unique_ptr<Page> page) {
-          LOG_DBG("ERS", "Early render: page %d has_images=%d free_heap=%d", earlyRenderTargetPage,
+        firstPageReadyFn = [&earlyRenderedPage, earlyRenderTargetPage](std::unique_ptr<Page> page) {
+          // Capture the pre-laid page for deferred rendering after createSectionFile returns.
+          // Do NOT call renderContents() here: this callback fires from inside the XML parser's
+          // deep call stack, and adding the full font-render pipeline on top overflows the task stack.
+          LOG_DBG("ERS", "Early page captured: page %d has_images=%d free_heap=%d", earlyRenderTargetPage,
                   (int)page->hasImages(), (int)ESP.getFreeHeap());
-          section->currentPage = earlyRenderTargetPage;
-          currentPageFootnotes = std::move(page->footnotes);
-          renderer.clearScreen();
-          renderContents(std::move(page), orientedMarginTop, orientedMarginRight, orientedMarginBottom,
-                         orientedMarginLeft, true);
-          LOG_DBG("ERS", "Early render complete free_heap=%d", (int)ESP.getFreeHeap());
-          earlyRenderDone = true;
+          earlyRenderedPage = std::move(page);
         };
       }
 
@@ -945,6 +942,16 @@ void EpubReaderActivity::render(RenderLock&& lock) {
       section->currentPage = newPage;
       pendingPercentJump = false;
     }
+  }
+
+  // Deferred early render: we have the pre-laid page from the indexing callback.
+  // Render it now that we're back on a clean call stack (not inside the XML parser).
+  if (earlyRenderedPage && section && section->currentPage == earlyRenderTargetPage) {
+    currentPageFootnotes = std::move(earlyRenderedPage->footnotes);
+    renderer.clearScreen();
+    renderContents(std::move(earlyRenderedPage), orientedMarginTop, orientedMarginRight, orientedMarginBottom,
+                   orientedMarginLeft);
+    earlyRenderDone = true;
   }
 
   if (earlyRenderDone && section->currentPage == earlyRenderTargetPage) {
@@ -1049,7 +1056,7 @@ bool EpubReaderActivity::saveProgress(int spineIndex, int currentPage, int pageC
 }
 void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int orientedMarginTop,
                                         const int orientedMarginRight, const int orientedMarginBottom,
-                                        const int orientedMarginLeft, const bool earlyRender) {
+                                        const int orientedMarginLeft) {
   const auto t0 = millis();
   const int fontId = SETTINGS.getReaderFontId();
 
@@ -1063,8 +1070,7 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   const bool pageHasImages = page->hasImages();
   const bool needsTextGrayscale = SETTINGS.textAntiAliasing;
   const bool needsAnyGrayscale = needsTextGrayscale || pageHasImages;
-  LOG_DBG("ERS", "renderContents early=%d has_images=%d free_heap=%d", (int)earlyRender, (int)pageHasImages,
-          (int)ESP.getFreeHeap());
+  LOG_DBG("ERS", "renderContents has_images=%d free_heap=%d", (int)pageHasImages, (int)ESP.getFreeHeap());
   auto renderGrayscalePass = [&]() {
     if (needsTextGrayscale) {
       page->render(renderer, fontId, orientedMarginLeft, orientedMarginTop);
@@ -1076,15 +1082,6 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   page->render(renderer, fontId, orientedMarginLeft, orientedMarginTop);
   renderStatusBar();
   const auto tBwRender = millis();
-
-  if (earlyRender) {
-    // Called during section indexing: skip image blanking and grayscale to avoid
-    // watchdog timeout from the multi-second display sequence.
-    renderer.displayBuffer(HalDisplay::HALF_REFRESH);
-    LOG_DBG("ERS", "Page render (early): prewarm=%lums bw_render=%lums total=%lums", tPrewarm - t0,
-            tBwRender - tPrewarm, millis() - t0);
-    return;
-  }
 
   if (pageHasImages) {
     // Double FAST_REFRESH with selective image blanking (pablohc's technique):
