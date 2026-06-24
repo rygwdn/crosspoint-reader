@@ -53,8 +53,7 @@ void XMLCALL imagePrepassElement(void* userData, const XML_Char* name, const XML
   }
   if (!src || src[0] == '\0' || ctx->imageRendering == 1) return;
 
-  const std::string resolvedPath =
-      FsHelpers::normalisePath(FsHelpers::decodeUriEscapes(ctx->contentBase + src));
+  const std::string resolvedPath = FsHelpers::normalisePath(FsHelpers::decodeUriEscapes(ctx->contentBase + src));
   if (!ImageDecoderFactory::isFormatSupported(resolvedPath)) return;
 
   const int imageIdx = ctx->imageCounter++;

@@ -27,7 +27,7 @@ class Epub;
 // keeping ZIP ring-buffer and JPEG allocations out of the heap-heavy layout phase.
 struct PrecomputedImage {
   std::string cachedPath;
-  int16_t intrinsicWidth = 0;   // 0 = extraction or decode failed; image will be skipped
+  int16_t intrinsicWidth = 0;  // 0 = extraction or decode failed; image will be skipped
   int16_t intrinsicHeight = 0;
 };
 
