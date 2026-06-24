@@ -1,7 +1,5 @@
 #pragma once
 
-#include <freertos/semphr.h>
-
 #include <cstddef>
 
 // Captures firmware log lines to SD card by flushing the RTC ring buffer every
@@ -30,10 +28,6 @@ class DiskLogger {
   // Guards against same-task re-entry: HalStorage calls LOG_ERR internally,
   // which would otherwise recurse back into logLine() → writeRingBufferToFile().
   static volatile bool reentrant;
-  // Guards against cross-task concurrent flushes (render task vs. main task).
-  // Non-blocking trylock: whichever task loses the race skips this flush cycle;
-  // the ring buffer content persists in RTC memory and will be written next time.
-  static SemaphoreHandle_t flushMutex;
 
   static void writeRingBufferToFile();
   static void rotateIfNeeded();

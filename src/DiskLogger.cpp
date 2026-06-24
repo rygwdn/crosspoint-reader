@@ -2,6 +2,7 @@
 
 #include <HalStorage.h>
 #include <Logging.h>
+#include <freertos/semphr.h>
 
 #include <string>
 
@@ -9,7 +10,10 @@
 
 int DiskLogger::linesSinceFlush = 0;
 volatile bool DiskLogger::reentrant = false;
-SemaphoreHandle_t DiskLogger::flushMutex = nullptr;
+// Guards against cross-task concurrent flushes (render task vs. main task).
+// Non-blocking trylock: whichever task loses the race skips this flush cycle;
+// the ring buffer content persists in RTC memory and will be written next time.
+static SemaphoreHandle_t flushMutex = nullptr;
 
 void DiskLogger::begin() {
   flushMutex = xSemaphoreCreateMutex();
