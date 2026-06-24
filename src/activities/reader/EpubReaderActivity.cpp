@@ -114,6 +114,40 @@ void moveFinishedBookToReadFolder(const std::string& srcPath, const std::string&
   }
 }
 
+// W3 next-page image pre-warm (Change 3). Runs on the RENDER task from inside
+// displayGrayBuffer()'s ~1ms idle callback; the decode it kicks off yields per
+// MCU block (vTaskDelay(1)) so the MAIN task keeps polling input, and a press
+// flips _cancelPrewarm which the decode's cancelFn observes to abort.
+struct PrewarmCtx {
+  EpubReaderActivity* self;
+  GfxRenderer* renderer;
+  const Page* nextPage;  // nullptr if there is no next page or it has no images
+  int xOffset;           // same offsets renderContents passes to Page::render
+  int yOffset;
+  bool done = false;
+};
+
+void prewarmIdle(void* ctx) {
+  auto* pc = static_cast<PrewarmCtx*>(ctx);
+  if (pc->done) return;
+  pc->done = true;  // attempt once; the decode below blocks this call to completion
+  if (EpubReaderActivity::prewarmCancelRequested(pc->self)) return;  // user already navigating
+  if (!pc->nextPage) return;
+  // Need ~20KB decoder + ~8KB band + headroom; bail if the heap can't spare it.
+  if (ESP.getFreeHeap() < 44u * 1024u) return;
+  for (const auto& el : pc->nextPage->elements) {
+    if (el->getTag() != TAG_PageImage) continue;
+    const auto& pi = static_cast<const PageImage&>(*el);
+    // getImageBlock() returns const ImageBlock&; warmCache only writes the .pxc
+    // cache file (it does not mutate ImageBlock), so const_cast is safe here and
+    // avoids widening PageImage's API.
+    ImageBlock& ib = const_cast<ImageBlock&>(pi.getImageBlock());
+    ib.warmCache(*pc->renderer, pi.xPos + pc->xOffset, pi.yPos + pc->yOffset,
+                 &EpubReaderActivity::prewarmCancelRequested, pc->self);
+    if (EpubReaderActivity::prewarmCancelRequested(pc->self)) break;  // abort remaining images
+  }
+}
+
 }  // namespace
 
 void EpubReaderActivity::onEnter() {
@@ -368,6 +402,7 @@ void EpubReaderActivity::loop() {
   // FORCE_REFRESH: re-render the current page with a full (HALF_REFRESH) waveform + AA pass.
   if (SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::FORCE_REFRESH &&
       mappedInput.wasReleased(MappedInputManager::Button::Power)) {
+    _cancelPrewarm = true;  // re-render incoming; abandon any in-flight pre-warm
     pagesUntilFullRefresh = 0;
     requestUpdate();
     return;
@@ -377,6 +412,11 @@ void EpubReaderActivity::loop() {
   if (!prevTriggered && !nextTriggered) {
     return;
   }
+
+  // A page turn / chapter skip / jump is about to re-render a different page.
+  // Abandon any in-flight W3 pre-warm decode (it runs on the render task during
+  // displayGrayBuffer's busy-wait, which yields to this main task each ms).
+  _cancelPrewarm = true;
 
   // At end of the book, forward button goes home (or back to caller) and back button returns to last page
   if (currentSpineIndex > 0 && currentSpineIndex >= epub->getSpineItemsCount()) {
@@ -766,6 +806,11 @@ void EpubReaderActivity::render(RenderLock&& lock) {
     return;
   }
 
+  // The navigation that triggered this render set _cancelPrewarm=true; clear it
+  // at entry so this page's W3 pre-warm can run. If the user presses again during
+  // this render's W1/W2, loop() re-sets it and the W3 pre-warm below skips.
+  _cancelPrewarm = false;
+
   const auto showPendingSyncSaveError = [this]() {
     if (!pendingSyncSaveError) return;
     pendingSyncSaveError = false;
@@ -977,6 +1022,49 @@ void EpubReaderActivity::silentIndexNextChapterIfNeeded(const uint16_t viewportW
                                      viewportHeight, SETTINGS.hyphenationEnabled, SETTINGS.embeddedStyle,
                                      SETTINGS.imageRendering, SETTINGS.focusReadingEnabled)) {
     LOG_ERR("ERS", "Failed silent indexing for chapter: %d", nextSpineIndex);
+    return;
+  }
+
+  // Chapter-boundary image pre-warm. The next chapter's section cache now exists,
+  // so pre-decode the .pxc for any images on its FIRST page (the page the user
+  // sees crossing the boundary) — one page only, matching the one-page-lookahead
+  // philosophy. warmCache sets cacheOnly=true, so this writes only the .pxc and
+  // never the framebuffer; safe even though we run after renderContents with no
+  // guaranteed full-refresh window. The decode yields per MCU block, so a press
+  // during this work flips _cancelPrewarm (reset false at this render()'s entry,
+  // so it is honestly clear unless the user navigated since), which the decode's
+  // cancelFn observes to abort, keeping its partial .pxc.
+  if (nextSection.pageCount < 1) {
+    return;
+  }
+  // Skip just the warming (the indexing above already succeeded) if the heap can't
+  // spare a decoder (~20KB) + band + headroom.
+  if (ESP.getFreeHeap() < 44u * 1024u) {
+    return;
+  }
+
+  auto firstPage = nextSection.loadPageFromSectionFile(0);
+  if (!firstPage || !firstPage->hasImages()) {
+    return;
+  }
+
+  // First-page render offsets are the standard oriented margins (no status-bar or
+  // auto-page-turn adjustment affects the top/left), matching render()/Page::render.
+  int omTop, omRight, omBottom, omLeft;
+  renderer.getOrientedViewableTRBL(&omTop, &omRight, &omBottom, &omLeft);
+  omTop += SETTINGS.screenMargin;
+  omLeft += SETTINGS.screenMargin;
+
+  for (const auto& el : firstPage->elements) {
+    if (el->getTag() != TAG_PageImage) continue;
+    if (_cancelPrewarm) break;  // user navigated; abandon remaining images
+    const auto& pi = static_cast<const PageImage&>(*el);
+    // getImageBlock() returns const ImageBlock&; warmCache only writes the .pxc
+    // (it does not mutate ImageBlock), so const_cast is safe and avoids widening
+    // PageImage's API.
+    const_cast<ImageBlock&>(pi.getImageBlock())
+        .warmCache(renderer, pi.xPos + omLeft, pi.yPos + omTop, &EpubReaderActivity::prewarmCancelRequested, this);
+    if (_cancelPrewarm) break;
   }
 }
 
@@ -1032,6 +1120,22 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   }
   const auto tDisplay = millis();
 
+  // Change 3: pre-warm the NEXT page's image cache during the upcoming grayscale
+  // refresh's W3 busy-wait. Load the next page now (it must outlive the
+  // displayGrayBuffer call below); only keep it if it actually has images so the
+  // idle callback can no-op otherwise. The explicit-index loader does NOT touch
+  // section->currentPage, which the main task may read concurrently. nextOwnedPage
+  // owns the lifetime; PrewarmCtx holds a raw observing pointer.
+  std::unique_ptr<Page> nextOwnedPage;
+  if (section && section->currentPage + 1 < section->pageCount) {
+    auto candidate = section->loadPageFromSectionFile(section->currentPage + 1);
+    if (candidate && candidate->hasImages()) {
+      nextOwnedPage = std::move(candidate);
+    }
+  }
+  PrewarmCtx prewarmCtx{this, &renderer, nextOwnedPage.get(), orientedMarginLeft, orientedMarginTop, false};
+  const IdleWork prewarmIdleWork{&prewarmIdle, &prewarmCtx};
+
   // Tiled grayscale: render each plane band-by-band into a small scratch and
   // stream straight to the controller, leaving the BW framebuffer intact so no
   // full-frame storeBwBuffer is needed; controller RAM is re-synced from the
@@ -1074,7 +1178,7 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
       const auto tGrayMsb = millis();
 
       renderer.setRenderMode(GfxRenderer::BW);
-      renderer.displayGrayBuffer();
+      renderer.displayGrayBuffer(prewarmIdleWork);
       const auto tGrayDisplay = millis();
 
       // BW framebuffer is intact; re-sync controller RAM for the next
@@ -1112,7 +1216,7 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
       const auto tGrayMsb = millis();
 
       // display grayscale part
-      renderer.displayGrayBuffer();
+      renderer.displayGrayBuffer(prewarmIdleWork);
       const auto tGrayDisplay = millis();
       renderer.setRenderMode(GfxRenderer::BW);
       renderer.restoreBwBuffer();

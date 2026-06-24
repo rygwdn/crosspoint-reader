@@ -220,7 +220,7 @@ class GfxRenderer {
   RenderMode getRenderMode() const { return renderMode; }
   void copyGrayscaleLsbBuffers() const;
   void copyGrayscaleMsbBuffers() const;
-  void displayGrayBuffer() const;
+  void displayGrayBuffer(IdleWork idle = {}) const;
 
   // Tiled grayscale (X4): stream one band of a plane straight to controller RAM
   // from `scratch` (panelWidthBytes * numRows, physical rows [yStart, yStart+

@@ -5,6 +5,8 @@
 #include <Logging.h>
 #include <Serialization.h>
 
+#include <algorithm>
+
 #include "Epub/converters/DirectPixelWriter.h"
 #include "Epub/converters/ImageDecoderFactory.h"
 
@@ -79,11 +81,51 @@ bool renderFromCache(GfxRenderer& renderer, const std::string& cachePath, int x,
   DirectPixelWriter pw;
   pw.init(renderer);
 
+  // On a grayscale strip pass only a contiguous band of physical rows is active.
+  // For landscape orientations physical-Y is a pure function of the logical row
+  // (DirectPixelWriter: phyYStepX == 0, phyYStepY == ±1), so the strip maps to a
+  // contiguous range of image rows we can seek to and stop after. Portrait and
+  // PortraitInverted have phyYStepX == ±1 (physical-Y varies with column), so all
+  // rows must be read. getWriteOriginY()/getWriteRows() collapse to (0, panel
+  // height) when no strip is active, yielding the full image range for full-page
+  // renders.
+  int firstRow = 0;
+  int lastRow = cachedHeight;
+  const int stripY = renderer.getWriteOriginY();
+  const int stripRows = renderer.getWriteRows();
+  switch (renderer.getOrientation()) {
+    case GfxRenderer::LandscapeCounterClockwise:
+      // phyY = y + row  ->  row = phyY - y
+      firstRow = std::max(0, stripY - y);
+      lastRow = std::min(static_cast<int>(cachedHeight), stripY + stripRows - y);
+      break;
+    case GfxRenderer::LandscapeClockwise: {
+      // phyY = (displayHeight-1) - (y + row)  ->  row = (displayHeight-1) - y - phyY
+      const int displayHeight = renderer.getDisplayHeight();
+      firstRow = std::max(0, (displayHeight - 1) - (stripY + stripRows - 1) - y);
+      lastRow = std::min(static_cast<int>(cachedHeight), (displayHeight - 1) - stripY - y + 1);
+      break;
+    }
+    default:
+      // Portrait / PortraitInverted: physical-Y depends on column, read all rows.
+      break;
+  }
+
+  if (firstRow >= lastRow) {
+    // The active strip does not intersect this image; nothing to draw.
+    free(readBuffer);
+    return true;
+  }
+
+  if (firstRow > 0) {
+    cacheFile.seekSet(4 + static_cast<size_t>(firstRow) * bytesPerRow);
+  }
+
   int rowsInBuffer = 0;
   int bufferRow = 0;
-  for (int row = 0; row < cachedHeight; row++) {
+  for (int row = firstRow; row < lastRow; row++) {
     if (bufferRow >= rowsInBuffer) {
-      const int toRead = (cachedHeight - row < rowsPerRead) ? (cachedHeight - row) : rowsPerRead;
+      const int toRead = (lastRow - row < rowsPerRead) ? (lastRow - row) : rowsPerRead;
       const size_t bytes = (size_t)toRead * bytesPerRow;
       if (cacheFile.read(readBuffer, bytes) != static_cast<int>(bytes)) {
         LOG_ERR("IMG", "Cache read error at row %d", row);
@@ -199,6 +241,56 @@ void ImageBlock::render(GfxRenderer& renderer, const int x, const int y) {
   }
 
   LOG_DBG("IMG", "Decode successful");
+}
+
+bool ImageBlock::warmCache(GfxRenderer& renderer, int x, int y, bool (*cancelFn)(void* ctx), void* cancelCtx) {
+  // Pre-decode this image's .pxc cache outside any strip/page render so a later
+  // real render is a pure cache hit. The RenderConfig below MUST match render()'s
+  // decode branch field-for-field so the produced cache is byte-identical.
+  std::string cachePath = getCachePath(imagePath);
+  if (Storage.exists(cachePath.c_str())) {
+    return true;  // Already cached - nothing to do.
+  }
+
+  // Verify the source image exists and is non-empty (mirrors render()).
+  HalFile file;
+  if (!Storage.openFileForRead("IMG", imagePath, file)) {
+    LOG_ERR("IMG", "Image file not found (warm): %s", imagePath.c_str());
+    return false;
+  }
+  size_t fileSize = file.size();
+  file.close();
+  if (fileSize == 0) {
+    LOG_ERR("IMG", "Image file is empty (warm): %s", imagePath.c_str());
+    return false;
+  }
+
+  RenderConfig config;
+  config.x = x;
+  config.y = y;
+  config.maxWidth = width;
+  config.maxHeight = height;
+  config.useGrayscale = true;
+  config.useDithering = true;
+  config.performanceMode = false;
+  config.useExactDimensions = true;
+  config.cachePath = cachePath;
+  // Produce only the .pxc cache, never the framebuffer: warmCache runs outside any
+  // page/strip render (W3 idle and the chapter-boundary pre-warm), so writing the
+  // framebuffer here would corrupt the on-screen page. The real render later reads
+  // this cache as a pure hit.
+  config.cacheOnly = true;
+  config.cancelFn = cancelFn;
+  config.cancelCtx = cancelCtx;
+
+  ImageToFramebufferDecoder* decoder = ImageDecoderFactory::getDecoder(imagePath);
+  if (!decoder) {
+    LOG_ERR("IMG", "No decoder found for image (warm): %s", imagePath.c_str());
+    return false;
+  }
+
+  LOG_DBG("IMG", "Warming cache: %s using %s decoder", imagePath.c_str(), decoder->getFormatName());
+  return decoder->decodeToFramebuffer(imagePath, renderer, config);
 }
 
 bool ImageBlock::serialize(HalFile& file) {

@@ -6,6 +6,8 @@
 #include <Logging.h>
 #include <Memory.h>
 #include <PNGdec.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 #include <cstdlib>
 #include <memory>
@@ -38,6 +40,10 @@ struct PngContext {
   bool caching{false};
 
   uint8_t* grayLineBuffer{nullptr};
+
+  // Optional cooperative-cancel hook (see RenderConfig). Null on the normal path.
+  bool (*cancelFn)(void* ctx){nullptr};
+  void* cancelCtx{nullptr};
 };
 
 // File I/O callbacks use pFile->fHandle to access the HalFile*,
@@ -165,10 +171,13 @@ void convertLineToGray(uint8_t* pPixels, uint8_t* grayLine, int width, int pixel
   }
 }
 
-int pngDrawCallback(PNGDRAW* pDraw) {
-  PngContext* ctx = reinterpret_cast<PngContext*>(pDraw->pUser);
-  if (!ctx || !ctx->config || !ctx->renderer || !ctx->grayLineBuffer) return 0;
-
+// Templated draw body. CacheOnly==false generates exactly the original callback
+// (every framebuffer write below is the if-constexpr false branch, compiled in
+// verbatim). CacheOnly==true elides all DirectPixelWriter use so the decode
+// produces only the .pxc — the PixelCache (cw) writes and all scaling/dither math
+// are identical in both specializations, keeping the cache byte-identical.
+template <bool CacheOnly>
+int drawPngBlock(PNGDRAW* pDraw, PngContext* ctx) {
   int srcY = pDraw->y;
   int srcWidth = ctx->srcWidth;
 
@@ -198,8 +207,10 @@ int pngDrawCallback(PNGDRAW* pDraw) {
 
   // Pre-compute orientation and render-mode state once per row
   DirectPixelWriter pw;
-  pw.init(*ctx->renderer);
-  pw.beginRow(outY);
+  if constexpr (!CacheOnly) {
+    pw.init(*ctx->renderer);
+    pw.beginRow(outY);
+  }
 
   // The cache streams to disk one row at a time. Flushing rows below this one
   // (PNGdec delivers scanlines top to bottom) repositions the single-row band.
@@ -231,7 +242,9 @@ int pngDrawCallback(PNGDRAW* pDraw) {
         ditheredGray = gray / 85;
         if (ditheredGray > 3) ditheredGray = 3;
       }
-      pw.writePixel(outX, ditheredGray);
+      if constexpr (!CacheOnly) {
+        pw.writePixel(outX, ditheredGray);
+      }
       if (caching) cw.writePixel(outX, ditheredGray);
     }
 
@@ -244,6 +257,25 @@ int pngDrawCallback(PNGDRAW* pDraw) {
   }
 
   return 1;
+}
+
+// Thin dispatcher: validates the context, performs the cooperative cancel-yield
+// once (kept out of the templated body so it isn't duplicated into both
+// specializations), then selects the cache-only or framebuffer specialization.
+int pngDrawCallback(PNGDRAW* pDraw) {
+  PngContext* ctx = reinterpret_cast<PngContext*>(pDraw->pUser);
+  if (!ctx || !ctx->config || !ctx->renderer || !ctx->grayLineBuffer) return 0;
+
+  // Cooperative cancellation: only when a cancel hook is supplied (null on the
+  // normal render path -> zero overhead). Yield ~1ms so the single-core main task
+  // can run and set the cancel flag, then observe it. PNGdec treats a 0 return as
+  // an abort (same path as the invalid-context guard above).
+  if (ctx->cancelFn) {
+    vTaskDelay(1);
+    if (ctx->cancelFn(ctx->cancelCtx)) return 0;
+  }
+
+  return ctx->config->cacheOnly ? drawPngBlock<true>(pDraw, ctx) : drawPngBlock<false>(pDraw, ctx);
 }
 
 }  // namespace
@@ -298,6 +330,8 @@ bool PngToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
   ctx.config = &config;
   ctx.screenWidth = renderer.getScreenWidth();
   ctx.screenHeight = renderer.getScreenHeight();
+  ctx.cancelFn = config.cancelFn;
+  ctx.cancelCtx = config.cancelCtx;
 
   int rc = png->open(imagePath.c_str(), pngOpenWithHandle, pngCloseWithHandle, pngReadWithHandle, pngSeekWithHandle,
                      pngDrawCallback);
@@ -380,7 +414,16 @@ bool PngToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
 
   if (rc != PNG_SUCCESS) {
     LOG_ERR("PNG", "Decode failed: %d", rc);
-    if (ctx.caching) ctx.cache.abort();
+    if (ctx.caching) {
+      // Distinguish a cancellation from a genuine decode error: on cancel keep the
+      // partial .pxc (the reader re-decodes via the short-read fallback); on a real
+      // error delete it so a later decode starts clean.
+      if (ctx.cancelFn && ctx.cancelFn(ctx.cancelCtx)) {
+        ctx.cache.close_partial();
+      } else {
+        ctx.cache.abort();
+      }
+    }
     return false;
   }
 

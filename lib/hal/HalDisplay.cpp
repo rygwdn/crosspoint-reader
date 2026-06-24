@@ -57,12 +57,12 @@ EInkDisplay::RefreshMode convertRefreshMode(HalDisplay::RefreshMode mode) {
   }
 }
 
-void HalDisplay::displayBuffer(HalDisplay::RefreshMode mode, bool turnOffScreen) {
+void HalDisplay::displayBuffer(HalDisplay::RefreshMode mode, bool turnOffScreen, IdleWork idle) {
   if (gpio.deviceIsX3() && mode == RefreshMode::HALF_REFRESH) {
     einkDisplay.requestResync(1);
   }
 
-  einkDisplay.displayBuffer(convertRefreshMode(mode), turnOffScreen);
+  einkDisplay.displayBuffer(convertRefreshMode(mode), turnOffScreen, idle);
 }
 
 void HalDisplay::refreshDisplay(HalDisplay::RefreshMode mode, bool turnOffScreen) {
@@ -87,7 +87,9 @@ void HalDisplay::copyGrayscaleMsbBuffers(const uint8_t* msbBuffer) { einkDisplay
 
 void HalDisplay::cleanupGrayscaleBuffers(const uint8_t* bwBuffer) { einkDisplay.cleanupGrayscaleBuffers(bwBuffer); }
 
-void HalDisplay::displayGrayBuffer(bool turnOffScreen) { einkDisplay.displayGrayBuffer(turnOffScreen); }
+void HalDisplay::displayGrayBuffer(bool turnOffScreen, IdleWork idle) {
+  einkDisplay.displayGrayBuffer(turnOffScreen, /*lut=*/nullptr, /*factoryMode=*/false, idle);
+}
 
 void HalDisplay::writeGrayscalePlaneStrip(bool lsbPlane, const uint8_t* rows, uint16_t yStart, uint16_t numRows) {
   einkDisplay.writeGrayscalePlaneStrip(lsbPlane ? EInkDisplay::GRAY_PLANE_LSB : EInkDisplay::GRAY_PLANE_MSB, rows,

@@ -40,6 +40,10 @@ class Section {
                          uint8_t imageRendering, bool focusReadingEnabled,
                          const std::function<void()>& popupFn = nullptr);
   std::unique_ptr<Page> loadPageFromSectionFile();
+  // Load an arbitrary page by explicit index without touching the currentPage
+  // member, so callers on the render task can peek ahead while the main task may
+  // be reading currentPage concurrently.
+  std::unique_ptr<Page> loadPageFromSectionFile(int pageIndex);
   std::string getTextFromSectionFile();
 
   // Look up the page number for an anchor id from the section cache file.

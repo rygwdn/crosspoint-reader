@@ -6,6 +6,8 @@
 #include <JPEGDEC.h>
 #include <Logging.h>
 #include <Memory.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 #include <cstdlib>
 #include <memory>
@@ -46,6 +48,10 @@ struct JpegContext {
 
   PixelCache cache;
   bool caching{false};
+
+  // Optional cooperative-cancel hook (see RenderConfig). Null on the normal path.
+  bool (*cancelFn)(void* ctx){nullptr};
+  void* cancelCtx{nullptr};
 };
 
 // File I/O callbacks use pFile->fHandle to access the HalFile*,
@@ -118,10 +124,13 @@ constexpr int FP_SHIFT = 16;
 constexpr int32_t FP_ONE = 1 << FP_SHIFT;
 constexpr int32_t FP_MASK = FP_ONE - 1;
 
-int jpegDrawCallback(JPEGDRAW* pDraw) {
-  JpegContext* ctx = reinterpret_cast<JpegContext*>(pDraw->pUser);
-  if (!ctx || !ctx->config || !ctx->renderer) return 0;
-
+// Templated draw body. CacheOnly==false generates exactly the original callback
+// (every framebuffer write below is the if-constexpr false branch, i.e. compiled
+// in verbatim). CacheOnly==true elides all DirectPixelWriter use so the decode
+// produces only the .pxc — the PixelCache (cw) writes and all scaling/dither/clamp
+// math are identical in both specializations, keeping the cache byte-identical.
+template <bool CacheOnly>
+int drawJpegBlock(JPEGDRAW* pDraw, JpegContext* ctx) {
   // In EIGHT_BIT_GRAYSCALE mode, pPixels contains 8-bit grayscale values
   // Buffer is densely packed: stride = pDraw->iWidth, valid columns = pDraw->iWidthUsed
   uint8_t* pixels = reinterpret_cast<uint8_t*>(pDraw->pPixels);
@@ -167,7 +176,9 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
 
   // Pre-compute orientation and render-mode state once per callback invocation
   DirectPixelWriter pw;
-  pw.init(renderer);
+  if constexpr (!CacheOnly) {
+    pw.init(renderer);
+  }
 
   // The cache streams to disk one MCU-row band at a time. Flushing rows below
   // this block (raster order guarantees they are final) repositions the band;
@@ -190,7 +201,9 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
   if (fineScaleFPX == FP_ONE && fineScaleFPY == FP_ONE) {
     for (int dstY = dstYStart; dstY < dstYEnd; dstY++) {
       const int outY = cfgY + dstY;
-      pw.beginRow(outY);
+      if constexpr (!CacheOnly) {
+        pw.beginRow(outY);
+      }
       if (caching) cw.beginRow(outY, cacheOriginY);
       const uint8_t* row = &pixels[(dstY - blockY) * stride];
       for (int dstX = dstXStart; dstX < dstXEnd; dstX++) {
@@ -203,7 +216,9 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
           dithered = gray / 85;
           if (dithered > 3) dithered = 3;
         }
-        pw.writePixel(outX, dithered);
+        if constexpr (!CacheOnly) {
+          pw.writePixel(outX, dithered);
+        }
         if (caching) cw.writePixel(outX, dithered);
       }
     }
@@ -224,7 +239,9 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
 
     for (int dstY = dstYStart; dstY < dstYEnd; dstY++) {
       const int outY = cfgY + dstY;
-      pw.beginRow(outY);
+      if constexpr (!CacheOnly) {
+        pw.beginRow(outY);
+      }
       if (caching) cw.beginRow(outY, cacheOriginY);
       const int32_t srcFyFP = dstY * invScaleFPY;
       const int32_t fy = srcFyFP & FP_MASK;
@@ -262,7 +279,9 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
           dithered = gray / 85;
           if (dithered > 3) dithered = 3;
         }
-        pw.writePixel(outX, dithered);
+        if constexpr (!CacheOnly) {
+          pw.writePixel(outX, dithered);
+        }
         if (caching) cw.writePixel(outX, dithered);
       }
 
@@ -285,7 +304,9 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
           dithered = gray / 85;
           if (dithered > 3) dithered = 3;
         }
-        pw.writePixel(outX, dithered);
+        if constexpr (!CacheOnly) {
+          pw.writePixel(outX, dithered);
+        }
         if (caching) cw.writePixel(outX, dithered);
       }
 
@@ -311,7 +332,9 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
           dithered = gray / 85;
           if (dithered > 3) dithered = 3;
         }
-        pw.writePixel(outX, dithered);
+        if constexpr (!CacheOnly) {
+          pw.writePixel(outX, dithered);
+        }
         if (caching) cw.writePixel(outX, dithered);
       }
     }
@@ -321,7 +344,9 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
   // === Nearest-neighbor (downscale: fineScale < 1.0) ===
   for (int dstY = dstYStart; dstY < dstYEnd; dstY++) {
     const int outY = cfgY + dstY;
-    pw.beginRow(outY);
+    if constexpr (!CacheOnly) {
+      pw.beginRow(outY);
+    }
     if (caching) cw.beginRow(outY, cacheOriginY);
     const int32_t srcFyFP = dstY * invScaleFPY;
     int ly = (srcFyFP >> FP_SHIFT) - blockY;
@@ -344,12 +369,33 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
         dithered = gray / 85;
         if (dithered > 3) dithered = 3;
       }
-      pw.writePixel(outX, dithered);
+      if constexpr (!CacheOnly) {
+        pw.writePixel(outX, dithered);
+      }
       if (caching) cw.writePixel(outX, dithered);
     }
   }
 
   return 1;
+}
+
+// Thin dispatcher: validates the context, performs the cooperative cancel-yield
+// once (kept out of the templated body so it isn't duplicated into both
+// specializations), then selects the cache-only or framebuffer specialization.
+int jpegDrawCallback(JPEGDRAW* pDraw) {
+  JpegContext* ctx = reinterpret_cast<JpegContext*>(pDraw->pUser);
+  if (!ctx || !ctx->config || !ctx->renderer) return 0;
+
+  // Cooperative cancellation: only when a cancel hook is supplied (null on the
+  // normal render path -> zero overhead). Yield ~1ms so the single-core main task
+  // can run and set the cancel flag, then observe it. JPEGDEC treats a 0 return as
+  // an abort (same path as the invalid-context guard above).
+  if (ctx->cancelFn) {
+    vTaskDelay(1);
+    if (ctx->cancelFn(ctx->cancelCtx)) return 0;
+  }
+
+  return ctx->config->cacheOnly ? drawJpegBlock<true>(pDraw, ctx) : drawJpegBlock<false>(pDraw, ctx);
 }
 
 }  // namespace
@@ -402,6 +448,8 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
   ctx.config = &config;
   ctx.screenWidth = renderer.getScreenWidth();
   ctx.screenHeight = renderer.getScreenHeight();
+  ctx.cancelFn = config.cancelFn;
+  ctx.cancelCtx = config.cancelCtx;
 
   int rc = jpeg->open(imagePath.c_str(), jpegOpen, jpegClose, jpegRead, jpegSeek, jpegDrawCallback);
   const ScopedCleanup cleanup{[&jpeg]() { jpeg->close(); }};
@@ -499,7 +547,16 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
 
   if (rc != 1) {
     LOG_ERR("JPG", "Decode failed (rc=%d, lastError=%d)", rc, jpeg->getLastError());
-    if (ctx.caching) ctx.cache.abort();
+    if (ctx.caching) {
+      // Distinguish a cancellation from a genuine decode error: on cancel keep the
+      // partial .pxc (the reader re-decodes via the short-read fallback); on a real
+      // error delete it so a later decode starts clean.
+      if (ctx.cancelFn && ctx.cancelFn(ctx.cancelCtx)) {
+        ctx.cache.close_partial();
+      } else {
+        ctx.cache.abort();
+      }
+    }
     return false;
   }
 

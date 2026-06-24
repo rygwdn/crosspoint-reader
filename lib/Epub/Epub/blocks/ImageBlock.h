@@ -21,6 +21,15 @@ class ImageBlock final : public Block {
   bool isEmpty() override { return false; }
 
   void render(GfxRenderer& renderer, const int x, const int y);
+
+  // Decode + write the .pxc cache for this image WITHOUT needing a strip/page render.
+  // If a cache file already exists, returns true immediately (no work). The decode is
+  // cooperatively cancellable via cancelFn/cancelCtx (threaded into RenderConfig); a
+  // cancelled decode leaves a partial .pxc that the normal render path re-decodes.
+  // x,y must be the image's on-page render position (same coords ImageBlock::render gets).
+  bool warmCache(GfxRenderer& renderer, int x, int y, bool (*cancelFn)(void* ctx) = nullptr,
+                 void* cancelCtx = nullptr);
+
   bool serialize(HalFile& file);
   static std::unique_ptr<ImageBlock> deserialize(HalFile& file);
 

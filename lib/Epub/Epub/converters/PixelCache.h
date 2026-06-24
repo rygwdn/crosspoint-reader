@@ -163,6 +163,17 @@ struct PixelCache {
     return true;
   }
 
+  // Close the file but intentionally KEEP the truncated partial cache on disk.
+  // Used when a decode is cancelled mid-stream: the reader detects the short file
+  // via a short row read in renderFromCache() and falls back to a full re-decode,
+  // so the partial file is harmless and avoids deleting work we may reuse later.
+  // Must close the file so the destructor (which calls abort() only when the file
+  // is still open) does not then delete it.
+  void close_partial() {
+    if (file.isOpen()) file.close();
+    ok = false;
+  }
+
   // Drop a partial/failed cache so a later decode re-creates it cleanly.
   void abort() {
     if (file.isOpen()) file.close();

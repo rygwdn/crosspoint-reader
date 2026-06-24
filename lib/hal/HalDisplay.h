@@ -38,7 +38,11 @@ class HalDisplay {
   void drawImageTransparent(const uint8_t* imageData, uint16_t x, uint16_t y, uint16_t w, uint16_t h,
                             bool fromProgmem = false) const;
 
-  void displayBuffer(RefreshMode mode = RefreshMode::FAST_REFRESH, bool turnOffScreen = false);
+  // `idle` (default {}) runs a tiny unit of work each ~1ms while the e-ink
+  // busy-wait blocks; default {} reproduces the original behaviour exactly.
+  // IdleWork is defined in EInkDisplay.h (included above), so the HAL reuses
+  // the SDK type rather than introducing a reverse dependency.
+  void displayBuffer(RefreshMode mode = RefreshMode::FAST_REFRESH, bool turnOffScreen = false, IdleWork idle = {});
   void refreshDisplay(RefreshMode mode = RefreshMode::FAST_REFRESH, bool turnOffScreen = false);
 
   // Power management
@@ -52,7 +56,7 @@ class HalDisplay {
   void copyGrayscaleMsbBuffers(const uint8_t* msbBuffer);
   void cleanupGrayscaleBuffers(const uint8_t* bwBuffer);
 
-  void displayGrayBuffer(bool turnOffScreen = false);
+  void displayGrayBuffer(bool turnOffScreen = false, IdleWork idle = {});
 
   // Tiled grayscale: stream one band of a plane (lsbPlane selects LSB/MSB RAM)
   // straight to the controller; supportsStripGrayscale() gates the path. See

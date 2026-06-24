@@ -3,6 +3,7 @@
 #include <Epub/FootnoteEntry.h>
 #include <Epub/Section.h>
 
+#include <atomic>
 #include <optional>
 
 #include "EpubReaderMenuActivity.h"
@@ -42,6 +43,11 @@ class EpubReaderActivity final : public Activity {
   // Consumed in onExit() to relocate the finished book into /Read/.
   bool pendingReadFolderMove = false;
   bool returnToCallerAtEnd = false;
+  // Cross-task abort flag for the W3 next-page image pre-warm. Written on the
+  // MAIN task (loop), read on the RENDER task (decode callback); std::atomic
+  // because no other lock covers it. No existing volatile/atomic flag convention
+  // exists in this file, so std::atomic<bool> is used per the change spec.
+  std::atomic<bool> _cancelPrewarm{false};
 
   // Footnote support
   std::vector<FootnoteEntry> currentPageFootnotes;
@@ -77,6 +83,14 @@ class EpubReaderActivity final : public Activity {
   explicit EpubReaderActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, std::unique_ptr<Epub> epub)
       : Activity("EpubReader", renderer, mappedInput), epub(std::move(epub)) {}
   void setReturnToCallerAtEnd(bool v) { returnToCallerAtEnd = v; }
+
+  // Set true on the MAIN task (loop()) when the user navigates away, so an
+  // in-flight W3 pre-warm decode running on the RENDER task aborts promptly.
+  // Reset to false at the start of render(). Read via the static thunk below,
+  // which is passed to ImageBlock::warmCache as its cancelFn.
+  static bool prewarmCancelRequested(void* ctx) {
+    return static_cast<EpubReaderActivity*>(ctx)->_cancelPrewarm.load();
+  }
   void onEnter() override;
   void onExit() override;
   void loop() override;
