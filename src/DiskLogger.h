@@ -25,8 +25,8 @@ class DiskLogger {
   static constexpr int FLUSH_INTERVAL = 16;
 
   static int linesSinceFlush;
-  // Guards against re-entry: HalStorage calls LOG_ERR internally, which would
-  // otherwise recurse back into logLine() and then into writeRingBufferToFile().
+  // Guards against same-task re-entry: HalStorage calls LOG_ERR internally,
+  // which would otherwise recurse back into logLine() → writeRingBufferToFile().
   static volatile bool reentrant;
 
   static void writeRingBufferToFile();
