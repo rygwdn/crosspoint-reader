@@ -1,7 +1,8 @@
 #pragma once
 
-#include <cstddef>
 #include <freertos/semphr.h>
+
+#include <cstddef>
 
 // Captures firmware log lines to SD card by flushing the RTC ring buffer every
 // FLUSH_INTERVAL log calls. Enabled/disabled at runtime via SETTINGS.diskLogsEnabled.

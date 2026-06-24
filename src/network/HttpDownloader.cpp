@@ -153,8 +153,8 @@ HttpDownloader::DownloadError runGet(const std::string& url, const std::string& 
   const uint32_t transferMs = tDone - tConnected;
   // bytes/ms == KB/s (1000 ms/s ÷ 1024 B/KB ≈ 1); use exact integer arithmetic.
   const uint32_t kbps = transferMs > 0 ? (uint32_t)((uint64_t)sink.downloaded * 1000 / 1024 / transferMs) : 0;
-  LOG_INF("HTTP", "connect %ums, %u bytes in %ums (%u KB/s) [net %ums, disk %ums]",
-          connectMs, (unsigned)sink.downloaded, transferMs, kbps, netMs, diskMs);
+  LOG_INF("HTTP", "connect %ums, %u bytes in %ums (%u KB/s) [net %ums, disk %ums]", connectMs,
+          (unsigned)sink.downloaded, transferMs, kbps, netMs, diskMs);
 
   return HttpDownloader::OK;
 }
