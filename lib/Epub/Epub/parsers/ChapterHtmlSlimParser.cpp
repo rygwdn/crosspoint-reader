@@ -487,30 +487,50 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
           std::string resolvedPath = FsHelpers::normalisePath(FsHelpers::decodeUriEscapes(self->contentBase + src));
 
           if (ImageDecoderFactory::isFormatSupported(resolvedPath)) {
-            // Create a unique filename for the cached image
             std::string ext;
             size_t extPos = resolvedPath.rfind('.');
             if (extPos != std::string::npos) {
               ext = resolvedPath.substr(extPos);
             }
-            std::string cachedImagePath = self->imageBasePath + std::to_string(self->imageCounter++) + ext;
+            const int imageIdx = self->imageCounter++;
+            std::string cachedImagePath;
+            ImageDimensions dims = {0, 0};
+            bool haveImage = false;
 
-            // Extract image to cache file
-            HalFile cachedImageFile;
-            bool extractSuccess = false;
-            if (Storage.openFileForWrite("EHP", cachedImagePath, cachedImageFile)) {
-              extractSuccess = self->epub->readItemContentsToStream(resolvedPath, cachedImageFile, 4096);
-              cachedImageFile.flush();
-              cachedImageFile.close();
-              delay(50);  // Give SD card time to sync
+            const std::vector<PrecomputedImage>* preImages = self->precomputedImages;
+            if (preImages && imageIdx < static_cast<int>(preImages->size()) &&
+                (*preImages)[imageIdx].intrinsicWidth > 0) {
+              // Pre-pass already extracted this image; reuse the cached file and dimensions.
+              const PrecomputedImage& pre = (*preImages)[imageIdx];
+              cachedImagePath = pre.cachedPath;
+              dims.width = pre.intrinsicWidth;
+              dims.height = pre.intrinsicHeight;
+              haveImage = true;
+            } else {
+              // No pre-pass data: extract from ZIP and get dimensions inline.
+              cachedImagePath = self->imageBasePath + std::to_string(imageIdx) + ext;
+              HalFile cachedImageFile;
+              if (Storage.openFileForWrite("EHP", cachedImagePath, cachedImageFile)) {
+                const bool ok = self->epub->readItemContentsToStream(resolvedPath, cachedImageFile, 4096);
+                cachedImageFile.flush();
+                cachedImageFile.close();
+                delay(50);  // Give SD card time to sync
+                if (ok) {
+                  ImageToFramebufferDecoder* decoder = ImageDecoderFactory::getDecoder(cachedImagePath);
+                  if (decoder && decoder->getDimensions(cachedImagePath, dims)) {
+                    haveImage = true;
+                  } else {
+                    LOG_ERR("EHP", "Failed to get image dimensions");
+                    Storage.remove(cachedImagePath.c_str());
+                  }
+                } else {
+                  LOG_ERR("EHP", "Failed to extract image");
+                }
+              }
             }
 
-            if (extractSuccess) {
-              // Get image dimensions
-              ImageDimensions dims = {0, 0};
-              ImageToFramebufferDecoder* decoder = ImageDecoderFactory::getDecoder(cachedImagePath);
-              if (decoder && decoder->getDimensions(cachedImagePath, dims)) {
-                LOG_DBG("EHP", "Image dimensions: %dx%d", dims.width, dims.height);
+            if (haveImage) {
+              LOG_DBG("EHP", "Image dimensions: %dx%d", dims.width, dims.height);
 
                 int displayWidth = 0;
                 int displayHeight = 0;
@@ -687,12 +707,6 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
 
                 self->depth += 1;
                 return;
-              } else {
-                LOG_ERR("EHP", "Failed to get image dimensions");
-                Storage.remove(cachedImagePath.c_str());
-              }
-            } else {
-              LOG_ERR("EHP", "Failed to extract image");
             }
           }  // isFormatSupported
         }

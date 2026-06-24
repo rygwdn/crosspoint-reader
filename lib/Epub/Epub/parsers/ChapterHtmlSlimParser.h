@@ -21,6 +21,16 @@ class Epub;
 
 #define MAX_WORD_SIZE 200
 
+// Holds the result of the image pre-pass for a single <img> element.
+// Passed from Section::createSectionFile into ChapterHtmlSlimParser so the layout
+// pass can use already-extracted images without touching the ZIP or the JPEG decoder,
+// keeping ZIP ring-buffer and JPEG allocations out of the heap-heavy layout phase.
+struct PrecomputedImage {
+  std::string cachedPath;
+  int16_t intrinsicWidth = 0;   // 0 = extraction or decode failed; image will be skipped
+  int16_t intrinsicHeight = 0;
+};
+
 class ChapterHtmlSlimParser {
   std::shared_ptr<Epub> epub;
   const std::string& filepath;
@@ -54,6 +64,7 @@ class ChapterHtmlSlimParser {
   std::string contentBase;
   std::string imageBasePath;
   int imageCounter = 0;
+  const std::vector<PrecomputedImage>* precomputedImages = nullptr;
 
   // Style tracking (replaces depth-based approach)
   struct StyleStackEntry {
@@ -131,7 +142,8 @@ class ChapterHtmlSlimParser {
                                  const bool embeddedStyle, const std::string& contentBase,
                                  const std::string& imageBasePath, const uint8_t imageRendering = 0,
                                  std::vector<std::string> tocAnchors = {},
-                                 const std::function<void()>& popupFn = nullptr, const CssParser* cssParser = nullptr)
+                                 const std::function<void()>& popupFn = nullptr, const CssParser* cssParser = nullptr,
+                                 const std::vector<PrecomputedImage>* precomputedImages = nullptr)
 
       : epub(epub),
         filepath(filepath),
@@ -151,7 +163,8 @@ class ChapterHtmlSlimParser {
         imageRendering(imageRendering),
         contentBase(contentBase),
         imageBasePath(imageBasePath),
-        tocAnchors(std::move(tocAnchors)) {}
+        tocAnchors(std::move(tocAnchors)),
+        precomputedImages(precomputedImages) {}
 
   ~ChapterHtmlSlimParser() = default;
   bool parseAndBuildPages();
