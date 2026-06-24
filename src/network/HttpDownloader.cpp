@@ -76,6 +76,7 @@ HttpDownloader::DownloadError runGet(const std::string& url, const std::string& 
   // open()/read() does not auto-follow redirects (only perform() does), so step
   // 30x responses manually. OPDS download endpoints and the GitHub release CDN
   // both redirect.
+  const uint32_t tStart = millis();
   esp_err_t err = esp_http_client_open(client, 0);
   if (err != ESP_OK) {
     LOG_ERR("HTTP", "open failed: %s", esp_err_to_name(err));
@@ -95,6 +96,7 @@ HttpDownloader::DownloadError runGet(const std::string& url, const std::string& 
     contentLength = esp_http_client_fetch_headers(client);
     status = esp_http_client_get_status_code(client);
   }
+  const uint32_t tConnected = millis();
 
   if (status != 200) {
     LOG_ERR("HTTP", "unexpected status: %d", status);
@@ -132,6 +134,7 @@ HttpDownloader::DownloadError runGet(const std::string& url, const std::string& 
     sink.downloaded += read;
     if (sink.progress && sink.total > 0) sink.progress(sink.downloaded, sink.total);
   }
+  const uint32_t tDone = millis();
 
   const bool complete = esp_http_client_is_complete_data_received(client);
   esp_http_client_cleanup(client);
@@ -139,6 +142,13 @@ HttpDownloader::DownloadError runGet(const std::string& url, const std::string& 
     LOG_ERR("HTTP", "incomplete: got %zu of %zu bytes", sink.downloaded, sink.total);
     return HttpDownloader::HTTP_ERROR;
   }
+
+  const uint32_t connectMs = tConnected - tStart;
+  const uint32_t transferMs = tDone - tConnected;
+  // bytes/ms == KB/s (1000 ms/s ÷ 1024 B/KB ≈ 1); use exact integer arithmetic.
+  const uint32_t kbps = transferMs > 0 ? (uint32_t)((uint64_t)sink.downloaded * 1000 / 1024 / transferMs) : 0;
+  LOG_INF("HTTP", "connect %ums, %u bytes in %ums (%u KB/s)", connectMs, (unsigned)sink.downloaded, transferMs, kbps);
+
   return HttpDownloader::OK;
 }
 }  // namespace
