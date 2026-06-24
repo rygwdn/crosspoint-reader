@@ -171,7 +171,7 @@ void ImageBlock::render(GfxRenderer& renderer, const int x, const int y) {
     return;
   }
 
-  LOG_DBG("IMG", "Decoding and caching: %s", imagePath.c_str());
+  LOG_DBG("IMG", "Decoding and caching: %s (free_heap=%d)", imagePath.c_str(), (int)ESP.getFreeHeap());
 
   RenderConfig config;
   config.x = x;
