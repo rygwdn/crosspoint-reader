@@ -24,14 +24,14 @@ struct PageLutEntry {
 };
 }  // namespace
 
-uint32_t Section::onPageComplete(std::unique_ptr<Page> page) {
+uint32_t Section::onPageComplete(const Page& page) {
   if (!file) {
     LOG_ERR("SCT", "File not open for writing page %d", pageCount);
     return 0;
   }
 
   const uint32_t position = file.position();
-  if (!page->serialize(file)) {
+  if (!page.serialize(file)) {
     LOG_ERR("SCT", "Failed to serialize page %d", pageCount);
     return 0;
   }
@@ -153,7 +153,9 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
                                 const uint8_t paragraphAlignment, const uint16_t viewportWidth,
                                 const uint16_t viewportHeight, const bool hyphenationEnabled, const bool embeddedStyle,
                                 const uint8_t imageRendering, const bool focusReadingEnabled,
-                                const std::function<void()>& popupFn) {
+                                const std::function<void()>& popupFn,
+                                const std::function<void(std::unique_ptr<Page>)>& firstPageReadyFn,
+                                const int firstPageReadyTarget) {
   const auto localPath = epub->getSpineItem(spineIndex).href;
   const auto tmpHtmlPath = epub->getCachePath() + "/.tmp_" + std::to_string(spineIndex) + ".html";
 
@@ -238,8 +240,15 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
   ChapterHtmlSlimParser visitor(
       epub, tmpHtmlPath, renderer, fontId, lineCompression, extraParagraphSpacing, paragraphAlignment, viewportWidth,
       viewportHeight, hyphenationEnabled, focusReadingEnabled,
-      [this, &lut](std::unique_ptr<Page> page, const uint16_t paragraphIndex, const uint16_t listItemIndex) {
-        lut.push_back({this->onPageComplete(std::move(page)), paragraphIndex, listItemIndex});
+      [this, &lut, &firstPageReadyFn, firstPageReadyTarget](std::unique_ptr<Page> page, const uint16_t paragraphIndex,
+                                                            const uint16_t listItemIndex) {
+        const bool isTarget =
+            firstPageReadyFn && firstPageReadyTarget >= 0 && static_cast<int>(lut.size()) == firstPageReadyTarget;
+        const auto offset = this->onPageComplete(*page);
+        lut.push_back({offset, paragraphIndex, listItemIndex});
+        if (isTarget) {
+          firstPageReadyFn(std::move(page));
+        }
       },
       embeddedStyle, contentBase, imageBasePath, imageRendering, std::move(tocAnchors), popupFn, cssParser);
   Hyphenator::setPreferredLanguage(epub->getLanguage());
