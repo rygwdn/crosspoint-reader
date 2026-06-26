@@ -879,7 +879,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
           currentPageFootnotes = std::move(page->footnotes);
           renderer.clearScreen();
           renderContents(std::move(page), orientedMarginTop, orientedMarginRight, orientedMarginBottom,
-                         orientedMarginLeft);
+                         orientedMarginLeft, true);
           earlyRenderDone = true;
         };
       }
@@ -1051,7 +1051,7 @@ bool EpubReaderActivity::saveProgress(int spineIndex, int currentPage, int pageC
 }
 void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int orientedMarginTop,
                                         const int orientedMarginRight, const int orientedMarginBottom,
-                                        const int orientedMarginLeft) {
+                                        const int orientedMarginLeft, const bool earlyRender) {
   const auto t0 = millis();
   const int fontId = SETTINGS.getReaderFontId();
 
@@ -1076,6 +1076,15 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   page->render(renderer, fontId, orientedMarginLeft, orientedMarginTop);
   renderStatusBar();
   const auto tBwRender = millis();
+
+  if (earlyRender) {
+    // Called during section indexing: skip image blanking and grayscale to avoid
+    // watchdog timeout from the multi-second display sequence.
+    renderer.displayBuffer(HalDisplay::HALF_REFRESH);
+    LOG_DBG("ERS", "Page render (early): prewarm=%lums bw_render=%lums total=%lums", tPrewarm - t0,
+            tBwRender - tPrewarm, millis() - t0);
+    return;
+  }
 
   if (pageHasImages) {
     // Double FAST_REFRESH with selective image blanking (pablohc's technique):
