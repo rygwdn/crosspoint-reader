@@ -875,11 +875,14 @@ void EpubReaderActivity::render(RenderLock&& lock) {
       if (earlyRenderTargetPage >= 0) {
         firstPageReadyFn = [this, &earlyRenderDone, earlyRenderTargetPage, orientedMarginTop, orientedMarginRight,
                             orientedMarginBottom, orientedMarginLeft](std::unique_ptr<Page> page) {
+          LOG_DBG("ERS", "Early render: page %d has_images=%d free_heap=%d", earlyRenderTargetPage,
+                  (int)page->hasImages(), (int)ESP.getFreeHeap());
           section->currentPage = earlyRenderTargetPage;
           currentPageFootnotes = std::move(page->footnotes);
           renderer.clearScreen();
           renderContents(std::move(page), orientedMarginTop, orientedMarginRight, orientedMarginBottom,
                          orientedMarginLeft, true);
+          LOG_DBG("ERS", "Early render complete free_heap=%d", (int)ESP.getFreeHeap());
           earlyRenderDone = true;
         };
       }
@@ -1065,6 +1068,8 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   const bool pageHasImages = page->hasImages();
   const bool needsTextGrayscale = SETTINGS.textAntiAliasing;
   const bool needsAnyGrayscale = needsTextGrayscale || pageHasImages;
+  LOG_DBG("ERS", "renderContents early=%d has_images=%d free_heap=%d", (int)earlyRender, (int)pageHasImages,
+          (int)ESP.getFreeHeap());
   auto renderGrayscalePass = [&]() {
     if (needsTextGrayscale) {
       page->render(renderer, fontId, orientedMarginLeft, orientedMarginTop);
