@@ -376,6 +376,14 @@ void EpubReaderActivity::loop() {
           }
         }
         break;
+      case CrossPointSettings::LP_MENU_SLEEP:
+        // Hold ~1s goes to sleep.
+        if (mappedInput.getHeldTime() >= ReaderUtils::GO_HOME_MS) {
+          ignoreNextConfirmRelease = true;
+          activityManager.goToSleep();
+          return;
+        }
+        break;
       case CrossPointSettings::LP_MENU_DISABLED:
       default:
         break;
@@ -388,14 +396,14 @@ void EpubReaderActivity::loop() {
     return;
   }
 
-  // Short press BACK goes directly to home (or restores position if viewing footnote)
+  // finish() lets push-callers (e.g. OPDS browser) return normally; replace-callers still reach Home via empty stack.
   if (mappedInput.wasReleased(MappedInputManager::Button::Back) &&
       mappedInput.getHeldTime() < ReaderUtils::GO_HOME_MS) {
     if (footnoteDepth > 0) {
       restoreSavedPosition();
       return;
     }
-    onGoHome();
+    finish();
     return;
   }
 
@@ -430,10 +438,14 @@ void EpubReaderActivity::loop() {
     return;
   }
 
-  // At end of the book, forward button goes home and back button returns to last page
+  // At end of the book, forward button goes home (or back to caller) and back button returns to last page
   if (currentSpineIndex > 0 && currentSpineIndex >= epub->getSpineItemsCount()) {
     if (nextTriggered) {
-      onGoHome();
+      if (returnToCallerAtEnd) {
+        finish();
+      } else {
+        onGoHome();
+      }
     } else {
       currentSpineIndex = epub->getSpineItemsCount() - 1;
       nextPageNumber = 0;
