@@ -357,6 +357,14 @@ bool Section::buildSomeMore(const int maxPages) {
   }
 }
 
+std::optional<uint16_t> Section::findAnchorDuringBuild(const std::string& anchor) const {
+  if (!build_ || !build_->parser) return std::nullopt;
+  for (const auto& [key, page] : build_->parser->getAnchors()) {
+    if (key == anchor) return page;
+  }
+  return std::nullopt;
+}
+
 uint16_t Section::estimatedTotalPages() const {
   if (!build_) return pageCount;  // finalized -> exact count
   const uint32_t consumed = build_->bytesConsumed;

@@ -886,7 +886,11 @@ void EpubReaderActivity::render(RenderLock&& lock) {
       // page and finishes the rest in loop(). The settings-change reposition (cachedChapterTotal*)
       // is NOT a full-build trigger: it's deferred to applyDeferredReposition() once the real page
       // count is known, so it never blocks the first page.
-      const bool needsFullBuild = !pendingAnchor.empty() || pendingPercentJump;
+      // Only a percent jump truly needs the whole chapter up front (percent -> page needs the final
+      // page count). Anchor jumps (TOC / chapter select / footnotes) resolve incrementally below --
+      // the anchor is recorded as its page is laid out, so a chapter-top anchor lands on page 0
+      // without indexing the whole chapter.
+      const bool needsFullBuild = pendingPercentJump;
       if (needsFullBuild) {
         GUI.drawPopup(renderer, tr(STR_INDEXING));
         const auto popupFn = [this]() { GUI.drawPopup(renderer, tr(STR_INDEXING)); };
@@ -921,7 +925,12 @@ void EpubReaderActivity::render(RenderLock&& lock) {
           showPendingSyncSaveError();
           return;
         }
-        while (!section->isBuildComplete() && static_cast<int>(section->pageCount) <= target) {
+        const bool anchorJump = !pendingAnchor.empty();
+        while (!section->isBuildComplete() &&
+               (anchorJump ? !section->findAnchorDuringBuild(pendingAnchor)
+                           : static_cast<int>(section->pageCount) <= target)) {
+          // Anchor jump: build until the anchor's page is laid out (usually page 0). Otherwise:
+          // build until the target page exists. loop() builds the rest behind it.
           if (!section->buildSomeMore(BUILD_PAGES_PER_CHUNK)) {
             LOG_ERR("ERS", "Failed during incremental section build");
             section.reset();
@@ -952,7 +961,10 @@ void EpubReaderActivity::render(RenderLock&& lock) {
     }
 
     if (!pendingAnchor.empty()) {
-      if (const auto page = section->getPageForAnchor(pendingAnchor)) {
+      // While building, resolve from the pages laid out so far; once finalized, from the .bin map.
+      const auto page = section->isBuilding() ? section->findAnchorDuringBuild(pendingAnchor)
+                                              : section->getPageForAnchor(pendingAnchor);
+      if (page) {
         section->currentPage = *page;
         LOG_DBG("ERS", "Resolved anchor '%s' to page %d", pendingAnchor.c_str(), *page);
       } else {
