@@ -63,6 +63,15 @@ class EpubReaderActivity final : public Activity {
   // page-turn critical path) so navigating forward never blocks on indexing.
   void silentIndexAheadIfNeeded(uint16_t viewportWidth, uint16_t viewportHeight);
   static constexpr int PREFETCH_SECTIONS_AHEAD = 5;
+  // Pages laid out per incremental-build pump: on the render path (catching up to the page
+  // being shown) and per loop() tick (background build of a large chapter). Kept small so a
+  // background build chunk never noticeably delays input or a pending render.
+  static constexpr int BUILD_PAGES_PER_CHUNK = 8;
+  static constexpr int BACKGROUND_BUILD_PAGES_PER_TICK = 4;
+  // Remap the cached relative reading position once the section's real page count is known
+  // (used after a settings change re-paginates a chapter). Returns true if currentPage moved.
+  // No-op while the section is still building or when the pagination is unchanged (plain resume).
+  bool applyDeferredReposition();
   bool saveProgress(int spineIndex, int currentPage, int pageCount);
   // Jump to a percentage of the book (0-100), mapping it to spine and page.
   void jumpToPercent(int percent);

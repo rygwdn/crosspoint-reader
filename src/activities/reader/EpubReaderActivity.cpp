@@ -238,6 +238,25 @@ void EpubReaderActivity::loop() {
     return;
   }
 
+  // Drive any in-progress incremental section build forward, off the page-turn critical path,
+  // so a large chapter finishes laying out (and caching) while the reader is on the first page
+  // and later pages turn instantly. Skip while the render mutex is busy so we never delay a
+  // pending render; re-check isBuilding() under the lock since render() may have just finished it.
+  if (section && section->isBuilding() && !RenderLock::peek()) {
+    RenderLock lock;
+    if (section->isBuilding()) {
+      if (!section->buildSomeMore(BACKGROUND_BUILD_PAGES_PER_TICK)) {
+        LOG_ERR("ERS", "Background section build failed");
+        section.reset();
+        requestUpdate();
+      } else if (section->isBuildComplete() && applyDeferredReposition()) {
+        // The chapter re-paginated since the saved progress (settings changed): we now know the
+        // real page count, so re-render at the remapped page. No-op for an unchanged resume.
+        requestUpdate();
+      }
+    }
+  }
+
   // End-of-Book screen reached (currentSpineIndex == spine count) means the book is
   // finished. Two independent finished-book features key off this same condition.
   const bool atEndOfBook = currentSpineIndex > 0 && currentSpineIndex >= epub->getSpineItemsCount();
@@ -853,18 +872,46 @@ void EpubReaderActivity::render(RenderLock&& lock) {
                                   SETTINGS.imageRendering, SETTINGS.focusReadingEnabled)) {
       LOG_DBG("ERS", "Cache not found, building...");
 
-      GUI.drawPopup(renderer, tr(STR_INDEXING));
-
-      const auto popupFn = [this]() { GUI.drawPopup(renderer, tr(STR_INDEXING)); };
-
-      if (!section->createSectionFile(SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(),
+      // Jumps that need the final pagination or the anchor map -- explicit page jumps,
+      // fragment anchors, percent jumps, and cross-setting progress repositioning -- can't
+      // resolve their landing page until the whole chapter is laid out, so they take the full
+      // (blocking) build with the indexing popup. Everything else -- plain forward reads, resume,
+      // and explicit page jumps -- only needs a specific page, so it builds incrementally to that
+      // page and finishes the rest in loop(). The settings-change reposition (cachedChapterTotal*)
+      // is NOT a full-build trigger: it's deferred to applyDeferredReposition() once the real page
+      // count is known, so it never blocks the first page.
+      const bool needsFullBuild = !pendingAnchor.empty() || pendingPercentJump;
+      if (needsFullBuild) {
+        GUI.drawPopup(renderer, tr(STR_INDEXING));
+        const auto popupFn = [this]() { GUI.drawPopup(renderer, tr(STR_INDEXING)); };
+        if (!section->createSectionFile(SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(),
+                                        SETTINGS.extraParagraphSpacing, SETTINGS.paragraphAlignment, viewportWidth,
+                                        viewportHeight, SETTINGS.hyphenationEnabled, SETTINGS.embeddedStyle,
+                                        SETTINGS.imageRendering, SETTINGS.focusReadingEnabled, popupFn)) {
+          LOG_ERR("ERS", "Failed to persist page data to SD");
+          section.reset();
+          showPendingSyncSaveError();
+          return;
+        }
+      } else if (!section->startBuild(SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(),
                                       SETTINGS.extraParagraphSpacing, SETTINGS.paragraphAlignment, viewportWidth,
                                       viewportHeight, SETTINGS.hyphenationEnabled, SETTINGS.embeddedStyle,
-                                      SETTINGS.imageRendering, SETTINGS.focusReadingEnabled, popupFn)) {
-        LOG_ERR("ERS", "Failed to persist page data to SD");
+                                      SETTINGS.imageRendering, SETTINGS.focusReadingEnabled)) {
+        LOG_ERR("ERS", "Failed to start section build");
         section.reset();
         showPendingSyncSaveError();
         return;
+      } else {
+        // Lay out just enough to show the landing page; loop() builds the rest behind it.
+        const int target = pendingPageJump.has_value() ? *pendingPageJump : (nextPageNumber < 0 ? 0 : nextPageNumber);
+        while (!section->isBuildComplete() && static_cast<int>(section->pageCount) <= target) {
+          if (!section->buildSomeMore(BUILD_PAGES_PER_CHUNK)) {
+            LOG_ERR("ERS", "Failed during incremental section build");
+            section.reset();
+            showPendingSyncSaveError();
+            return;
+          }
+        }
       }
     } else {
       LOG_DBG("ERS", "Cache found, skipping build...");
@@ -897,17 +944,6 @@ void EpubReaderActivity::render(RenderLock&& lock) {
       pendingAnchor.clear();
     }
 
-    // handles changes in reader settings and reset to approximate position based on cached progress
-    if (cachedChapterTotalPageCount > 0) {
-      // only goes to relative position if spine index matches cached value
-      if (currentSpineIndex == cachedSpineIndex && section->pageCount != cachedChapterTotalPageCount) {
-        float progress = static_cast<float>(section->currentPage) / static_cast<float>(cachedChapterTotalPageCount);
-        int newPage = static_cast<int>(progress * section->pageCount);
-        section->currentPage = newPage;
-      }
-      cachedChapterTotalPageCount = 0;  // resets to 0 to prevent reading cached progress again
-    }
-
     if (pendingPercentJump && section->pageCount > 0) {
       // Apply the pending percent jump now that we know the new section's page count.
       int newPage = static_cast<int>(pendingSpineProgress * static_cast<float>(section->pageCount));
@@ -918,6 +954,29 @@ void EpubReaderActivity::render(RenderLock&& lock) {
       pendingPercentJump = false;
     }
   }
+
+  // For an in-progress incremental build, make sure the page we're about to show has been laid
+  // out. This runs every render, so it covers both the first page and any forward turn that gets
+  // ahead of the background builder; pages already built do no work here.
+  if (section->isBuilding()) {
+    while (!section->isBuildComplete() && section->currentPage >= static_cast<int>(section->pageCount)) {
+      if (!section->buildSomeMore(BUILD_PAGES_PER_CHUNK)) {
+        LOG_ERR("ERS", "Failed during incremental section build");
+        section.reset();
+        showPendingSyncSaveError();
+        return;
+      }
+    }
+    // Build finished with fewer pages than the requested page -> clamp to the last page.
+    if (section->isBuildComplete() && section->pageCount > 0 &&
+        section->currentPage >= static_cast<int>(section->pageCount)) {
+      section->currentPage = section->pageCount - 1;
+    }
+  }
+
+  // Apply a deferred settings-change reposition now that the real page count is known (a no-op for
+  // a plain resume / unchanged pagination). If still building, this defers to loop() on completion.
+  applyDeferredReposition();
 
   renderer.clearScreen();
 
@@ -944,7 +1003,10 @@ void EpubReaderActivity::render(RenderLock&& lock) {
   updateBookmarkFlag();
 
   {
-    auto p = section->loadPageFromSectionFile();
+    // While the section is still building, read the page from the partially-written .bin via
+    // the in-RAM page table; once finalized, read it the normal way.
+    auto p = section->isBuilding() ? section->loadPageDuringBuild(section->currentPage)
+                                   : section->loadPageFromSectionFile();
     if (!p) {
       LOG_ERR("ERS", "Failed to load page from SD - clearing section cache");
       section->clearCache();
@@ -978,8 +1040,34 @@ void EpubReaderActivity::render(RenderLock&& lock) {
   }
 }
 
+bool EpubReaderActivity::applyDeferredReposition() {
+  if (cachedChapterTotalPageCount == 0 || !section || section->isBuilding()) {
+    return false;
+  }
+  bool changed = false;
+  // Only remap when the chapter actually re-paginated (e.g. after a settings change). A plain
+  // resume has identical pagination, so section->pageCount == cachedChapterTotalPageCount and
+  // nothing moves.
+  if (currentSpineIndex == cachedSpineIndex && section->pageCount != cachedChapterTotalPageCount) {
+    const float progress = static_cast<float>(section->currentPage) / static_cast<float>(cachedChapterTotalPageCount);
+    int newPage = static_cast<int>(progress * static_cast<float>(section->pageCount));
+    if (newPage < 0) newPage = 0;
+    if (section->pageCount > 0 && newPage >= static_cast<int>(section->pageCount)) {
+      newPage = section->pageCount - 1;
+    }
+    if (newPage != section->currentPage) {
+      section->currentPage = newPage;
+      changed = true;
+    }
+  }
+  cachedChapterTotalPageCount = 0;  // consumed; don't read cached progress again
+  return changed;
+}
+
 void EpubReaderActivity::silentIndexAheadIfNeeded(const uint16_t viewportWidth, const uint16_t viewportHeight) {
-  if (!epub || !section) {
+  // Don't prefetch the next sections while the current one is still building incrementally --
+  // a full blocking build of an upcoming spine item would stall the in-progress build.
+  if (!epub || !section || section->isBuilding()) {
     return;
   }
 
