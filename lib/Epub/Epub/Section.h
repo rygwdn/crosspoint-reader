@@ -94,6 +94,10 @@ class Section {
   std::unique_ptr<Page> loadPageFromSectionFile();
   std::string getTextFromSectionFile();
 
+  // True if this spine's unzipped HTML is already cached, so a build won't pay the (multi-second on a
+  // giant spine) zip inflation. Lets the reader skip the indexing popup on a fast reopen/rebuild.
+  bool hasHtmlCache() const;
+
   // Look up the page number for an anchor id from the section cache file.
   std::optional<uint16_t> getPageForAnchor(const std::string& anchor) const;
 

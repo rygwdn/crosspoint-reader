@@ -893,6 +893,9 @@ void EpubReaderActivity::render(RenderLock&& lock) {
       const bool needsFullBuild = pendingPercentJump;
       if (needsFullBuild) {
         GUI.drawPopup(renderer, tr(STR_INDEXING));
+        // The popup's own refresh is a plain FAST, so force the page that replaces it onto the HALF
+        // ghost-cleanup path -- otherwise the "INDEXING" text ghosts under the rendered page.
+        pagesUntilFullRefresh = 1;
         const auto popupFn = [this]() { GUI.drawPopup(renderer, tr(STR_INDEXING)); };
         if (!section->createSectionFile(SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(),
                                         SETTINGS.extraParagraphSpacing, SETTINGS.paragraphAlignment, viewportWidth,
@@ -913,8 +916,14 @@ void EpubReaderActivity::render(RenderLock&& lock) {
         const size_t spineBytes =
             epub->getCumulativeSpineItemSize(currentSpineIndex) -
             (currentSpineIndex > 0 ? epub->getCumulativeSpineItemSize(currentSpineIndex - 1) : 0);
-        if (spineBytes > BUILD_POPUP_BYTE_THRESHOLD || target > BUILD_POPUP_PAGE_THRESHOLD) {
+        // Popup only when the build will actually be slow: a big spine whose HTML still needs
+        // inflating (the multi-second cost), or a deep page target. A reopen with cached HTML builds
+        // fast, so no popup -- that's what made an already-indexed book look like it was reindexing.
+        const bool willInflate = !section->hasHtmlCache();
+        if ((spineBytes > BUILD_POPUP_BYTE_THRESHOLD && willInflate) || target > BUILD_POPUP_PAGE_THRESHOLD) {
           GUI.drawPopup(renderer, tr(STR_INDEXING));
+          // HALF-clear the popup when the page replaces it, else "INDEXING" ghosts under the page.
+          pagesUntilFullRefresh = 1;
         }
         if (!section->startBuild(SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(),
                                  SETTINGS.extraParagraphSpacing, SETTINGS.paragraphAlignment, viewportWidth,

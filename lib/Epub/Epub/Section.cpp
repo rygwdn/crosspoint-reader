@@ -204,9 +204,11 @@ bool Section::startBuild(const int fontId, const float lineCompression, const bo
   // Reuse the previously unzipped HTML if we already have it. The unzipped HTML is keyed only on the
   // book (it lives in the per-book cache dir), not on render settings, so it survives the invalidation
   // that wipes the layout (.bin) caches when font/margin/orientation change -- rebuilds then skip zip
-  // inflation entirely. The persistent file is only ever created by an atomic rename after a fully
-  // successful parse (finalizeBuild), so if it exists it is known-complete.
+  // inflation entirely. It's promoted by an atomic rename as soon as the inflate succeeds (below), so
+  // even a window-only giant spine -- whose .bin never finalizes -- still caches its HTML, letting a
+  // reopen skip the multi-second inflate. If htmlPath exists it is known-complete.
   const bool reusedHtml = Storage.exists(htmlPath.c_str());
+  bool htmlCached = reusedHtml;
   if (reusedHtml) {
     LOG_DBG("SCT", "Reusing cached HTML %s", htmlPath.c_str());
   } else {
@@ -251,6 +253,15 @@ bool Section::startBuild(const int fontId, const float lineCompression, const bo
     }
 
     LOG_DBG("SCT", "Streamed temp HTML to %s (%d bytes)", tmpHtmlPath.c_str(), fileSize);
+
+    // Promote to the persistent HTML cache immediately -- the inflate is complete and the bytes are
+    // valid regardless of whether the layout build finishes, so reopening (even a window-only spine
+    // that never finalizes its .bin) skips re-inflation. If the rename fails we just parse the temp.
+    if (Storage.rename(tmpHtmlPath.c_str(), htmlPath.c_str())) {
+      htmlCached = true;
+    } else {
+      LOG_DBG("SCT", "Failed to promote HTML cache; parsing from temp");
+    }
   }
 
   if (!Storage.openFileForWrite("SCT", filePath, file)) {
@@ -269,10 +280,12 @@ bool Section::startBuild(const int fontId, const float lineCompression, const bo
     if (!reusedHtml) Storage.remove(tmpHtmlPath.c_str());
     return false;
   }
-  ctx->reusedHtml = reusedHtml;
+  // htmlCached == "htmlPath is the live cache" (reused, or just promoted). finalizeBuild/abandonBuild
+  // then leave the cached HTML alone; only an un-promoted temp (rename failed) is theirs to clean up.
+  ctx->reusedHtml = htmlCached;
   ctx->htmlPath = htmlPath;
   ctx->tmpHtmlPath = tmpHtmlPath;
-  ctx->parsePath = reusedHtml ? htmlPath : tmpHtmlPath;
+  ctx->parsePath = htmlCached ? htmlPath : tmpHtmlPath;
 
   // Derive the content base directory and image cache path prefix for the parser
   const size_t lastSlash = localPath.find_last_of('/');
@@ -355,6 +368,11 @@ bool Section::buildSomeMore(const int maxPages) {
       return true;
     }
   }
+}
+
+bool Section::hasHtmlCache() const {
+  const std::string htmlPath = epub->getCachePath() + "/html/" + std::to_string(spineIndex) + ".html";
+  return Storage.exists(htmlPath.c_str());
 }
 
 std::optional<uint16_t> Section::findAnchorDuringBuild(const std::string& anchor) const {
