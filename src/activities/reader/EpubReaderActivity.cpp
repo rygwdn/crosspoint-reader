@@ -963,7 +963,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
     renderContents(std::move(p), orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft);
     LOG_DBG("ERS", "Rendered page in %dms", millis() - start);
   }
-  silentIndexNextChapterIfNeeded(viewportWidth, viewportHeight);
+  silentIndexAheadIfNeeded(viewportWidth, viewportHeight);
   saveProgress(currentSpineIndex, section->currentPage, section->pageCount);
 
   showPendingSyncSaveError();
@@ -978,35 +978,46 @@ void EpubReaderActivity::render(RenderLock&& lock) {
   }
 }
 
-void EpubReaderActivity::silentIndexNextChapterIfNeeded(const uint16_t viewportWidth, const uint16_t viewportHeight) {
-  if (!epub || !section || section->pageCount < 2) {
+void EpubReaderActivity::silentIndexAheadIfNeeded(const uint16_t viewportWidth, const uint16_t viewportHeight) {
+  if (!epub || !section) {
     return;
   }
 
-  // Build the next chapter cache while the penultimate page is on screen.
-  if (section->currentPage != section->pageCount - 2) {
+  // Only prefetch once we're at/near the end of the current section, so we don't do extra
+  // work while several pages still remain to read in this one. For a single-page section
+  // (pageCount 1, currentPage 0) this is true immediately, which is exactly the case that
+  // used to block on every page turn (front matter built of many one-page spine items).
+  if (section->pageCount > 0 && section->currentPage < section->pageCount - 2) {
     return;
   }
 
-  const int nextSpineIndex = currentSpineIndex + 1;
-  if (nextSpineIndex < 0 || nextSpineIndex >= epub->getSpineItemsCount()) {
-    return;
-  }
+  // Keep a window of upcoming sections built ahead of the reader. We're on the render task
+  // with the current page already on screen, so this work is off the page-turn critical
+  // path. Each section is built silently (no popupFn -> no e-ink refresh), one at a time;
+  // already-cached sections are skipped, so steady state only builds the new frontier.
+  const int spineCount = epub->getSpineItemsCount();
+  for (int offset = 1; offset <= PREFETCH_SECTIONS_AHEAD; offset++) {
+    const int nextSpineIndex = currentSpineIndex + offset;
+    if (nextSpineIndex >= spineCount) {
+      break;
+    }
 
-  Section nextSection(epub, nextSpineIndex, renderer);
-  if (nextSection.loadSectionFile(SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(),
-                                  SETTINGS.extraParagraphSpacing, SETTINGS.paragraphAlignment, viewportWidth,
-                                  viewportHeight, SETTINGS.hyphenationEnabled, SETTINGS.embeddedStyle,
-                                  SETTINGS.imageRendering, SETTINGS.focusReadingEnabled)) {
-    return;
-  }
+    Section nextSection(epub, nextSpineIndex, renderer);
+    if (nextSection.loadSectionFile(SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(),
+                                    SETTINGS.extraParagraphSpacing, SETTINGS.paragraphAlignment, viewportWidth,
+                                    viewportHeight, SETTINGS.hyphenationEnabled, SETTINGS.embeddedStyle,
+                                    SETTINGS.imageRendering, SETTINGS.focusReadingEnabled)) {
+      continue;  // already cached
+    }
 
-  LOG_DBG("ERS", "Silently indexing next chapter: %d", nextSpineIndex);
-  if (!nextSection.createSectionFile(SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(),
-                                     SETTINGS.extraParagraphSpacing, SETTINGS.paragraphAlignment, viewportWidth,
-                                     viewportHeight, SETTINGS.hyphenationEnabled, SETTINGS.embeddedStyle,
-                                     SETTINGS.imageRendering, SETTINGS.focusReadingEnabled)) {
-    LOG_ERR("ERS", "Failed silent indexing for chapter: %d", nextSpineIndex);
+    LOG_DBG("ERS", "Silently indexing ahead: %d", nextSpineIndex);
+    if (!nextSection.createSectionFile(SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(),
+                                       SETTINGS.extraParagraphSpacing, SETTINGS.paragraphAlignment, viewportWidth,
+                                       viewportHeight, SETTINGS.hyphenationEnabled, SETTINGS.embeddedStyle,
+                                       SETTINGS.imageRendering, SETTINGS.focusReadingEnabled)) {
+      LOG_ERR("ERS", "Failed silent indexing for chapter: %d", nextSpineIndex);
+      break;  // stop the window on failure
+    }
   }
 }
 

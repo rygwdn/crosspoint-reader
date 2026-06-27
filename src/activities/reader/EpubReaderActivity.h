@@ -59,7 +59,10 @@ class EpubReaderActivity final : public Activity {
   void renderContents(std::unique_ptr<Page> page, int orientedMarginTop, int orientedMarginRight,
                       int orientedMarginBottom, int orientedMarginLeft);
   void renderStatusBar() const;
-  void silentIndexNextChapterIfNeeded(uint16_t viewportWidth, uint16_t viewportHeight);
+  // Keep a small window of upcoming sections built ahead of the reader (off the
+  // page-turn critical path) so navigating forward never blocks on indexing.
+  void silentIndexAheadIfNeeded(uint16_t viewportWidth, uint16_t viewportHeight);
+  static constexpr int PREFETCH_SECTIONS_AHEAD = 5;
   bool saveProgress(int spineIndex, int currentPage, int pageCount);
   // Jump to a percentage of the book (0-100), mapping it to spine and page.
   void jumpToPercent(int percent);

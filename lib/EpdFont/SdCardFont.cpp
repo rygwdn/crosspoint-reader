@@ -37,6 +37,12 @@ constexpr char CPFONT_MAGIC[8] = {'C', 'P', 'F', 'O', 'N', 'T', '\0', '\0'};
 constexpr uint32_t HEADER_SIZE = 32;
 constexpr uint32_t STYLE_TOC_ENTRY_SIZE = 32;
 
+// On-disk size of one interval entry (v5): EpdUnicodeInterval (first/last/offset,
+// 12 bytes) + uniformAdvance (uint16) + reserved (uint16). The in-RAM lookup
+// structures stay 12-byte (EpdUnicodeInterval) or 6-byte (BmpInterval16); the
+// uniform advance is split into a parallel intervalAdvances array on load.
+constexpr uint32_t SD_INTERVAL_DISK_SIZE = 16;
+
 // Helper to read little-endian values from byte buffer
 inline uint16_t readU16(const uint8_t* p) { return p[0] | (p[1] << 8); }
 inline int16_t readI16(const uint8_t* p) { return static_cast<int16_t>(p[0] | (p[1] << 8)); }
@@ -118,6 +124,8 @@ void SdCardFont::freeStyleAll(PerStyle& s) {
   delete[] s.bmpIntervals;
   s.bmpIntervals = nullptr;
   s.intervalsAreBmp16 = false;
+  delete[] s.intervalAdvances;
+  s.intervalAdvances = nullptr;
   freeStyleKernLigatureData(s);
   s.present = false;
 }
@@ -408,7 +416,7 @@ void SdCardFont::applyGlyphMissCallback(uint8_t styleIdx) {
 
 void SdCardFont::computeStyleFileOffsets(PerStyle& s, uint32_t baseOffset) {
   s.intervalsFileOffset = baseOffset;
-  s.glyphsFileOffset = s.intervalsFileOffset + s.header.intervalCount * sizeof(EpdUnicodeInterval);
+  s.glyphsFileOffset = s.intervalsFileOffset + s.header.intervalCount * SD_INTERVAL_DISK_SIZE;
   s.kernLeftFileOffset = s.glyphsFileOffset + s.header.glyphCount * sizeof(EpdGlyph);
   s.kernRightFileOffset = s.kernLeftFileOffset + s.header.kernLeftEntryCount * sizeof(EpdKernClassEntry);
   s.kernMatrixFileOffset = s.kernRightFileOffset + s.header.kernRightEntryCount * sizeof(EpdKernClassEntry);
@@ -519,10 +527,13 @@ bool SdCardFont::load(const char* path) {
   styleCount_ = styleCount;
   contentHash_ = hash;
 
-  // Load full intervals into RAM for each present style. BMP-only fonts with
-  // fewer than 65536 glyphs use a compact 6-byte interval table instead of the
-  // on-disk 12-byte table; large sparse CJK subsets otherwise keep tens of KB
-  // of always-resident heap just for lookup metadata.
+  // Load intervals into RAM for each present style. The on-disk interval entry
+  // is 16 bytes (SD_INTERVAL_DISK_SIZE): the 12-byte first/last/offset triple
+  // plus a per-interval uniform advance. The lookup table stays compact -- a
+  // BMP-only font (<65536 glyphs) uses 6-byte BmpInterval16 entries, otherwise
+  // 12-byte EpdUnicodeInterval -- and the uniform advance is split into a
+  // parallel intervalAdvances array (allocated only when some interval is
+  // uniform, so proportional Latin fonts pay nothing).
   for (uint8_t i = 0; i < MAX_STYLES; i++) {
     auto& s = styles_[i];
     if (!s.present) continue;
@@ -537,15 +548,18 @@ bool SdCardFont::load(const char* path) {
     // glyph reads) trusts them. A malformed file could otherwise drive
     // out-of-range glyph indices into bogus on-disk reads.
     bool canUseBmp16 = s.header.glyphCount <= UINT16_MAX;
+    bool anyUniform = false;
     uint32_t expectedOffset = 0;
     uint32_t prevLast = 0;
+    uint8_t ivBuf[SD_INTERVAL_DISK_SIZE];
     EpdUnicodeInterval iv{};
     for (uint32_t j = 0; j < s.header.intervalCount; ++j) {
-      if (file.read(reinterpret_cast<uint8_t*>(&iv), sizeof(iv)) != sizeof(iv)) {
+      if (file.read(ivBuf, SD_INTERVAL_DISK_SIZE) != static_cast<int>(SD_INTERVAL_DISK_SIZE)) {
         LOG_ERR("SDCF", "Failed to read interval %u for style %u", j, i);
         freeAll();
         return false;
       }
+      memcpy(&iv, ivBuf, sizeof(EpdUnicodeInterval));
       if (iv.first > iv.last) {
         LOG_ERR("SDCF", "Style %u: invalid interval %u (first 0x%lX > last 0x%lX)", i, j,
                 static_cast<unsigned long>(iv.first), static_cast<unsigned long>(iv.last));
@@ -568,8 +582,20 @@ bool SdCardFont::load(const char* path) {
       if (iv.first > UINT16_MAX || iv.last > UINT16_MAX || iv.offset > UINT16_MAX) {
         canUseBmp16 = false;
       }
+      if (readU16(ivBuf + sizeof(EpdUnicodeInterval)) != 0) {
+        anyUniform = true;
+      }
       expectedOffset += span;
       prevLast = iv.last;
+    }
+
+    if (anyUniform) {
+      s.intervalAdvances = new (std::nothrow) uint16_t[s.header.intervalCount];
+      if (!s.intervalAdvances) {
+        LOG_ERR("SDCF", "Failed to allocate interval advances for style %u", i);
+        freeAll();
+        return false;
+      }
     }
 
     if (!file.seekSet(s.intervalsFileOffset)) {
@@ -586,13 +612,15 @@ bool SdCardFont::load(const char* path) {
         return false;
       }
       for (uint32_t j = 0; j < s.header.intervalCount; ++j) {
-        if (file.read(reinterpret_cast<uint8_t*>(&iv), sizeof(iv)) != sizeof(iv)) {
+        if (file.read(ivBuf, SD_INTERVAL_DISK_SIZE) != static_cast<int>(SD_INTERVAL_DISK_SIZE)) {
           LOG_ERR("SDCF", "Failed to read compact interval %u for style %u", j, i);
           freeAll();
           return false;
         }
+        memcpy(&iv, ivBuf, sizeof(EpdUnicodeInterval));
         s.bmpIntervals[j] = {static_cast<uint16_t>(iv.first), static_cast<uint16_t>(iv.last),
                              static_cast<uint16_t>(iv.offset)};
+        if (s.intervalAdvances) s.intervalAdvances[j] = readU16(ivBuf + sizeof(EpdUnicodeInterval));
       }
       s.intervalsAreBmp16 = true;
     } else {
@@ -602,11 +630,14 @@ bool SdCardFont::load(const char* path) {
         freeAll();
         return false;
       }
-      size_t intervalsBytes = s.header.intervalCount * sizeof(EpdUnicodeInterval);
-      if (file.read(reinterpret_cast<uint8_t*>(s.fullIntervals), intervalsBytes) != static_cast<int>(intervalsBytes)) {
-        LOG_ERR("SDCF", "Failed to read intervals for style %u", i);
-        freeAll();
-        return false;
+      for (uint32_t j = 0; j < s.header.intervalCount; ++j) {
+        if (file.read(ivBuf, SD_INTERVAL_DISK_SIZE) != static_cast<int>(SD_INTERVAL_DISK_SIZE)) {
+          LOG_ERR("SDCF", "Failed to read interval %u for style %u", j, i);
+          freeAll();
+          return false;
+        }
+        memcpy(&s.fullIntervals[j], ivBuf, sizeof(EpdUnicodeInterval));
+        if (s.intervalAdvances) s.intervalAdvances[j] = readU16(ivBuf + sizeof(EpdUnicodeInterval));
       }
     }
 
@@ -653,6 +684,25 @@ int32_t SdCardFont::findGlobalGlyphIndex(const PerStyle& s, uint32_t codepoint) 
     }
   }
   return -1;
+}
+
+uint16_t SdCardFont::intervalUniformAdvance(const PerStyle& s, uint32_t codepoint) const {
+  if (!s.intervalAdvances) return 0;
+  int left = 0;
+  int right = static_cast<int>(s.header.intervalCount) - 1;
+  while (left <= right) {
+    int mid = left + (right - left) / 2;
+    const uint32_t first = s.intervalsAreBmp16 ? s.bmpIntervals[mid].first : s.fullIntervals[mid].first;
+    const uint32_t last = s.intervalsAreBmp16 ? s.bmpIntervals[mid].last : s.fullIntervals[mid].last;
+    if (codepoint < first) {
+      right = mid - 1;
+    } else if (codepoint > last) {
+      left = mid + 1;
+    } else {
+      return s.intervalAdvances[mid];
+    }
+  }
+  return 0;
 }
 
 // --- Prewarm ---
@@ -1070,6 +1120,12 @@ bool SdCardFont::hasAdvanceTable() const {
 
 uint16_t SdCardFont::getAdvance(uint32_t codepoint, uint8_t style) const {
   style &= (MAX_STYLES - 1);
+  // v5 fast path: fixed-width intervals (e.g. CJK) carry a uniform advance, so
+  // the answer needs no per-glyph lookup and no advance-table entry.
+  if (styles_[style].present) {
+    const uint16_t uniform = intervalUniformAdvance(styles_[style], codepoint);
+    if (uniform != 0) return uniform;
+  }
   if (!advanceTable_[style]) return 0;
   const AdvanceEntry* table = advanceTable_[style];
   const uint32_t size = advanceTableSize_[style];
@@ -1122,7 +1178,8 @@ int SdCardFont::fetchAdvancesForCodepoints(uint32_t* codepoints, uint32_t cpCoun
     const int32_t replacementIdx = findGlobalGlyphIndex(s, REPLACEMENT_GLYPH);
     for (uint32_t i = 0; i < cpCount; i++) {
       const uint32_t cp = codepoints[i];
-      if (advanceTableLookup(si, cp, nullptr)) continue;  // already cached
+      if (advanceTableLookup(si, cp, nullptr)) continue;       // already cached
+      if (intervalUniformAdvance(s, cp) != 0) continue;        // resolved via interval, no per-glyph fetch
       int32_t idx = findGlobalGlyphIndex(s, cp);
       if (idx < 0) {
         if (replacementIdx < 0) {

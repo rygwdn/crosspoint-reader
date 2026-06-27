@@ -16,7 +16,10 @@
 // lib/EpdFont/scripts/cpfont_version.py. This firmware-side copy must be
 // bumped manually when the firmware is updated to support a new format.
 // Reader enforcement: SdCardFont::load().
-#define CPFONT_VERSION 4
+// v5: interval entries are 16 bytes (was 12) and carry a per-interval uniform
+// advance, letting fixed-width ranges (CJK) resolve advances with no per-glyph
+// reads. Bumping this also redirects FONT_MANIFEST_URL to the v5 font release.
+#define CPFONT_VERSION 5
 
 class SdCardFont {
  public:
@@ -149,6 +152,12 @@ class SdCardFont {
     BmpInterval16* bmpIntervals = nullptr;
     bool intervalsAreBmp16 = false;
 
+    // Per-interval uniform advance (v5), parallel to the interval table above.
+    // nullptr when no interval in this style is uniform (e.g. proportional Latin
+    // fonts pay nothing). A 0 in a slot means that interval is non-uniform, so
+    // its advances are resolved per-glyph via the advance table.
+    uint16_t* intervalAdvances = nullptr;
+
     // Persistent kern-class + ligature tables (lazy-loaded on first prewarm).
     // The full kern MATRIX is NOT resident — on Literata-class fonts a single
     // style's matrix is ~36-42KB contiguous, and 4 styles' worth won't fit
@@ -247,6 +256,9 @@ class SdCardFont {
   void applyKernLigaturePointers(PerStyle& s, EpdFontData& data) const;
   void applyGlyphMissCallback(uint8_t styleIdx);
   int32_t findGlobalGlyphIndex(const PerStyle& s, uint32_t codepoint) const;
+  // Returns the v5 per-interval uniform advance for codepoint, or 0 when the
+  // codepoint's interval is non-uniform or absent (caller resolves per-glyph).
+  uint16_t intervalUniformAdvance(const PerStyle& s, uint32_t codepoint) const;
   int fetchAdvancesForCodepoints(uint32_t* codepoints, uint32_t cpCount, uint8_t styleMask);
   template <typename Iter>
   int buildAdvanceTableRange(Iter begin, Iter end, bool includeSpace, bool includeHyphen, uint8_t styleMask);

@@ -733,8 +733,16 @@ def pack_style_sections(sd):
     intervals_data = bytearray()
     offset = 0
     for i_start, i_end in sd.intervals:
-        intervals_data += struct.pack("<III", i_start, i_end, offset)
-        offset += i_end - i_start + 1
+        width = i_end - i_start + 1
+        # v5: per-interval uniform advance. Glyphs are stored in interval/codepoint
+        # order, so this interval's glyphs are all_glyphs[offset : offset + width].
+        # If they all share one advance_x, store it so the reader resolves advances
+        # for this whole range with no per-glyph SD reads (the CJK win). 0 means
+        # "not uniform" -- the reader falls back to per-glyph advances.
+        advances = {sd.all_glyphs[offset + k][0].advance_x for k in range(width)}
+        uniform_advance = advances.pop() if len(advances) == 1 else 0
+        intervals_data += struct.pack("<IIIHH", i_start, i_end, offset, uniform_advance, 0)
+        offset += width
 
     glyphs_data = bytearray()
     for glyph, packed in sd.all_glyphs:
@@ -777,7 +785,7 @@ def style_sections_total_size(sections):
 
 def generate_cpfont_multistyle(style_fonts, size, intervals, output_path,
                                force_autohint=False, fallback_style_fonts=None):
-    """Generate a multi-style v4 .cpfont file.
+    """Generate a multi-style .cpfont file (current format: see CPFONT_VERSION).
 
     style_fonts: dict of {style_id: fontfile_path} e.g. {0: "Regular.ttf", 2: "Italic.ttf"}
     fallback_style_fonts: optional dict of {style_id: fallback_fontfile_path}
@@ -856,7 +864,7 @@ def generate_cpfont_multistyle(style_fonts, size, intervals, output_path,
         total_file_size = f.tell()
 
     # Print summary
-    print(f"  Output: {output_path} (v4, {style_count} styles)", file=sys.stderr)
+    print(f"  Output: {output_path} (v{CPFONT_VERSION}, {style_count} styles)", file=sys.stderr)
     print(f"    Header+TOC: {HEADER_SIZE + len(toc_data)} bytes", file=sys.stderr)
     for style_id in sorted(raster_data.keys()):
         sd = raster_data[style_id]
@@ -996,11 +1004,11 @@ def main():
         font_name = base
 
     if not is_multistyle:
-        # Single font file provided: wrap as a single-style v4 font
+        # Single font file provided: wrap as a single-style font
         style_map = {"regular": 0, "bold": 1, "italic": 2, "bolditalic": 3}
         style_fonts[style_map[args.style]] = fontfile
 
-    # Always generate v4 format
+    # Always generate the current .cpfont format (CPFONT_VERSION)
     if args.output and len(sizes) != 1:
         print("Error: --output can only be used with a single size", file=sys.stderr)
         sys.exit(1)
@@ -1012,7 +1020,8 @@ def main():
         else:
             filename = f"{font_name}_{sz}.cpfont"
             output_path = os.path.join(output_dir, filename)
-        print(f"Generating {output_path} (size {sz}, {len(style_fonts)} style(s), v4)...", file=sys.stderr)
+        print(f"Generating {output_path} (size {sz}, {len(style_fonts)} style(s), v{CPFONT_VERSION})...",
+              file=sys.stderr)
         total_size += generate_cpfont_multistyle(
             style_fonts, sz, intervals, output_path,
             force_autohint=args.force_autohint,

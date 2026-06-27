@@ -155,7 +155,9 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
                                 const uint8_t imageRendering, const bool focusReadingEnabled,
                                 const std::function<void()>& popupFn) {
   const auto localPath = epub->getSpineItem(spineIndex).href;
-  const auto tmpHtmlPath = epub->getCachePath() + "/.tmp_" + std::to_string(spineIndex) + ".html";
+  const auto htmlDir = epub->getCachePath() + "/html";
+  const auto htmlPath = htmlDir + "/" + std::to_string(spineIndex) + ".html";
+  const auto tmpHtmlPath = htmlDir + "/.tmp_" + std::to_string(spineIndex) + ".html";
 
   // Create cache directory if it doesn't exist
   {
@@ -163,42 +165,56 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
     Storage.mkdir(sectionsDir.c_str());
   }
 
-  // Retry logic for SD card timing issues
-  bool success = false;
-  uint32_t fileSize = 0;
-  for (int attempt = 0; attempt < 3 && !success; attempt++) {
-    if (attempt > 0) {
-      LOG_DBG("SCT", "Retrying stream (attempt %d)...", attempt + 1);
-      delay(50);  // Brief delay before retry
+  // Reuse the previously unzipped HTML if we already have it. The unzipped HTML is keyed only on the
+  // book (it lives in the per-book cache dir), not on render settings, so it survives the invalidation
+  // that wipes the layout (.bin) caches when font/margin/orientation change -- rebuilds then skip zip
+  // inflation entirely. The persistent file is only ever created by an atomic rename after a fully
+  // successful parse (below), so if it exists it is known-complete.
+  const bool reusedHtml = Storage.exists(htmlPath.c_str());
+  const std::string& parsePath = reusedHtml ? htmlPath : tmpHtmlPath;
+
+  if (reusedHtml) {
+    LOG_DBG("SCT", "Reusing cached HTML %s", htmlPath.c_str());
+  } else {
+    Storage.mkdir(htmlDir.c_str());
+
+    // Retry logic for SD card timing issues
+    bool streamed = false;
+    uint32_t fileSize = 0;
+    for (int attempt = 0; attempt < 3 && !streamed; attempt++) {
+      if (attempt > 0) {
+        LOG_DBG("SCT", "Retrying stream (attempt %d)...", attempt + 1);
+        delay(50);  // Brief delay before retry
+      }
+
+      // Remove any incomplete file from previous attempt before retrying
+      if (Storage.exists(tmpHtmlPath.c_str())) {
+        Storage.remove(tmpHtmlPath.c_str());
+      }
+
+      HalFile tmpHtml;
+      if (!Storage.openFileForWrite("SCT", tmpHtmlPath, tmpHtml)) {
+        continue;
+      }
+      streamed = epub->readItemContentsToStream(localPath, tmpHtml, 1024);
+      fileSize = tmpHtml.size();
+      // Explicitly close() file before calling Storage.remove()
+      tmpHtml.close();
+
+      // If streaming failed, remove the incomplete file immediately
+      if (!streamed && Storage.exists(tmpHtmlPath.c_str())) {
+        Storage.remove(tmpHtmlPath.c_str());
+        LOG_DBG("SCT", "Removed incomplete temp file after failed attempt");
+      }
     }
 
-    // Remove any incomplete file from previous attempt before retrying
-    if (Storage.exists(tmpHtmlPath.c_str())) {
-      Storage.remove(tmpHtmlPath.c_str());
+    if (!streamed) {
+      LOG_ERR("SCT", "Failed to stream item contents to temp file after retries");
+      return false;
     }
 
-    HalFile tmpHtml;
-    if (!Storage.openFileForWrite("SCT", tmpHtmlPath, tmpHtml)) {
-      continue;
-    }
-    success = epub->readItemContentsToStream(localPath, tmpHtml, 1024);
-    fileSize = tmpHtml.size();
-    // Explicitly close() file before calling Storage.remove()
-    tmpHtml.close();
-
-    // If streaming failed, remove the incomplete file immediately
-    if (!success && Storage.exists(tmpHtmlPath.c_str())) {
-      Storage.remove(tmpHtmlPath.c_str());
-      LOG_DBG("SCT", "Removed incomplete temp file after failed attempt");
-    }
+    LOG_DBG("SCT", "Streamed temp HTML to %s (%d bytes)", tmpHtmlPath.c_str(), fileSize);
   }
-
-  if (!success) {
-    LOG_ERR("SCT", "Failed to stream item contents to temp file after retries");
-    return false;
-  }
-
-  LOG_DBG("SCT", "Streamed temp HTML to %s (%d bytes)", tmpHtmlPath.c_str(), fileSize);
 
   if (!Storage.openFileForWrite("SCT", filePath, file)) {
     return false;
@@ -236,16 +252,30 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
   }
 
   ChapterHtmlSlimParser visitor(
-      epub, tmpHtmlPath, renderer, fontId, lineCompression, extraParagraphSpacing, paragraphAlignment, viewportWidth,
+      epub, parsePath, renderer, fontId, lineCompression, extraParagraphSpacing, paragraphAlignment, viewportWidth,
       viewportHeight, hyphenationEnabled, focusReadingEnabled,
       [this, &lut](std::unique_ptr<Page> page, const uint16_t paragraphIndex, const uint16_t listItemIndex) {
         lut.push_back({this->onPageComplete(std::move(page)), paragraphIndex, listItemIndex});
       },
       embeddedStyle, contentBase, imageBasePath, imageRendering, std::move(tocAnchors), popupFn, cssParser);
   Hyphenator::setPreferredLanguage(epub->getLanguage());
-  success = visitor.parseAndBuildPages();
+  const bool success = visitor.parseAndBuildPages();
 
-  Storage.remove(tmpHtmlPath.c_str());
+  if (!reusedHtml) {
+    if (success) {
+      // Promote the freshly unzipped HTML to the persistent cache so future rebuilds (e.g. after a
+      // settings change invalidates the layout caches) can skip zip inflation. If promotion fails,
+      // drop the temp file -- the section build itself still succeeded.
+      if (!Storage.rename(tmpHtmlPath.c_str(), htmlPath.c_str())) {
+        LOG_DBG("SCT", "Failed to promote HTML cache, removing temp");
+        Storage.remove(tmpHtmlPath.c_str());
+      }
+    } else {
+      // Parse failed on a freshly unzipped file -- discard it rather than caching a bad source.
+      Storage.remove(tmpHtmlPath.c_str());
+    }
+  }
+
   if (!success) {
     LOG_ERR("SCT", "Failed to parse XML and build pages");
     // Explicitly close() file before calling Storage.remove()
