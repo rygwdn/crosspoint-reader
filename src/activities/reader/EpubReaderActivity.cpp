@@ -245,6 +245,11 @@ void EpubReaderActivity::loop() {
   if (section && section->isBuilding() && !RenderLock::peek() &&
       static_cast<int>(section->pageCount) < section->currentPage + BUILD_WINDOW_AHEAD) {
     RenderLock lock;
+    // Re-check under the lock: render() (which also holds the RenderLock) may have finalized the
+    // build between the outer isBuilding() check and acquiring the lock here, in which case
+    // buildSomeMore() would fail and wrongly reset the section. cppcheck can't see the cross-task
+    // mutation, so it flags this as always true.
+    // cppcheck-suppress knownConditionTrueFalse
     if (section->isBuilding()) {
       if (!section->buildSomeMore(BACKGROUND_BUILD_PAGES_PER_TICK)) {
         LOG_ERR("ERS", "Background section build failed");
@@ -913,9 +918,8 @@ void EpubReaderActivity::render(RenderLock&& lock) {
         // a deep resume/jump that must lay out many pages to reach the landing page. Tiny sections
         // build in a blink and stay popup-free.
         const int target = pendingPageJump.has_value() ? *pendingPageJump : (nextPageNumber < 0 ? 0 : nextPageNumber);
-        const size_t spineBytes =
-            epub->getCumulativeSpineItemSize(currentSpineIndex) -
-            (currentSpineIndex > 0 ? epub->getCumulativeSpineItemSize(currentSpineIndex - 1) : 0);
+        const size_t spineBytes = epub->getCumulativeSpineItemSize(currentSpineIndex) -
+                                  (currentSpineIndex > 0 ? epub->getCumulativeSpineItemSize(currentSpineIndex - 1) : 0);
         // Popup only when the build will actually be slow: a big spine whose HTML still needs
         // inflating (the multi-second cost), or a deep page target. A reopen with cached HTML builds
         // fast, so no popup -- that's what made an already-indexed book look like it was reindexing.
@@ -935,9 +939,8 @@ void EpubReaderActivity::render(RenderLock&& lock) {
           return;
         }
         const bool anchorJump = !pendingAnchor.empty();
-        while (!section->isBuildComplete() &&
-               (anchorJump ? !section->findAnchorDuringBuild(pendingAnchor)
-                           : static_cast<int>(section->pageCount) <= target)) {
+        while (!section->isBuildComplete() && (anchorJump ? !section->findAnchorDuringBuild(pendingAnchor)
+                                                          : static_cast<int>(section->pageCount) <= target)) {
           // Anchor jump: build until the anchor's page is laid out (usually page 0). Otherwise:
           // build until the target page exists. loop() builds the rest behind it.
           if (!section->buildSomeMore(BUILD_PAGES_PER_CHUNK)) {
@@ -1043,8 +1046,8 @@ void EpubReaderActivity::render(RenderLock&& lock) {
   {
     // While the section is still building, read the page from the partially-written .bin via
     // the in-RAM page table; once finalized, read it the normal way.
-    auto p = section->isBuilding() ? section->loadPageDuringBuild(section->currentPage)
-                                   : section->loadPageFromSectionFile();
+    auto p =
+        section->isBuilding() ? section->loadPageDuringBuild(section->currentPage) : section->loadPageFromSectionFile();
     if (!p) {
       LOG_ERR("ERS", "Failed to load page from SD - clearing section cache");
       section->clearCache();

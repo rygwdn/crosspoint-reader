@@ -1178,8 +1178,8 @@ int SdCardFont::fetchAdvancesForCodepoints(uint32_t* codepoints, uint32_t cpCoun
     const int32_t replacementIdx = findGlobalGlyphIndex(s, REPLACEMENT_GLYPH);
     for (uint32_t i = 0; i < cpCount; i++) {
       const uint32_t cp = codepoints[i];
-      if (advanceTableLookup(si, cp, nullptr)) continue;       // already cached
-      if (intervalUniformAdvance(s, cp) != 0) continue;        // resolved via interval, no per-glyph fetch
+      if (advanceTableLookup(si, cp, nullptr)) continue;  // already cached
+      if (intervalUniformAdvance(s, cp) != 0) continue;   // resolved via interval, no per-glyph fetch
       int32_t idx = findGlobalGlyphIndex(s, cp);
       if (idx < 0) {
         if (replacementIdx < 0) {
