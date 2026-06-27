@@ -11,6 +11,7 @@
 #include <algorithm>
 
 #include "CrossPointSettings.h"
+#include "DiskLogger.h"
 #include "FontInstaller.h"
 #include "OpdsServerStore.h"
 #include "SdCardFontSystem.h"
@@ -20,6 +21,7 @@
 #include "html/FilesPageHtml.generated.h"
 #include "html/FontsPageHtml.generated.h"
 #include "html/HomePageHtml.generated.h"
+#include "html/LogsPageHtml.generated.h"
 #include "html/SettingsPageHtml.generated.h"
 #include "html/js/jszip_minJs.generated.h"
 #include "util/BookCacheUtils.h"
@@ -164,6 +166,13 @@ void CrossPointWebServer::begin() {
   server->on("/api/fonts", HTTP_GET, [this] { handleFontList(); });
   server->on("/api/fonts/upload", HTTP_POST, [this] { handleFontUpload(); }, [this] { handleFontUploadData(); });
   server->on("/api/fonts/delete", HTTP_POST, [this] { handleFontDelete(); });
+
+  // Log management endpoints
+  server->on("/logs", HTTP_GET, [this] { handleLogsPage(); });
+  server->on("/api/logs/recent", HTTP_GET, [this] { handleLogsRecent(); });
+  server->on("/api/logs/flush", HTTP_POST, [this] { handleLogsFlush(); });
+  server->on("/api/logs/download", HTTP_GET, [this] { handleLogsDownload(); });
+  server->on("/api/logs/clear", HTTP_POST, [this] { handleLogsClear(); });
 
   // OPDS server endpoints
   server->on("/api/opds", HTTP_GET, [this] { handleGetOpdsServers(); });
@@ -1270,6 +1279,73 @@ void CrossPointWebServer::handlePostSettings() {
 
   LOG_DBG("WEB", "Applied %d setting(s)", applied);
   server->send(200, "text/plain", String("Applied ") + String(applied) + " setting(s)");
+}
+
+// ---- Log Management API ----
+
+void CrossPointWebServer::handleLogsPage() const {
+  sendHtmlContent(server.get(), LogsPageHtml, sizeof(LogsPageHtml));
+  LOG_DBG("WEB", "Served logs page");
+}
+
+void CrossPointWebServer::handleLogsRecent() const {
+  std::string logs = getLastLogs();
+  server->send(200, "text/plain", logs.c_str());
+}
+
+void CrossPointWebServer::handleLogsFlush() {
+  DiskLogger::flushNow();
+  server->send(200, "text/plain", "Flushed");
+}
+
+void CrossPointWebServer::handleLogsDownload() const {
+  DiskLogger::flushNow();
+
+  constexpr const char* logPath = "/.crosspoint/debug.log";
+
+  if (!Storage.exists(logPath)) {
+    server->send(404, "text/plain", "No log file found. Enable disk logging and wait for 16+ log entries.");
+    return;
+  }
+
+  HalFile file = Storage.open(logPath);
+  if (!file) {
+    server->send(500, "text/plain", "Failed to open log file");
+    return;
+  }
+
+  server->setContentLength(file.fileSize());
+  server->sendHeader("Content-Disposition", "attachment; filename=\"debug.log\"");
+  server->send(200, "text/plain", "");
+
+  NetworkClient client = server->client();
+  constexpr size_t chunkSize = 4096;
+  uint8_t buf[chunkSize];
+  bool ok = true;
+  while (ok && file.available()) {
+    int result = file.read(buf, chunkSize);
+    if (result <= 0) break;
+    size_t bytesRead = static_cast<size_t>(result);
+    size_t written = 0;
+    while (written < bytesRead) {
+      esp_task_wdt_reset();
+      size_t n = client.write(buf + written, bytesRead - written);
+      if (n == 0) {
+        ok = false;
+        break;
+      }
+      written += n;
+    }
+  }
+  client.clear();
+  file.close();
+  LOG_DBG("WEB", "Served log file download");
+}
+
+void CrossPointWebServer::handleLogsClear() {
+  DiskLogger::clear();
+  server->send(200, "text/plain", "Cleared");
+  LOG_DBG("WEB", "Log files cleared");
 }
 
 // ---- OPDS Server API ----

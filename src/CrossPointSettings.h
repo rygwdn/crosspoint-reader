@@ -153,6 +153,7 @@ class CrossPointSettings {
     LP_MENU_KOSYNC = 0,
     LP_MENU_DISABLED = 1,
     LP_MENU_BOOKMARK = 2,
+    LP_MENU_SLEEP = 3,
     LONG_PRESS_MENU_FUNCTION_COUNT
   };
 
@@ -275,6 +276,8 @@ class CrossPointSettings {
   uint8_t language = 0;
   // Quick Resume: keep current content visible with moon icon instead of showing a static sleep screen.
   uint8_t quickResumeSleepScreen = QUICK_RESUME_NEVER;
+  // Capture log lines to SD card (/.crosspoint/debug.log) for offline debugging.
+  uint8_t diskLogsEnabled = 0;
 
   ~CrossPointSettings() = default;
 
