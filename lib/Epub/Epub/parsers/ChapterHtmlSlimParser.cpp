@@ -575,8 +575,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
                 displayHeight = static_cast<int>(
                     imgStyle.imageHeight.toPixels(emSize, static_cast<float>(self->viewportHeight)) + 0.5f);
                 if (displayHeight < 1) displayHeight = 1;
-                displayWidth =
-                    static_cast<int>(displayHeight * (static_cast<float>(dims.width) / dims.height) + 0.5f);
+                displayWidth = static_cast<int>(displayHeight * (static_cast<float>(dims.width) / dims.height) + 0.5f);
                 if (displayHeight > self->viewportHeight) {
                   displayHeight = self->viewportHeight;
                   // Rescale width to preserve aspect ratio when height is clamped
