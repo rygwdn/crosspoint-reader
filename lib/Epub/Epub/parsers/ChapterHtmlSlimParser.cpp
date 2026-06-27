@@ -649,7 +649,6 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
               if (self->currentPage && !self->currentPage->elements.empty() &&
                   (self->currentPageNextY + imageMarginTop + displayHeight + imageMarginBottom >
                    self->viewportHeight)) {
-                self->commitPendingPage();
                 self->completePageFn(std::move(self->currentPage), self->xpathParagraphIndex, self->xpathListItemIndex);
                 self->completedPageCount++;
                 self->currentPage.reset(new (std::nothrow) Page());
