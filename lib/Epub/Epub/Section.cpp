@@ -1,9 +1,13 @@
 #include "Section.h"
 
+#include <FsHelpers.h>
 #include <HalStorage.h>
 #include <Logging.h>
 #include <Serialization.h>
+#include <XmlParserUtils.h>
 
+#include "Epub/converters/ImageDecoderFactory.h"
+#include "Epub/converters/ImageToFramebufferDecoder.h"
 #include "Epub/css/CssParser.h"
 #include "Page.h"
 #include "hyphenation/Hyphenator.h"
@@ -22,6 +26,117 @@ struct PageLutEntry {
   uint16_t paragraphIndex;
   uint16_t listItemIndex;
 };
+
+struct ImagePrepassCtx {
+  std::shared_ptr<Epub> epub;
+  std::string contentBase;
+  std::string imageBasePath;
+  uint8_t imageRendering;
+  std::vector<PrecomputedImage> results;
+  int imageCounter = 0;
+};
+
+void XMLCALL imagePrepassElement(void* userData, const XML_Char* name, const XML_Char** atts) {
+  if (strcmp(name, "img") != 0) return;
+  auto* ctx = static_cast<ImagePrepassCtx*>(userData);
+  if (ctx->imageRendering == 2) return;
+
+  const char* src = nullptr;
+  for (int i = 0; atts[i]; i += 2) {
+    if (strcmp(atts[i], "src") == 0) {
+      src = atts[i + 1];
+      break;
+    }
+  }
+  if (!src || src[0] == '\0' || ctx->imageRendering == 1) return;
+
+  const std::string resolvedPath = FsHelpers::normalisePath(FsHelpers::decodeUriEscapes(ctx->contentBase + src));
+  if (!ImageDecoderFactory::isFormatSupported(resolvedPath)) return;
+
+  const int imageIdx = ctx->imageCounter++;
+  std::string ext;
+  const size_t extPos = resolvedPath.rfind('.');
+  if (extPos != std::string::npos) ext = resolvedPath.substr(extPos);
+  const std::string cachedImagePath = ctx->imageBasePath + std::to_string(imageIdx) + ext;
+
+  PrecomputedImage pre;
+  pre.cachedPath = cachedImagePath;
+
+  HalFile cachedImageFile;
+  if (Storage.openFileForWrite("SCT", cachedImagePath, cachedImageFile)) {
+    const bool ok = ctx->epub->readItemContentsToStream(resolvedPath, cachedImageFile, 4096);
+    cachedImageFile.flush();
+    cachedImageFile.close();
+    delay(50);
+    if (ok) {
+      ImageToFramebufferDecoder* decoder = ImageDecoderFactory::getDecoder(cachedImagePath);
+      ImageDimensions dims = {0, 0};
+      if (decoder && decoder->getDimensions(cachedImagePath, dims)) {
+        pre.intrinsicWidth = dims.width;
+        pre.intrinsicHeight = dims.height;
+      } else {
+        LOG_ERR("SCT", "Pre-pass: failed to get dimensions for %s", cachedImagePath.c_str());
+        Storage.remove(cachedImagePath.c_str());
+      }
+    } else {
+      LOG_ERR("SCT", "Pre-pass: failed to extract %s", resolvedPath.c_str());
+      Storage.remove(cachedImagePath.c_str());
+    }
+  } else {
+    LOG_ERR("SCT", "Pre-pass: failed to open cache file %s", cachedImagePath.c_str());
+  }
+
+  ctx->results.push_back(std::move(pre));
+}
+
+std::vector<PrecomputedImage> runImagePrepass(const std::string& tmpHtmlPath, const std::shared_ptr<Epub>& epub,
+                                              const std::string& contentBase, const std::string& imageBasePath,
+                                              uint8_t imageRendering) {
+  ImagePrepassCtx ctx;
+  ctx.epub = epub;
+  ctx.contentBase = contentBase;
+  ctx.imageBasePath = imageBasePath;
+  ctx.imageRendering = imageRendering;
+
+  XML_Parser parser = XML_ParserCreate("UTF-8");
+  if (!parser) {
+    LOG_ERR("SCT", "Pre-pass: failed to create XML parser");
+    return ctx.results;
+  }
+  XML_SetUserData(parser, &ctx);
+  XML_SetStartElementHandler(parser, imagePrepassElement);
+
+  HalFile htmlFile;
+  if (!Storage.openFileForRead("SCT", tmpHtmlPath, htmlFile)) {
+    LOG_ERR("SCT", "Pre-pass: failed to open %s", tmpHtmlPath.c_str());
+    destroyXmlParser(parser);
+    return ctx.results;
+  }
+
+  constexpr size_t PREPASS_BUF = 1024;
+  for (;;) {
+    void* buf = XML_GetBuffer(parser, PREPASS_BUF);
+    if (!buf) {
+      LOG_ERR("SCT", "Pre-pass: XML_GetBuffer OOM");
+      break;
+    }
+    const int bytesRead = htmlFile.read(buf, PREPASS_BUF);
+    if (bytesRead < 0) {
+      LOG_ERR("SCT", "Pre-pass: read error");
+      break;
+    }
+    const bool isFinal = (bytesRead == 0);
+    if (XML_ParseBuffer(parser, bytesRead, isFinal) == XML_STATUS_ERROR) {
+      break;  // HTML may not be strict XML; ignore parse errors in pre-pass
+    }
+    if (isFinal) break;
+  }
+
+  destroyXmlParser(parser);
+  LOG_DBG("SCT", "Image pre-pass: %d image(s) (free_heap=%d)", (int)ctx.results.size(), (int)ESP.getFreeHeap());
+  return ctx.results;
+}
+
 }  // namespace
 
 uint32_t Section::onPageComplete(const Page& page) {
@@ -214,6 +329,12 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
   std::string contentBase = (lastSlash != std::string::npos) ? localPath.substr(0, lastSlash + 1) : "";
   std::string imageBasePath = epub->getCachePath() + "/img_" + std::to_string(spineIndex) + "_";
 
+  // Pre-extract images and measure them before the layout pass.  This keeps ZIP
+  // ring buffers (32KB) and JPEGDEC (~20KB) off the heap while page structures
+  // are accumulating, reducing peak allocation on image-heavy chapters.
+  std::vector<PrecomputedImage> precomputedImages =
+      runImagePrepass(tmpHtmlPath, epub, contentBase, imageBasePath, imageRendering);
+
   CssParser* cssParser = nullptr;
   if (embeddedStyle) {
     cssParser = epub->getCssParser();
@@ -250,7 +371,8 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
           firstPageReadyFn(std::move(page));
         }
       },
-      embeddedStyle, contentBase, imageBasePath, imageRendering, std::move(tocAnchors), popupFn, cssParser);
+      embeddedStyle, contentBase, imageBasePath, imageRendering, std::move(tocAnchors), popupFn, cssParser,
+      &precomputedImages);
   Hyphenator::setPreferredLanguage(epub->getLanguage());
   success = visitor.parseAndBuildPages();
 

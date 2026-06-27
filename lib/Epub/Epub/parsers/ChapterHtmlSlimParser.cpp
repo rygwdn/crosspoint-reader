@@ -481,211 +481,224 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
           std::string resolvedPath = FsHelpers::normalisePath(FsHelpers::decodeUriEscapes(self->contentBase + src));
 
           if (ImageDecoderFactory::isFormatSupported(resolvedPath)) {
-            // Create a unique filename for the cached image
             std::string ext;
             size_t extPos = resolvedPath.rfind('.');
             if (extPos != std::string::npos) {
               ext = resolvedPath.substr(extPos);
             }
-            std::string cachedImagePath = self->imageBasePath + std::to_string(self->imageCounter++) + ext;
+            const int imageIdx = self->imageCounter++;
+            std::string cachedImagePath;
+            ImageDimensions dims = {0, 0};
+            bool haveImage = false;
 
-            // Extract image to cache file
-            HalFile cachedImageFile;
-            bool extractSuccess = false;
-            if (Storage.openFileForWrite("EHP", cachedImagePath, cachedImageFile)) {
-              extractSuccess = self->epub->readItemContentsToStream(resolvedPath, cachedImageFile, 4096);
-              cachedImageFile.flush();
-              cachedImageFile.close();
-              delay(50);  // Give SD card time to sync
+            const std::vector<PrecomputedImage>* preImages = self->precomputedImages;
+            if (preImages && imageIdx < static_cast<int>(preImages->size()) &&
+                (*preImages)[imageIdx].intrinsicWidth > 0) {
+              // Pre-pass already extracted this image; reuse the cached file and dimensions.
+              const PrecomputedImage& pre = (*preImages)[imageIdx];
+              cachedImagePath = pre.cachedPath;
+              dims.width = pre.intrinsicWidth;
+              dims.height = pre.intrinsicHeight;
+              haveImage = true;
+            } else {
+              // No pre-pass data: extract from ZIP and get dimensions inline.
+              cachedImagePath = self->imageBasePath + std::to_string(imageIdx) + ext;
+              HalFile cachedImageFile;
+              if (Storage.openFileForWrite("EHP", cachedImagePath, cachedImageFile)) {
+                const bool ok = self->epub->readItemContentsToStream(resolvedPath, cachedImageFile, 4096);
+                cachedImageFile.flush();
+                cachedImageFile.close();
+                delay(50);  // Give SD card time to sync
+                if (ok) {
+                  ImageToFramebufferDecoder* decoder = ImageDecoderFactory::getDecoder(cachedImagePath);
+                  if (decoder && decoder->getDimensions(cachedImagePath, dims)) {
+                    haveImage = true;
+                  } else {
+                    LOG_ERR("EHP", "Failed to get image dimensions");
+                    Storage.remove(cachedImagePath.c_str());
+                  }
+                } else {
+                  LOG_ERR("EHP", "Failed to extract image");
+                }
+              }
             }
 
-            if (extractSuccess) {
-              // Get image dimensions
-              ImageDimensions dims = {0, 0};
-              ImageToFramebufferDecoder* decoder = ImageDecoderFactory::getDecoder(cachedImagePath);
-              if (decoder && decoder->getDimensions(cachedImagePath, dims)) {
-                LOG_DBG("EHP", "Image dimensions: %dx%d", dims.width, dims.height);
+            if (haveImage) {
+              LOG_DBG("EHP", "Image dimensions: %dx%d", dims.width, dims.height);
 
-                int displayWidth = 0;
-                int displayHeight = 0;
-                const float emSize = static_cast<float>(self->renderer.getFontAscenderSize(self->fontId));
-                CssStyle imgStyle = self->cssParser ? self->cssParser->resolveStyle("img", classAttr) : CssStyle{};
-                // Merge inline style (e.g. style="height: 2em") so it overrides stylesheet rules
-                if (!styleAttr.empty()) {
-                  imgStyle.applyOver(CssParser::parseInlineStyle(styleAttr));
+              int displayWidth = 0;
+              int displayHeight = 0;
+              const float emSize = static_cast<float>(self->renderer.getFontAscenderSize(self->fontId));
+              CssStyle imgStyle = self->cssParser ? self->cssParser->resolveStyle("img", classAttr) : CssStyle{};
+              // Merge inline style (e.g. style="height: 2em") so it overrides stylesheet rules
+              if (!styleAttr.empty()) {
+                imgStyle.applyOver(CssParser::parseInlineStyle(styleAttr));
+              }
+              const bool hasCssHeight = imgStyle.hasImageHeight();
+              const bool hasCssWidth = imgStyle.hasImageWidth();
+
+              // Compute effective container width for percentage-based image sizes.
+              // If the image is inside a block with horizontal margins/padding (e.g.
+              // <div style="margin: 1em 40%">), percentage widths like width:100%
+              // should resolve against the container width, not the full viewport.
+              int containerWidth = self->viewportWidth;
+              if (self->currentTextBlock) {
+                const int inset = self->currentTextBlock->getBlockStyle().totalHorizontalInset();
+                if (inset > 0 && inset < self->viewportWidth) {
+                  containerWidth = self->viewportWidth - inset;
                 }
-                const bool hasCssHeight = imgStyle.hasImageHeight();
-                const bool hasCssWidth = imgStyle.hasImageWidth();
+              }
 
-                // Compute effective container width for percentage-based image sizes.
-                // If the image is inside a block with horizontal margins/padding (e.g.
-                // <div style="margin: 1em 40%">), percentage widths like width:100%
-                // should resolve against the container width, not the full viewport.
-                int containerWidth = self->viewportWidth;
-                if (self->currentTextBlock) {
-                  const int inset = self->currentTextBlock->getBlockStyle().totalHorizontalInset();
-                  if (inset > 0 && inset < self->viewportWidth) {
-                    containerWidth = self->viewportWidth - inset;
-                  }
-                }
-
-                if (hasCssHeight && hasCssWidth && dims.width > 0 && dims.height > 0) {
-                  // Both CSS height and width set: resolve both, then clamp to viewport preserving requested ratio
-                  displayHeight = static_cast<int>(
-                      imgStyle.imageHeight.toPixels(emSize, static_cast<float>(self->viewportHeight)) + 0.5f);
-                  displayWidth =
-                      static_cast<int>(imgStyle.imageWidth.toPixels(emSize, static_cast<float>(containerWidth)) + 0.5f);
-                  if (displayHeight < 1) displayHeight = 1;
+              if (hasCssHeight && hasCssWidth && dims.width > 0 && dims.height > 0) {
+                // Both CSS height and width set: resolve both, then clamp to viewport preserving requested ratio
+                displayHeight = static_cast<int>(
+                    imgStyle.imageHeight.toPixels(emSize, static_cast<float>(self->viewportHeight)) + 0.5f);
+                displayWidth =
+                    static_cast<int>(imgStyle.imageWidth.toPixels(emSize, static_cast<float>(containerWidth)) + 0.5f);
+                if (displayHeight < 1) displayHeight = 1;
+                if (displayWidth < 1) displayWidth = 1;
+                if (displayWidth > containerWidth || displayHeight > self->viewportHeight) {
+                  float scaleX =
+                      (displayWidth > containerWidth) ? static_cast<float>(containerWidth) / displayWidth : 1.0f;
+                  float scaleY = (displayHeight > self->viewportHeight)
+                                     ? static_cast<float>(self->viewportHeight) / displayHeight
+                                     : 1.0f;
+                  float scale = (scaleX < scaleY) ? scaleX : scaleY;
+                  displayWidth = static_cast<int>(displayWidth * scale + 0.5f);
+                  displayHeight = static_cast<int>(displayHeight * scale + 0.5f);
                   if (displayWidth < 1) displayWidth = 1;
-                  if (displayWidth > containerWidth || displayHeight > self->viewportHeight) {
-                    float scaleX =
-                        (displayWidth > containerWidth) ? static_cast<float>(containerWidth) / displayWidth : 1.0f;
-                    float scaleY = (displayHeight > self->viewportHeight)
-                                       ? static_cast<float>(self->viewportHeight) / displayHeight
-                                       : 1.0f;
-                    float scale = (scaleX < scaleY) ? scaleX : scaleY;
-                    displayWidth = static_cast<int>(displayWidth * scale + 0.5f);
-                    displayHeight = static_cast<int>(displayHeight * scale + 0.5f);
-                    if (displayWidth < 1) displayWidth = 1;
-                    if (displayHeight < 1) displayHeight = 1;
-                  }
-                  LOG_DBG("EHP", "Display size from CSS height+width: %dx%d", displayWidth, displayHeight);
-                } else if (hasCssHeight && !hasCssWidth && dims.width > 0 && dims.height > 0) {
-                  // Use CSS height (resolve % against viewport height) and derive width from aspect ratio
-                  displayHeight = static_cast<int>(
-                      imgStyle.imageHeight.toPixels(emSize, static_cast<float>(self->viewportHeight)) + 0.5f);
                   if (displayHeight < 1) displayHeight = 1;
+                }
+                LOG_DBG("EHP", "Display size from CSS height+width: %dx%d", displayWidth, displayHeight);
+              } else if (hasCssHeight && !hasCssWidth && dims.width > 0 && dims.height > 0) {
+                // Use CSS height (resolve % against viewport height) and derive width from aspect ratio
+                displayHeight = static_cast<int>(
+                    imgStyle.imageHeight.toPixels(emSize, static_cast<float>(self->viewportHeight)) + 0.5f);
+                if (displayHeight < 1) displayHeight = 1;
+                displayWidth =
+                    static_cast<int>(displayHeight * (static_cast<float>(dims.width) / dims.height) + 0.5f);
+                if (displayHeight > self->viewportHeight) {
+                  displayHeight = self->viewportHeight;
+                  // Rescale width to preserve aspect ratio when height is clamped
                   displayWidth =
                       static_cast<int>(displayHeight * (static_cast<float>(dims.width) / dims.height) + 0.5f);
-                  if (displayHeight > self->viewportHeight) {
-                    displayHeight = self->viewportHeight;
-                    // Rescale width to preserve aspect ratio when height is clamped
-                    displayWidth =
-                        static_cast<int>(displayHeight * (static_cast<float>(dims.width) / dims.height) + 0.5f);
-                    if (displayWidth < 1) displayWidth = 1;
-                  }
-                  if (displayWidth > containerWidth) {
-                    displayWidth = containerWidth;
-                    // Rescale height to preserve aspect ratio when width is clamped
-                    displayHeight =
-                        static_cast<int>(displayWidth * (static_cast<float>(dims.height) / dims.width) + 0.5f);
-                    if (displayHeight < 1) displayHeight = 1;
-                  }
                   if (displayWidth < 1) displayWidth = 1;
-                  LOG_DBG("EHP", "Display size from CSS height: %dx%d", displayWidth, displayHeight);
-                } else if (hasCssWidth && !hasCssHeight && dims.width > 0 && dims.height > 0) {
-                  // Use CSS width (resolve % against container width) and derive height from aspect ratio
-                  displayWidth =
-                      static_cast<int>(imgStyle.imageWidth.toPixels(emSize, static_cast<float>(containerWidth)) + 0.5f);
-                  if (displayWidth > containerWidth) displayWidth = containerWidth;
-                  if (displayWidth < 1) displayWidth = 1;
+                }
+                if (displayWidth > containerWidth) {
+                  displayWidth = containerWidth;
+                  // Rescale height to preserve aspect ratio when width is clamped
                   displayHeight =
                       static_cast<int>(displayWidth * (static_cast<float>(dims.height) / dims.width) + 0.5f);
-                  if (displayHeight > self->viewportHeight) {
-                    displayHeight = self->viewportHeight;
-                    // Rescale width to preserve aspect ratio when height is clamped
-                    displayWidth =
-                        static_cast<int>(displayHeight * (static_cast<float>(dims.width) / dims.height) + 0.5f);
-                    if (displayWidth < 1) displayWidth = 1;
-                  }
                   if (displayHeight < 1) displayHeight = 1;
-                  LOG_DBG("EHP", "Display size from CSS width: %dx%d", displayWidth, displayHeight);
-                } else {
-                  // Scale to fit container while maintaining aspect ratio
-                  int maxWidth = containerWidth;
-                  int maxHeight = self->viewportHeight;
-                  float scaleX = (dims.width > maxWidth) ? (float)maxWidth / dims.width : 1.0f;
-                  float scaleY = (dims.height > maxHeight) ? (float)maxHeight / dims.height : 1.0f;
-                  float scale = (scaleX < scaleY) ? scaleX : scaleY;
-                  if (scale > 1.0f) scale = 1.0f;
-
-                  displayWidth = (int)(dims.width * scale);
-                  displayHeight = (int)(dims.height * scale);
-                  LOG_DBG("EHP", "Display size: %dx%d (scale %.2f)", displayWidth, displayHeight, scale);
                 }
-
-                // Flush any pending text block so it appears before the image
-                if (self->partWordBufferIndex > 0) {
-                  self->flushPartWordBuffer();
+                if (displayWidth < 1) displayWidth = 1;
+                LOG_DBG("EHP", "Display size from CSS height: %dx%d", displayWidth, displayHeight);
+              } else if (hasCssWidth && !hasCssHeight && dims.width > 0 && dims.height > 0) {
+                // Use CSS width (resolve % against container width) and derive height from aspect ratio
+                displayWidth =
+                    static_cast<int>(imgStyle.imageWidth.toPixels(emSize, static_cast<float>(containerWidth)) + 0.5f);
+                if (displayWidth > containerWidth) displayWidth = containerWidth;
+                if (displayWidth < 1) displayWidth = 1;
+                displayHeight = static_cast<int>(displayWidth * (static_cast<float>(dims.height) / dims.width) + 0.5f);
+                if (displayHeight > self->viewportHeight) {
+                  displayHeight = self->viewportHeight;
+                  // Rescale width to preserve aspect ratio when height is clamped
+                  displayWidth =
+                      static_cast<int>(displayHeight * (static_cast<float>(dims.width) / dims.height) + 0.5f);
+                  if (displayWidth < 1) displayWidth = 1;
                 }
-                if (self->currentTextBlock && !self->currentTextBlock->isEmpty()) {
-                  const BlockStyle parentBlockStyle = self->currentTextBlock->getBlockStyle();
-                  self->startNewTextBlock(parentBlockStyle);
-                }
-
-                // Apply vertical margins from the container to the image.
-                // Top margin lives on the empty text block (deposited via vertical merge
-                // in startNewTextBlock). Bottom margin was stripped by withoutBottom() for
-                // deferred application at element close, so read it from the stack.
-                int16_t imageMarginTop = 0;
-                int16_t imageMarginBottom = 0;
-                if (self->currentTextBlock && self->currentTextBlock->isEmpty()) {
-                  const auto& bs = self->currentTextBlock->getBlockStyle();
-                  imageMarginTop = bs.topInset();
-                  if (self->blockStyleStack.size() > 1) {
-                    imageMarginBottom = self->blockStyleStack.back().bottomInset();
-                  }
-                }
-
-                // Create page for image - only break if image won't fit remaining space
-                if (self->currentPage && !self->currentPage->elements.empty() &&
-                    (self->currentPageNextY + imageMarginTop + displayHeight + imageMarginBottom >
-                     self->viewportHeight)) {
-                  self->completePageFn(std::move(self->currentPage), self->xpathParagraphIndex,
-                                       self->xpathListItemIndex);
-                  self->completedPageCount++;
-                  self->currentPage.reset(new (std::nothrow) Page());
-                  if (!self->currentPage) {
-                    LOG_ERR("EHP", "OOM: failed to create new page (free_heap=%d)", (int)ESP.getFreeHeap());
-                    return;
-                  }
-                  self->currentPageNextY = 0;
-                } else if (!self->currentPage) {
-                  self->currentPage.reset(new (std::nothrow) Page());
-                  if (!self->currentPage) {
-                    LOG_ERR("EHP", "OOM: failed to create initial page (free_heap=%d)", (int)ESP.getFreeHeap());
-                    return;
-                  }
-                  self->currentPageNextY = 0;
-                }
-
-                // Apply top margin from container block
-                self->currentPageNextY += imageMarginTop;
-
-                // Create ImageBlock and add to page
-                auto imageBlock = std::make_shared<ImageBlock>(cachedImagePath, displayWidth, displayHeight);
-                if (!imageBlock) {
-                  LOG_ERR("EHP", "Failed to create ImageBlock");
-                  return;
-                }
-                int xPos = (self->viewportWidth - displayWidth) / 2;
-                auto pageImage = std::make_shared<PageImage>(imageBlock, xPos, self->currentPageNextY);
-                if (!pageImage) {
-                  LOG_ERR("EHP", "Failed to create PageImage");
-                  return;
-                }
-                self->currentPage->elements.push_back(pageImage);
-                self->currentPageNextY += displayHeight + imageMarginBottom;
-
-                // The image consumed the empty block's accumulated vertical spacing.
-                // Reset the block so the Vertical merge in startNewTextBlock doesn't
-                // re-apply the same margins to the next text paragraph.
-                if (self->currentTextBlock && self->currentTextBlock->isEmpty()) {
-                  BlockStyle resetStyle;
-                  resetStyle.alignment = (self->paragraphAlignment == static_cast<uint8_t>(CssTextAlign::None))
-                                             ? CssTextAlign::Justify
-                                             : static_cast<CssTextAlign>(self->paragraphAlignment);
-                  self->currentTextBlock->setBlockStyle(resetStyle);
-                }
-
-                self->depth += 1;
-                return;
+                if (displayHeight < 1) displayHeight = 1;
+                LOG_DBG("EHP", "Display size from CSS width: %dx%d", displayWidth, displayHeight);
               } else {
-                LOG_ERR("EHP", "Failed to get image dimensions");
-                Storage.remove(cachedImagePath.c_str());
+                // Scale to fit container while maintaining aspect ratio
+                int maxWidth = containerWidth;
+                int maxHeight = self->viewportHeight;
+                float scaleX = (dims.width > maxWidth) ? (float)maxWidth / dims.width : 1.0f;
+                float scaleY = (dims.height > maxHeight) ? (float)maxHeight / dims.height : 1.0f;
+                float scale = (scaleX < scaleY) ? scaleX : scaleY;
+                if (scale > 1.0f) scale = 1.0f;
+
+                displayWidth = (int)(dims.width * scale);
+                displayHeight = (int)(dims.height * scale);
+                LOG_DBG("EHP", "Display size: %dx%d (scale %.2f)", displayWidth, displayHeight, scale);
               }
-            } else {
-              LOG_ERR("EHP", "Failed to extract image");
+
+              // Flush any pending text block so it appears before the image
+              if (self->partWordBufferIndex > 0) {
+                self->flushPartWordBuffer();
+              }
+              if (self->currentTextBlock && !self->currentTextBlock->isEmpty()) {
+                const BlockStyle parentBlockStyle = self->currentTextBlock->getBlockStyle();
+                self->startNewTextBlock(parentBlockStyle);
+              }
+
+              // Apply vertical margins from the container to the image.
+              // Top margin lives on the empty text block (deposited via vertical merge
+              // in startNewTextBlock). Bottom margin was stripped by withoutBottom() for
+              // deferred application at element close, so read it from the stack.
+              int16_t imageMarginTop = 0;
+              int16_t imageMarginBottom = 0;
+              if (self->currentTextBlock && self->currentTextBlock->isEmpty()) {
+                const auto& bs = self->currentTextBlock->getBlockStyle();
+                imageMarginTop = bs.topInset();
+                if (self->blockStyleStack.size() > 1) {
+                  imageMarginBottom = self->blockStyleStack.back().bottomInset();
+                }
+              }
+
+              // Create page for image - only break if image won't fit remaining space
+              if (self->currentPage && !self->currentPage->elements.empty() &&
+                  (self->currentPageNextY + imageMarginTop + displayHeight + imageMarginBottom >
+                   self->viewportHeight)) {
+                self->commitPendingPage();
+                self->completePageFn(std::move(self->currentPage), self->xpathParagraphIndex, self->xpathListItemIndex);
+                self->completedPageCount++;
+                self->currentPage.reset(new (std::nothrow) Page());
+                if (!self->currentPage) {
+                  LOG_ERR("EHP", "OOM: failed to create new page (free_heap=%d)", (int)ESP.getFreeHeap());
+                  return;
+                }
+                self->currentPageNextY = 0;
+              } else if (!self->currentPage) {
+                self->currentPage.reset(new (std::nothrow) Page());
+                if (!self->currentPage) {
+                  LOG_ERR("EHP", "OOM: failed to create initial page (free_heap=%d)", (int)ESP.getFreeHeap());
+                  return;
+                }
+                self->currentPageNextY = 0;
+              }
+
+              // Apply top margin from container block
+              self->currentPageNextY += imageMarginTop;
+
+              // Create ImageBlock and add to page
+              auto imageBlock = std::make_shared<ImageBlock>(cachedImagePath, displayWidth, displayHeight);
+              if (!imageBlock) {
+                LOG_ERR("EHP", "Failed to create ImageBlock");
+                return;
+              }
+              int xPos = (self->viewportWidth - displayWidth) / 2;
+              auto pageImage = std::make_shared<PageImage>(imageBlock, xPos, self->currentPageNextY);
+              if (!pageImage) {
+                LOG_ERR("EHP", "Failed to create PageImage");
+                return;
+              }
+              self->currentPage->elements.push_back(pageImage);
+              self->currentPageNextY += displayHeight + imageMarginBottom;
+
+              // The image consumed the empty block's accumulated vertical spacing.
+              // Reset the block so the Vertical merge in startNewTextBlock doesn't
+              // re-apply the same margins to the next text paragraph.
+              if (self->currentTextBlock && self->currentTextBlock->isEmpty()) {
+                BlockStyle resetStyle;
+                resetStyle.alignment = (self->paragraphAlignment == static_cast<uint8_t>(CssTextAlign::None))
+                                           ? CssTextAlign::Justify
+                                           : static_cast<CssTextAlign>(self->paragraphAlignment);
+                self->currentTextBlock->setBlockStyle(resetStyle);
+              }
+
+              self->depth += 1;
+              return;
             }
           }  // isFormatSupported
         }
