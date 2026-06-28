@@ -12,7 +12,9 @@
 
 namespace {
 // v27: words NFC-composed at layout time; bump invalidates NFD section caches.
-constexpr uint8_t SECTION_FILE_VERSION = 27;
+// v28: <pre> blocks preserve line breaks and leading-space indentation; <code> renders italic.
+// v29: <li> bullet deferred to first word block with hanging indent; changes layout for all lists.
+constexpr uint8_t SECTION_FILE_VERSION = 29;
 // Written into the version field while a build is in progress; patched to
 // SECTION_FILE_VERSION only when the build is finalized. A partial / abandoned /
 // crash-interrupted .bin therefore carries version 0, which loadSectionFile rejects

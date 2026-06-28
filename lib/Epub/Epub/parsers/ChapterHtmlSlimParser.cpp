@@ -30,9 +30,9 @@ constexpr size_t PARSE_BUFFER_SIZE = 1024;
 constexpr size_t MAX_ANCHORS_PER_CHAPTER = 1024;
 
 constexpr const char* HEADER_TAGS[] = {"h1", "h2", "h3", "h4", "h5", "h6"};
-constexpr const char* BLOCK_TAGS[] = {"p", "li", "div", "br", "blockquote"};
+constexpr const char* BLOCK_TAGS[] = {"p", "li", "div", "br", "blockquote", "pre"};
 constexpr const char* BOLD_TAGS[] = {"b", "strong"};
-constexpr const char* ITALIC_TAGS[] = {"i", "em"};
+constexpr const char* ITALIC_TAGS[] = {"i", "em", "code"};
 constexpr const char* UNDERLINE_TAGS[] = {"u", "ins"};
 constexpr const char* IMAGE_TAGS[] = {"img"};
 constexpr const char* SKIP_TAGS[] = {"head"};
@@ -186,6 +186,10 @@ void ChapterHtmlSlimParser::flushPartWordBuffer() {
 
   // flush the buffer
   partWordBuffer[partWordBufferIndex] = '\0';
+  if (pendingListBullet) {
+    currentTextBlock->addWord("\xe2\x80\xa2", EpdFontFamily::REGULAR);
+    pendingListBullet = false;
+  }
   currentTextBlock->addWord(partWordBuffer, fontStyle, false, nextWordContinues);
   partWordBufferIndex = 0;
   nextWordContinues = false;
@@ -838,12 +842,25 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
       self->currentCssStyle = cssStyle;
       const auto accumulated = self->blockStyleStack.back().getCombinedBlockStyle(userAlignmentBlockStyle,
                                                                                   BlockStyle::CombineAxis::Horizontal);
-      self->blockStyleStack.push_back(accumulated);
-      self->startNewTextBlock(accumulated.withoutBottom());
+      if (strcmp(name, "li") == 0) {
+        // Hanging indent: indent all wrapped lines so they align with text, not bullet.
+        const int16_t hangPx = static_cast<int16_t>(self->renderer.getLineHeight(self->fontId) * self->lineCompression);
+        auto liStyle = accumulated;
+        liStyle.paddingLeft = static_cast<int16_t>(liStyle.paddingLeft + hangPx);
+        liStyle.textIndent = static_cast<int16_t>(-hangPx);
+        liStyle.textIndentDefined = true;
+        self->blockStyleStack.push_back(liStyle);
+        self->startNewTextBlock(liStyle.withoutBottom());
+        self->pendingListBullet = true;
+      } else {
+        self->blockStyleStack.push_back(accumulated);
+        self->startNewTextBlock(accumulated.withoutBottom());
+      }
       self->updateEffectiveInlineStyle();
 
-      if (strcmp(name, "li") == 0) {
-        self->currentTextBlock->addWord("\xe2\x80\xa2", EpdFontFamily::REGULAR);
+      if (strcmp(name, "pre") == 0) {
+        self->preDepth = self->depth;
+        self->preLineHasContent = false;
       }
     }
   } else if (matches(name, UNDERLINE_TAGS, std::size(UNDERLINE_TAGS))) {
@@ -1014,7 +1031,40 @@ void XMLCALL ChapterHtmlSlimParser::characterData(void* userData, const XML_Char
     self->currentFootnote.number[self->currentFootnoteLinkTextLen] = '\0';
   }
 
+  const bool insidePre = self->preDepth < INT_MAX;
+
   for (int i = 0; i < len; i++) {
+    // <pre> mode: preserve line structure before the normal whitespace-collapse path.
+    // \n becomes a forced line break; leading spaces on each line are NBSP-linked to
+    // preserve indentation; mid-line spaces remain normal word boundaries.
+    if (insidePre) {
+      if (s[i] == '\r') continue;
+      if (s[i] == '\n') {
+        if (self->partWordBufferIndex > 0) self->flushPartWordBuffer();
+        self->startNewTextBlock(self->blockStyleStack.back().withoutBottom());
+        self->preLineHasContent = false;
+        continue;
+      }
+      if (s[i] == ' ' || s[i] == '\t') {
+        if (!self->preLineHasContent) {
+          // Leading whitespace: NBSP-link to preserve indentation
+          if (self->partWordBufferIndex > 0) self->flushPartWordBuffer();
+          self->partWordBuffer[0] = ' ';
+          self->partWordBufferIndex = 1;
+          self->nextWordContinues = true;
+          self->flushPartWordBuffer();
+          self->nextWordContinues = true;
+        } else {
+          // Mid-line space: normal word boundary (allow reflow at viewport edge)
+          if (self->partWordBufferIndex > 0) self->flushPartWordBuffer();
+          self->nextWordContinues = false;
+        }
+        continue;
+      }
+      // Non-whitespace: mark line has content, fall through to normal character handling
+      self->preLineHasContent = true;
+    }
+
     if (isWhitespace(s[i])) {
       // Currently looking at whitespace, if there's anything in the partWordBuffer, flush it
       if (self->partWordBufferIndex > 0) {
@@ -1259,6 +1309,13 @@ void XMLCALL ChapterHtmlSlimParser::endElement(void* userData, const XML_Char* n
 
   // Clear block style when leaving header or block elements
   if (headerOrBlockTag) {
+    if (strcmp(name, "pre") == 0) {
+      self->preDepth = INT_MAX;
+      self->preLineHasContent = false;
+    }
+    if (strcmp(name, "li") == 0) {
+      self->pendingListBullet = false;  // empty <li> — no content arrived to consume the bullet
+    }
     self->currentCssStyle.reset();
     self->updateEffectiveInlineStyle();
 

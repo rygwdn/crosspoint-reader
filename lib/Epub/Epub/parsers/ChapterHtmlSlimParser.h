@@ -89,6 +89,11 @@ class ChapterHtmlSlimParser {
   uint16_t xpathParagraphIndex = 0;
   uint16_t xpathListItemIndex = 0;
 
+  // <pre> whitespace-preservation tracking
+  int preDepth = INT_MAX;          // depth at which <pre> was entered (INT_MAX = not in pre)
+  bool preLineHasContent = false;  // true after first non-whitespace char in current pre line
+  bool pendingListBullet = false;  // bullet deferred until first word of <li> to avoid bullet-only blocks
+
   // Widow prevention: hold the most recently filled page so makePages() can rescue
   // its last line when a paragraph leaves only one line on the following page (a widow).
   std::unique_ptr<Page> widowPendingPage;
