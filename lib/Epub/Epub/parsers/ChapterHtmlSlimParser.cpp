@@ -147,6 +147,7 @@ void ChapterHtmlSlimParser::flushPendingAnchor() {
   // block is flushed so the chapter starts on a fresh page.
   if (std::find(tocAnchors.begin(), tocAnchors.end(), pendingAnchorId) != tocAnchors.end()) {
     if (currentPage && !currentPage->elements.empty()) {
+      commitPendingPage();
       completePageFn(std::move(currentPage), xpathParagraphIndex, xpathListItemIndex);
       completedPageCount++;
       currentPage.reset(new Page());
@@ -252,6 +253,7 @@ void ChapterHtmlSlimParser::emitHorizontalRule(const BlockStyle& blockStyle) {
   const int16_t totalHeight = static_cast<int16_t>(topSpacing + ruleThickness + bottomSpacing);
 
   if (!currentPage->elements.empty() && currentPageNextY + totalHeight > viewportHeight) {
+    commitPendingPage();
     completePageFn(std::move(currentPage), xpathParagraphIndex, xpathListItemIndex);
     completedPageCount++;
     currentPage.reset(new (std::nothrow) Page());
@@ -631,6 +633,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
                 if (self->currentPage && !self->currentPage->elements.empty() &&
                     (self->currentPageNextY + imageMarginTop + displayHeight + imageMarginBottom >
                      self->viewportHeight)) {
+                  self->commitPendingPage();
                   self->completePageFn(std::move(self->currentPage), self->xpathParagraphIndex,
                                        self->xpathListItemIndex);
                   self->completedPageCount++;
@@ -810,6 +813,18 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
         self->blockStyleStack.back().getCombinedBlockStyle(headerBlockStyle, BlockStyle::CombineAxis::Horizontal);
     self->blockStyleStack.push_back(accumulated);
     self->startNewTextBlock(accumulated.withoutBottom());
+    // keep-with-next: if the heading would fall near the bottom of the page with
+    // insufficient room for the heading line plus at least two body lines after it,
+    // start a fresh page so the heading is never stranded alone at the bottom.
+    const int lineHeight = static_cast<int>(self->renderer.getLineHeight(self->fontId) * self->lineCompression);
+    if (self->currentPage && !self->currentPage->elements.empty() &&
+        self->currentPageNextY + lineHeight * 3 > self->viewportHeight) {
+      self->commitPendingPage();
+      self->completePageFn(std::move(self->currentPage), self->xpathParagraphIndex, self->xpathListItemIndex);
+      self->completedPageCount++;
+      self->currentPage.reset(new (std::nothrow) Page());
+      self->currentPageNextY = 0;
+    }
     self->boldUntilDepth = std::min(self->boldUntilDepth, self->depth);
     self->updateEffectiveInlineStyle();
   } else if (matches(name, BLOCK_TAGS, std::size(BLOCK_TAGS))) {
@@ -1358,6 +1373,7 @@ bool ChapterHtmlSlimParser::finishParse() {
       anchorData.push_back({std::move(pendingAnchorId), static_cast<uint16_t>(completedPageCount)});
       pendingAnchorId.clear();
     }
+    commitPendingPage();
     completePageFn(std::move(currentPage), xpathParagraphIndex, xpathListItemIndex);
     completedPageCount++;
     currentPage.reset();
@@ -1384,6 +1400,13 @@ bool ChapterHtmlSlimParser::parseAndBuildPages() {
   return finishParse();
 }
 
+void ChapterHtmlSlimParser::commitPendingPage() {
+  if (widowPendingPage) {
+    completePageFn(std::move(widowPendingPage), widowPendingParagraphIndex, widowPendingListItemIndex);
+    widowPendingPage.reset();
+  }
+}
+
 void ChapterHtmlSlimParser::addLineToPage(std::shared_ptr<TextBlock> line) {
   const int lineHeight = renderer.getLineHeight(fontId) * lineCompression;
 
@@ -1393,7 +1416,12 @@ void ChapterHtmlSlimParser::addLineToPage(std::shared_ptr<TextBlock> line) {
   }
 
   if (currentPageNextY + lineHeight > viewportHeight) {
-    completePageFn(std::move(currentPage), xpathParagraphIndex, xpathListItemIndex);
+    // Defer writing the filled page: widow fixup in makePages() may need to pull
+    // the last line back to accompany a lone widow on the next page.
+    commitPendingPage();
+    widowPendingPage = std::move(currentPage);
+    widowPendingParagraphIndex = xpathParagraphIndex;
+    widowPendingListItemIndex = xpathListItemIndex;
     completedPageCount++;
     currentPage.reset(new Page());
     currentPageNextY = 0;
@@ -1429,6 +1457,24 @@ void ChapterHtmlSlimParser::makePages() {
 
   // Apply top spacing before the paragraph (stored in pixels)
   const BlockStyle& blockStyle = currentTextBlock->getBlockStyle();
+
+  // ORPHAN PREVENTION: if fewer than 2 lines would fit on the current page after
+  // the paragraph's top inset, push the whole paragraph to a new page.
+  if (currentPage && !currentPage->elements.empty()) {
+    const int remaining = viewportHeight - currentPageNextY - blockStyle.topInset();
+    if (remaining < lineHeight * 2) {
+      commitPendingPage();
+      completePageFn(std::move(currentPage), xpathParagraphIndex, xpathListItemIndex);
+      completedPageCount++;
+      currentPage.reset(new (std::nothrow) Page());
+      if (!currentPage) {
+        LOG_ERR("EHP", "OOM: orphan prevention page");
+        return;
+      }
+      currentPageNextY = 0;
+    }
+  }
+
   if (blockStyle.marginTop > 0) {
     currentPageNextY += blockStyle.marginTop;
   }
@@ -1441,9 +1487,29 @@ void ChapterHtmlSlimParser::makePages() {
   const uint16_t effectiveWidth =
       (horizontalInset < viewportWidth) ? static_cast<uint16_t>(viewportWidth - horizontalInset) : viewportWidth;
 
+  const int pageCountBefore = completedPageCount;
   currentTextBlock->layoutAndExtractLines(
       renderer, fontId, effectiveWidth,
       [this](const std::shared_ptr<TextBlock>& textBlock) { addLineToPage(textBlock); });
+
+  // WIDOW PREVENTION: if exactly one line of this paragraph landed on a fresh page
+  // (a typographic widow), rescue the last line from the pending page so the new
+  // page opens with two lines instead of one.
+  if (currentPage && currentPage->elements.size() == 1 && completedPageCount > pageCountBefore && widowPendingPage &&
+      widowPendingPage->elements.size() >= 2 && widowPendingPage->elements.back()->getTag() == TAG_PageLine) {
+    auto& rescuedEl = static_cast<PageLine&>(*widowPendingPage->elements.back());
+    auto& widowEl = static_cast<PageLine&>(*currentPage->elements.front());
+    auto rescuedBlock = rescuedEl.getBlock();
+    const int16_t rescuedX = rescuedEl.xPos;
+    auto widowBlock = widowEl.getBlock();
+    const int16_t widowX = widowEl.xPos;
+    widowPendingPage->elements.pop_back();
+    currentPage->elements.clear();
+    currentPage->elements.push_back(std::make_shared<PageLine>(std::move(rescuedBlock), rescuedX, 0));
+    currentPage->elements.push_back(
+        std::make_shared<PageLine>(std::move(widowBlock), widowX, static_cast<int16_t>(lineHeight)));
+    currentPageNextY = static_cast<int16_t>(lineHeight * 2);
+  }
 
   // Fallback: transfer any remaining pending footnotes to current page.
   // Normally addLineToPage handles this via word-index tracking, but this catches
