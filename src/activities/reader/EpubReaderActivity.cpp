@@ -242,8 +242,10 @@ void EpubReaderActivity::loop() {
   // so a large chapter finishes laying out (and caching) while the reader is on the first page
   // and later pages turn instantly. Skip while the render mutex is busy so we never delay a
   // pending render; re-check isBuilding() under the lock since render() may have just finished it.
-  if (section && section->isBuilding() && !RenderLock::peek() &&
-      static_cast<int>(section->pageCount) < section->currentPage + BUILD_WINDOW_AHEAD) {
+  // No page-count gate: a look-ahead window caused the build to stall short of finalizeBuild()
+  // for long sections, so the .bin was never committed and every reopen rebuilt from scratch.
+  // BACKGROUND_BUILD_PAGES_PER_TICK already limits CPU use per tick.
+  if (section && section->isBuilding() && !RenderLock::peek()) {
     RenderLock lock;
     // Re-check under the lock: render() (which also holds the RenderLock) may have finalized the
     // build between the outer isBuilding() check and acquiring the lock here, in which case
