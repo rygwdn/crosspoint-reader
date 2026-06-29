@@ -818,11 +818,11 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
     self->blockStyleStack.push_back(accumulated);
     self->startNewTextBlock(accumulated.withoutBottom());
     // keep-with-next: if the heading would fall near the bottom of the page with
-    // insufficient room for the heading line plus at least two body lines after it,
-    // start a fresh page so the heading is never stranded alone at the bottom.
+    // insufficient room for the heading's top margin + heading line + at least two body
+    // lines after it, start a fresh page so the heading is never stranded at the bottom.
     const int lineHeight = static_cast<int>(self->renderer.getLineHeight(self->fontId) * self->lineCompression);
     if (self->currentPage && !self->currentPage->elements.empty() &&
-        self->currentPageNextY + lineHeight * 3 > self->viewportHeight) {
+        self->currentPageNextY + accumulated.topInset() + lineHeight * 3 > self->viewportHeight) {
       self->commitPendingPage();
       self->completePageFn(std::move(self->currentPage), self->xpathParagraphIndex, self->xpathListItemIndex);
       self->completedPageCount++;
