@@ -11,8 +11,8 @@
 #include "parsers/ChapterHtmlSlimParser.h"
 
 namespace {
-// v27: words NFC-composed at layout time; bump invalidates NFD section caches.
-constexpr uint8_t SECTION_FILE_VERSION = 27;
+// v28: anchors hashed to uint64_t (ARX); bump invalidates cached string maps.
+constexpr uint8_t SECTION_FILE_VERSION = 28;
 // Written into the version field while a build is in progress; patched to
 // SECTION_FILE_VERSION only when the build is finalized. A partial / abandoned /
 // crash-interrupted .bin therefore carries version 0, which loadSectionFile rejects
@@ -308,14 +308,14 @@ bool Section::startBuild(const int fontId, const float lineCompression, const bo
   }
 
   // Collect TOC anchors for this spine so the parser can insert page breaks at chapter boundaries
-  std::vector<std::string> tocAnchors;
+  std::vector<uint64_t> tocAnchors;
   const int startTocIndex = epub->getTocIndexForSpineIndex(spineIndex);
   if (startTocIndex >= 0) {
     for (int i = startTocIndex; i < epub->getTocItemsCount(); i++) {
       auto entry = epub->getTocItem(i);
       if (entry.spineIndex != spineIndex) break;
       if (!entry.anchor.empty()) {
-        tocAnchors.push_back(std::move(entry.anchor));
+        tocAnchors.push_back(arxHash64(entry.anchor));
       }
     }
   }
@@ -454,7 +454,7 @@ bool Section::finalizeBuild() {
   const auto& anchors = build_->parser->getAnchors();
   serialization::writePod(file, static_cast<uint16_t>(anchors.size()));
   for (const auto& [anchor, page] : anchors) {
-    serialization::writeString(file, anchor);
+    serialization::writePod(file, anchor);
     serialization::writePod(file, page);
   }
 
@@ -601,15 +601,16 @@ std::optional<uint16_t> Section::getPageForAnchor(const std::string& anchor) con
     return std::nullopt;
   }
 
+  const uint64_t targetHash = arxHash64(anchor);
   f.seek(anchorMapOffset);
   uint16_t count;
   serialization::readPod(f, count);
   for (uint16_t i = 0; i < count; i++) {
-    std::string key;
+    uint64_t hashKey;
     uint16_t page;
-    serialization::readString(f, key);
+    serialization::readPod(f, hashKey);
     serialization::readPod(f, page);
-    if (key == anchor) {
+    if (hashKey == targetHash) {
       return page;
     }
   }

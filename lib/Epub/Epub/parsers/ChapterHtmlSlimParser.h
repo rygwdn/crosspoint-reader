@@ -4,10 +4,24 @@
 #include <expat.h>
 
 #include <climits>
+#include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
+
+inline uint64_t arxHash64(const char* s) {
+  uint64_t hash = 0xcbf29ce484222325ULL;
+  while (char c = *s++) {
+    hash ^= static_cast<uint8_t>(c);
+    hash = (hash << 19) | (hash >> 45);
+    hash += 0x9e3779b97f4a7c15ULL;
+  }
+  return hash;
+}
+
+inline uint64_t arxHash64(const std::string& s) { return arxHash64(s.c_str()); }
 
 #include "Epub/FootnoteEntry.h"
 #include "Epub/ParsedText.h"
@@ -81,11 +95,11 @@ class ChapterHtmlSlimParser {
   int tableRowIndex = 0;
   int tableColIndex = 0;
 
-  // Anchor-to-page mapping: tracks which page each HTML id attribute lands on
+  // Anchor-to-page mapping: tracks which page each HTML id attribute lands on.
   int completedPageCount = 0;
-  std::vector<std::pair<std::string, uint16_t>> anchorData;
-  std::string pendingAnchorId;          // deferred until after previous text block is flushed
-  std::vector<std::string> tocAnchors;  // the list of anchors that are TOC chapter boundaries
+  std::vector<std::pair<uint64_t, uint16_t>> anchorData;
+  std::optional<uint64_t> pendingAnchorId;  // deferred until after previous text block is flushed
+  std::vector<uint64_t> tocAnchors;         // the list of anchors that are TOC chapter boundaries
   uint16_t xpathParagraphIndex = 0;
   uint16_t xpathListItemIndex = 0;
 
@@ -129,8 +143,8 @@ class ChapterHtmlSlimParser {
                                  const std::function<void(std::unique_ptr<Page>, uint16_t, uint16_t)>& completePageFn,
                                  const bool embeddedStyle, const std::string& contentBase,
                                  const std::string& imageBasePath, const uint8_t imageRendering = 0,
-                                 std::vector<std::string> tocAnchors = {},
-                                 const std::function<void()>& popupFn = nullptr, const CssParser* cssParser = nullptr)
+                                 std::vector<uint64_t> tocAnchors = {}, const std::function<void()>& popupFn = nullptr,
+                                 const CssParser* cssParser = nullptr)
 
       : epub(epub),
         filepath(filepath),
@@ -169,7 +183,7 @@ class ChapterHtmlSlimParser {
   void abortParse();   // tear down without flushing (error / abandon)
 
   void addLineToPage(std::shared_ptr<TextBlock> line);
-  const std::vector<std::pair<std::string, uint16_t>>& getAnchors() const { return anchorData; }
+  const std::vector<std::pair<uint64_t, uint16_t>>& getAnchors() const { return anchorData; }
 
   // Byte progress of the in-flight parse, used to estimate a still-building section's total page
   // count (a giant single-spine book never fully lays out, so its real count is unknown). Valid
