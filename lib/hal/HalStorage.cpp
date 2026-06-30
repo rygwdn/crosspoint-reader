@@ -170,4 +170,6 @@ HalFile HalFile::openNextFile() {
 }
 bool HalFile::isOpen() const { return impl != nullptr && impl->file.isOpen(); }  // already thread-safe, no need to wrap
 HalFile::operator bool() const { return isOpen(); }
-bool HalFile::getModifyDateTime(uint16_t* pdate, uint16_t* ptime) { HAL_FILE_WRAPPED_CALL(getModifyDateTime, pdate, ptime); }
+bool HalFile::getModifyDateTime(uint16_t* pdate, uint16_t* ptime) {
+  HAL_FILE_WRAPPED_CALL(getModifyDateTime, pdate, ptime);
+}

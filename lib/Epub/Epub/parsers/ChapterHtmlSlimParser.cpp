@@ -1485,7 +1485,6 @@ void ChapterHtmlSlimParser::commitPendingPage() {
   }
 }
 
-
 void ChapterHtmlSlimParser::addLineToPage(std::shared_ptr<TextBlock> line) {
   const int lineHeight = renderer.getLineHeight(fontId) * lineCompression;
 

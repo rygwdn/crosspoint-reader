@@ -29,8 +29,7 @@ String fatDateTimeToRfc1123(uint16_t pdate, uint16_t ptime) {
   int y = year - (month < 3 ? 1 : 0);
   int dow = (y + y / 4 - y / 100 + y / 400 + t[month - 1] + day) % 7;
   static const char* DAYS[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
-  static const char* MONTHS[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                                  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+  static const char* MONTHS[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
   char buf[32];
   snprintf(buf, sizeof(buf), "%s, %02d %s %04d %02d:%02d:%02d GMT", DAYS[dow], day, MONTHS[month - 1], year, hour,
            minute, second);
