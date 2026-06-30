@@ -10,10 +10,38 @@
 namespace {
 constexpr const char* HIDDEN_ITEMS[] = {"System Volume Information", "XTCache"};
 
-// RFC 1123 date format helper: "Sun, 06 Nov 1994 08:49:37 GMT"
-// ESP32 doesn't have real-time clock set by default, so we use a fixed epoch date
-// as a fallback. The date is not critical for WebDAV Class 1 operations.
-const char* FIXED_DATE = "Thu, 01 Jan 2024 00:00:00 GMT";
+// RFC 1123 date: "Thu, 01 Jan 2024 00:00:00 GMT"
+const char* FIXED_DATE = "Thu, 01 Jan 1980 00:00:00 GMT";
+
+// Convert FAT date/time fields to RFC 1123. Returns FIXED_DATE if pdate==0
+// (unset — ESP32 has no RTC by default so most files carry a zero timestamp).
+String fatDateTimeToRfc1123(uint16_t pdate, uint16_t ptime) {
+  if (pdate == 0) return FIXED_DATE;
+  int year = 1980 + ((pdate >> 9) & 0x7F);
+  int month = (pdate >> 5) & 0x0F;
+  int day = pdate & 0x1F;
+  int hour = (ptime >> 11) & 0x1F;
+  int minute = (ptime >> 5) & 0x3F;
+  int second = (ptime & 0x1F) * 2;
+  if (month < 1 || month > 12 || day < 1 || day > 31) return FIXED_DATE;
+  // Tomohiko Sakamoto's day-of-week algorithm (0=Sun)
+  static const int t[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
+  int y = year - (month < 3 ? 1 : 0);
+  int dow = (y + y / 4 - y / 100 + y / 400 + t[month - 1] + day) % 7;
+  static const char* DAYS[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+  static const char* MONTHS[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%s, %02d %s %04d %02d:%02d:%02d GMT", DAYS[dow], day, MONTHS[month - 1], year, hour,
+           minute, second);
+  return String(buf);
+}
+
+String getFileTimestamp(HalFile& file) {
+  uint16_t pdate = 0, ptime = 0;
+  file.getModifyDateTime(&pdate, &ptime);
+  return fatDateTimeToRfc1123(pdate, ptime);
+}
 }  // namespace
 
 // ── RequestHandler interface ─────────────────────────────────────────────────
@@ -210,9 +238,10 @@ void WebDAVHandler::handlePropfind(WebServer& s) {
 
   // Entry for the resource itself
   if (isDir) {
-    sendPropEntry(s, path, true, 0, FIXED_DATE);
+    sendPropEntry(s, path, true, 0, getFileTimestamp(root));
   } else {
-    sendPropEntry(s, path, false, root.size(), FIXED_DATE);
+    String ts = getFileTimestamp(root);
+    sendPropEntry(s, path, false, root.size(), ts);
     root.close();
     s.sendContent("</D:multistatus>\n");
     s.sendContent("");
@@ -227,27 +256,14 @@ void WebDAVHandler::handlePropfind(WebServer& s) {
       file.getName(name, sizeof(name));
       String fileName(name);
 
-      // Skip hidden/protected items
-      bool shouldHide = fileName.startsWith(".");
-      if (!shouldHide) {
-        for (const auto* item : HIDDEN_ITEMS) {
-          if (fileName.equals(item)) {
-            shouldHide = true;
-            break;
-          }
-        }
-      }
+      String childPath = path;
+      if (!childPath.endsWith("/")) childPath += "/";
+      childPath += fileName;
 
-      if (!shouldHide) {
-        String childPath = path;
-        if (!childPath.endsWith("/")) childPath += "/";
-        childPath += fileName;
-
-        if (file.isDirectory()) {
-          sendPropEntry(s, childPath, true, 0, FIXED_DATE);
-        } else {
-          sendPropEntry(s, childPath, false, file.size(), FIXED_DATE);
-        }
+      if (file.isDirectory()) {
+        sendPropEntry(s, childPath, true, 0, getFileTimestamp(file));
+      } else {
+        sendPropEntry(s, childPath, false, file.size(), getFileTimestamp(file));
       }
 
       file.close();
@@ -301,11 +317,6 @@ void WebDAVHandler::handleGet(WebServer& s) {
   String path = getRequestPath(s);
   LOG_DBG("DAV", "GET %s", path.c_str());
 
-  if (isProtectedPath(path)) {
-    s.send(403, "text/plain", "Forbidden");
-    return;
-  }
-
   if (!Storage.exists(path.c_str())) {
     s.send(404, "text/plain", "Not Found");
     return;
@@ -328,7 +339,25 @@ void WebDAVHandler::handleGet(WebServer& s) {
   s.send(200, contentType.c_str(), "");
 
   NetworkClient client = s.client();
-  client.write(file);
+  constexpr size_t CHUNK = 4096;
+  uint8_t buffer[CHUNK];
+  bool sendOk = true;
+  while (sendOk && file.available()) {
+    int result = file.read(buffer, CHUNK);
+    if (result <= 0) break;
+    size_t bytesRead = static_cast<size_t>(result);
+    size_t totalWritten = 0;
+    while (totalWritten < bytesRead) {
+      esp_task_wdt_reset();
+      size_t wrote = client.write(buffer + totalWritten, bytesRead - totalWritten);
+      if (wrote == 0) {
+        sendOk = false;
+        break;
+      }
+      totalWritten += wrote;
+    }
+  }
+  client.clear();
   file.close();
 }
 
@@ -337,11 +366,6 @@ void WebDAVHandler::handleGet(WebServer& s) {
 void WebDAVHandler::handleHead(WebServer& s) {
   String path = getRequestPath(s);
   LOG_DBG("DAV", "HEAD %s", path.c_str());
-
-  if (isProtectedPath(path)) {
-    s.send(403, "text/plain", "");
-    return;
-  }
 
   if (!Storage.exists(path.c_str())) {
     s.send(404, "text/plain", "");

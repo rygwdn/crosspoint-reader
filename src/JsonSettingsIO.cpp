@@ -280,6 +280,7 @@ bool JsonSettingsIO::saveWifi(const WifiCredentialStore& store, const char* path
     JsonObject obj = arr.add<JsonObject>();
     obj["ssid"] = cred.ssid;
     obj["password_obf"] = obfuscation::obfuscateToBase64(cred.password);
+    if (cred.isBackup) obj["backup"] = true;  // omit false to save JSON space
   }
 
   String json;
@@ -310,6 +311,7 @@ bool JsonSettingsIO::loadWifi(WifiCredentialStore& store, const char* json, bool
       cred.password = obj["password"] | std::string("");
       if (!cred.password.empty() && needsResave) *needsResave = true;
     }
+    cred.isBackup = obj["backup"] | false;
     store.credentials.push_back(cred);
   }
 
@@ -373,6 +375,11 @@ bool JsonSettingsIO::saveOpds(const OpdsServerStore& store, const char* path) {
     obj["url"] = server.url;
     obj["username"] = server.username;
     obj["password_obf"] = obfuscation::obfuscateToBase64(server.password);
+    obj["sync_enabled"] = server.syncEnabled;
+    obj["sync_limit"] = server.syncLimit;
+    obj["show_on_home"] = server.showOnHome;
+    obj["cache_enabled"] = server.cacheEnabled;
+    if (!server.downloadPath.empty()) obj["download_path"] = server.downloadPath;
   }
 
   String json;
@@ -405,6 +412,11 @@ bool JsonSettingsIO::loadOpds(OpdsServerStore& store, const char* json, bool* ne
       server.password = obj["password"] | std::string("");
       if (!server.password.empty() && needsResave) *needsResave = true;
     }
+    server.syncEnabled = obj["sync_enabled"] | false;
+    server.syncLimit = obj["sync_limit"] | 20;
+    server.showOnHome = obj["show_on_home"] | false;
+    server.cacheEnabled = obj["cache_enabled"] | false;
+    server.downloadPath = obj["download_path"] | std::string("");
     store.servers.push_back(std::move(server));
   }
 

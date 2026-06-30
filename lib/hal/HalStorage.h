@@ -94,6 +94,7 @@ class HalFile : public Print {
   HalFile openNextFile();
   bool isOpen() const;
   operator bool() const;
+  bool getModifyDateTime(uint16_t* pdate, uint16_t* ptime);
 };
 
 // Downstream code must use Storage instead of SdMan

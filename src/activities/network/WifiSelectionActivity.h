@@ -18,6 +18,7 @@ struct WifiNetworkInfo {
   int32_t rssi;
   bool isEncrypted;
   bool hasSavedPassword;  // Whether we have saved credentials for this network
+  bool isBackup = false;  // Whether this network is the designated mobile backup
 };
 
 // WiFi selection states
@@ -74,9 +75,12 @@ class WifiSelectionActivity final : public Activity {
   // Whether we are attempting to auto-connect
   bool autoConnecting = false;
 
-  // Save/forget prompt selection (0 = Yes, 1 = No)
+  // Save/forget prompt selection (0 = Yes/Cancel, 1 = No/Forget)
   int savePromptSelection = 0;
   int forgetPromptSelection = 0;
+
+  // Whether the current auto-connect attempt is the backup fallback
+  bool autoConnectingBackup = false;
 
   // Connection timeout
   static constexpr unsigned long CONNECTION_TIMEOUT_MS = 15000;
@@ -95,6 +99,7 @@ class WifiSelectionActivity final : public Activity {
   void selectNetwork(int index);
   void attemptConnection();
   void checkConnectionStatus();
+  bool tryFallbackToBackup();  // Initiates backup auto-connect; returns true if attempted
   std::string getSignalStrengthIndicator(int32_t rssi) const;
 
   void onComplete(bool connected);

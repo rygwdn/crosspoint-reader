@@ -242,8 +242,10 @@ void EpubReaderActivity::loop() {
   // so a large chapter finishes laying out (and caching) while the reader is on the first page
   // and later pages turn instantly. Skip while the render mutex is busy so we never delay a
   // pending render; re-check isBuilding() under the lock since render() may have just finished it.
-  if (section && section->isBuilding() && !RenderLock::peek() &&
-      static_cast<int>(section->pageCount) < section->currentPage + BUILD_WINDOW_AHEAD) {
+  // No page-count gate: a look-ahead window caused the build to stall short of finalizeBuild()
+  // for long sections, so the .bin was never committed and every reopen rebuilt from scratch.
+  // BACKGROUND_BUILD_PAGES_PER_TICK already limits CPU use per tick.
+  if (section && section->isBuilding() && !RenderLock::peek()) {
     RenderLock lock;
     // Re-check under the lock: render() (which also holds the RenderLock) may have finalized the
     // build between the outer isBuilding() check and acquiring the lock here, in which case
@@ -338,18 +340,23 @@ void EpubReaderActivity::loop() {
         bookProgress = epub->calculateProgress(currentSpineIndex, chapterProgress) * 100.0f;
       }
       const int bookProgressPercent = clampPercent(static_cast<int>(bookProgress + 0.5f));
-      startActivityForResult(std::make_unique<EpubReaderMenuActivity>(
-                                 renderer, mappedInput, epub->getTitle(), currentPage, totalPages, bookProgressPercent,
-                                 SETTINGS.orientation, !currentPageFootnotes.empty(), !cachedBookmarks.empty()),
-                             [this](const ActivityResult& result) {
-                               // Always apply orientation change even if the menu was cancelled
-                               const auto& menu = std::get<MenuResult>(result.data);
-                               applyOrientation(menu.orientation);
-                               toggleAutoPageTurn(menu.pageTurnOption);
-                               if (!result.isCancelled) {
-                                 onReaderMenuConfirm(static_cast<EpubReaderMenuActivity::MenuAction>(menu.action));
-                               }
-                             });
+      startActivityForResult(
+          std::make_unique<EpubReaderMenuActivity>(renderer, mappedInput, epub->getTitle(), currentPage, totalPages,
+                                                   bookProgressPercent, SETTINGS.orientation, SETTINGS.fadingFix,
+                                                   !currentPageFootnotes.empty(), !cachedBookmarks.empty()),
+          [this](const ActivityResult& result) {
+            // Always apply orientation and sunlight changes even if the menu was cancelled
+            const auto& menu = std::get<MenuResult>(result.data);
+            applyOrientation(menu.orientation);
+            toggleAutoPageTurn(menu.pageTurnOption);
+            if (SETTINGS.fadingFix != menu.sunlightMode) {
+              SETTINGS.fadingFix = menu.sunlightMode;
+              SETTINGS.saveToFile();
+            }
+            if (!result.isCancelled) {
+              onReaderMenuConfirm(static_cast<EpubReaderMenuActivity::MenuAction>(menu.action));
+            }
+          });
     }
   }
 
@@ -376,6 +383,21 @@ void EpubReaderActivity::loop() {
           }
         }
         break;
+      case CrossPointSettings::LP_MENU_SLEEP:
+        // Hold ~1s goes to sleep.
+        if (mappedInput.getHeldTime() >= ReaderUtils::GO_HOME_MS) {
+          ignoreNextConfirmRelease = true;
+          activityManager.goToSleep();
+          return;
+        }
+        break;
+      case CrossPointSettings::LP_MENU_FORCE_REFRESH:
+        if (mappedInput.getHeldTime() >= ReaderUtils::BOOKMARK_HOLD_MS) {
+          pagesUntilFullRefresh = 0;
+          ignoreNextConfirmRelease = true;
+          requestUpdate();
+        }
+        break;
       case CrossPointSettings::LP_MENU_DISABLED:
       default:
         break;
@@ -388,18 +410,26 @@ void EpubReaderActivity::loop() {
     return;
   }
 
-  // Short press BACK goes directly to home (or restores position if viewing footnote)
+  // finish() lets push-callers (e.g. OPDS browser) return normally; replace-callers still reach Home via empty stack.
   if (mappedInput.wasReleased(MappedInputManager::Button::Back) &&
       mappedInput.getHeldTime() < ReaderUtils::GO_HOME_MS) {
     if (footnoteDepth > 0) {
       restoreSavedPosition();
       return;
     }
-    onGoHome();
+    finish();
     return;
   }
 
   // auto [prevTriggered, nextTriggered] = ReaderUtils::detectPageTurn(mappedInput);
+
+  // FORCE_REFRESH: re-render the current page with a full (HALF_REFRESH) waveform + AA pass.
+  if (SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::FORCE_REFRESH &&
+      mappedInput.wasReleased(MappedInputManager::Button::Power)) {
+    pagesUntilFullRefresh = 0;
+    requestUpdate();
+    return;
+  }
 
   // Handle short power button press for footnotes
   if (SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::FOOTNOTES &&
@@ -430,10 +460,14 @@ void EpubReaderActivity::loop() {
     return;
   }
 
-  // At end of the book, forward button goes home and back button returns to last page
+  // At end of the book, forward button goes home (or back to caller) and back button returns to last page
   if (currentSpineIndex > 0 && currentSpineIndex >= epub->getSpineItemsCount()) {
     if (nextTriggered) {
-      onGoHome();
+      if (returnToCallerAtEnd) {
+        finish();
+      } else {
+        onGoHome();
+      }
     } else {
       currentSpineIndex = epub->getSpineItemsCount() - 1;
       nextPageNumber = 0;
@@ -477,6 +511,12 @@ void EpubReaderActivity::loop() {
         nextTriggered ? (SETTINGS.orientation - 1 + SETTINGS.ORIENTATION_COUNT) % SETTINGS.ORIENTATION_COUNT
                       : (SETTINGS.orientation + 1) % SETTINGS.ORIENTATION_COUNT;
     applyOrientation(newOrientation);
+    requestUpdate();
+    return;
+  }
+
+  if (longPress && SETTINGS.longPressButtonBehavior == CrossPointSettings::LP_BTN_FORCE_REFRESH) {
+    pagesUntilFullRefresh = 0;
     requestUpdate();
     return;
   }

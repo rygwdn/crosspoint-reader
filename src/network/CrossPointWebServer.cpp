@@ -11,6 +11,7 @@
 #include <algorithm>
 
 #include "CrossPointSettings.h"
+#include "DiskLogger.h"
 #include "FontInstaller.h"
 #include "OpdsServerStore.h"
 #include "SdCardFontSystem.h"
@@ -20,6 +21,7 @@
 #include "html/FilesPageHtml.generated.h"
 #include "html/FontsPageHtml.generated.h"
 #include "html/HomePageHtml.generated.h"
+#include "html/LogsPageHtml.generated.h"
 #include "html/SettingsPageHtml.generated.h"
 #include "html/js/jszip_minJs.generated.h"
 #include "util/BookCacheUtils.h"
@@ -165,6 +167,13 @@ void CrossPointWebServer::begin() {
   server->on("/api/fonts/upload", HTTP_POST, [this] { handleFontUpload(); }, [this] { handleFontUploadData(); });
   server->on("/api/fonts/delete", HTTP_POST, [this] { handleFontDelete(); });
 
+  // Log management endpoints
+  server->on("/logs", HTTP_GET, [this] { handleLogsPage(); });
+  server->on("/api/logs/recent", HTTP_GET, [this] { handleLogsRecent(); });
+  server->on("/api/logs/flush", HTTP_POST, [this] { handleLogsFlush(); });
+  server->on("/api/logs/download", HTTP_GET, [this] { handleLogsDownload(); });
+  server->on("/api/logs/clear", HTTP_POST, [this] { handleLogsClear(); });
+
   // OPDS server endpoints
   server->on("/api/opds", HTTP_GET, [this] { handleGetOpdsServers(); });
   server->on("/api/opds", HTTP_POST, [this] { handlePostOpdsServer(); });
@@ -174,6 +183,7 @@ void CrossPointWebServer::begin() {
   server->on("/api/wifi", HTTP_GET, [this] { handleGetWifiNetworks(); });
   server->on("/api/wifi", HTTP_POST, [this] { handlePostWifiNetwork(); });
   server->on("/api/wifi/delete", HTTP_POST, [this] { handleDeleteWifiNetwork(); });
+  server->on("/api/wifi/backup", HTTP_POST, [this] { handleSetWifiBackup(); });
 
   server->onNotFound([this] { handleNotFound(); });
   LOG_DBG("WEB", "[MEM] Free heap after route setup: %d bytes", ESP.getFreeHeap());
@@ -1271,6 +1281,73 @@ void CrossPointWebServer::handlePostSettings() {
   server->send(200, "text/plain", String("Applied ") + String(applied) + " setting(s)");
 }
 
+// ---- Log Management API ----
+
+void CrossPointWebServer::handleLogsPage() const {
+  sendHtmlContent(server.get(), LogsPageHtml, sizeof(LogsPageHtml));
+  LOG_DBG("WEB", "Served logs page");
+}
+
+void CrossPointWebServer::handleLogsRecent() const {
+  std::string logs = getLastLogs();
+  server->send(200, "text/plain", logs.c_str());
+}
+
+void CrossPointWebServer::handleLogsFlush() {
+  DiskLogger::flushNow();
+  server->send(200, "text/plain", "Flushed");
+}
+
+void CrossPointWebServer::handleLogsDownload() const {
+  DiskLogger::flushNow();
+
+  constexpr const char* logPath = "/.crosspoint/debug.log";
+
+  if (!Storage.exists(logPath)) {
+    server->send(404, "text/plain", "No log file found. Enable disk logging and wait for 16+ log entries.");
+    return;
+  }
+
+  HalFile file = Storage.open(logPath);
+  if (!file) {
+    server->send(500, "text/plain", "Failed to open log file");
+    return;
+  }
+
+  server->setContentLength(file.fileSize());
+  server->sendHeader("Content-Disposition", "attachment; filename=\"debug.log\"");
+  server->send(200, "text/plain", "");
+
+  NetworkClient client = server->client();
+  constexpr size_t chunkSize = 4096;
+  uint8_t buf[chunkSize];
+  bool ok = true;
+  while (ok && file.available()) {
+    int result = file.read(buf, chunkSize);
+    if (result <= 0) break;
+    size_t bytesRead = static_cast<size_t>(result);
+    size_t written = 0;
+    while (written < bytesRead) {
+      esp_task_wdt_reset();
+      size_t n = client.write(buf + written, bytesRead - written);
+      if (n == 0) {
+        ok = false;
+        break;
+      }
+      written += n;
+    }
+  }
+  client.clear();
+  file.close();
+  LOG_DBG("WEB", "Served log file download");
+}
+
+void CrossPointWebServer::handleLogsClear() {
+  DiskLogger::clear();
+  server->send(200, "text/plain", "Cleared");
+  LOG_DBG("WEB", "Log files cleared");
+}
+
 // ---- OPDS Server API ----
 
 void CrossPointWebServer::handleGetOpdsServers() const {
@@ -1281,7 +1358,7 @@ void CrossPointWebServer::handleGetOpdsServers() const {
   server->send(200, "application/json", "");
   server->sendContent("[");
 
-  char output[512];
+  char output[640];
   constexpr size_t outputSize = sizeof(output);
   JsonDocument doc;
 
@@ -1293,6 +1370,11 @@ void CrossPointWebServer::handleGetOpdsServers() const {
     doc["username"] = servers[i].username;
     // Never expose passwords over the API — only indicate whether one is set
     doc["hasPassword"] = !servers[i].password.empty();
+    doc["show_on_home"] = servers[i].showOnHome;
+    doc["sync_enabled"] = servers[i].syncEnabled;
+    doc["sync_limit"] = servers[i].syncLimit;
+    doc["cache_enabled"] = servers[i].cacheEnabled;
+    doc["download_path"] = servers[i].downloadPath;
 
     const size_t written = serializeJson(doc, output, outputSize);
     if (written >= outputSize) continue;
@@ -1324,6 +1406,11 @@ void CrossPointWebServer::handlePostOpdsServer() {
   opdsServer.name = doc["name"] | std::string("");
   opdsServer.url = doc["url"] | std::string("");
   opdsServer.username = doc["username"] | std::string("");
+  opdsServer.showOnHome = doc["show_on_home"] | false;
+  opdsServer.syncEnabled = doc["sync_enabled"] | false;
+  opdsServer.syncLimit = doc["sync_limit"] | 20;
+  opdsServer.cacheEnabled = doc["cache_enabled"] | false;
+  opdsServer.downloadPath = doc["download_path"] | std::string("");
 
   // The password field is optional in the JSON payload. When absent (vs. present but empty),
   // we preserve the existing password — the web UI omits it when the user hasn't changed it.
@@ -1409,6 +1496,7 @@ void CrossPointWebServer::handleGetWifiNetworks() const {
     // Never expose Wi-Fi passwords over the API — only indicate whether one is set
     doc["hasPassword"] = !credentials[i].password.empty();
     doc["isLastConnected"] = credentials[i].ssid == lastConnectedSsid;
+    doc["isBackup"] = credentials[i].isBackup;
 
     const size_t written = serializeJson(doc, output, outputSize);
     if (written >= outputSize) continue;
@@ -1518,6 +1606,47 @@ void CrossPointWebServer::handleDeleteWifiNetwork() {
   }
 
   LOG_DBG("WEB", "Deleted Wi-Fi network at index %d (SSID: %s)", idx, ssid.c_str());
+  server->send(200, "text/plain", "OK");
+}
+
+// POST /api/wifi/backup — designates one saved network as the mobile hotspot backup.
+// Body: {"index": <int>} to set backup, or {"index": -1} to clear it.
+void CrossPointWebServer::handleSetWifiBackup() {
+  if (!server->hasArg("plain")) {
+    server->send(400, "text/plain", "Missing JSON body");
+    return;
+  }
+
+  const String body = server->arg("plain");
+  JsonDocument doc;
+  const DeserializationError err = deserializeJson(doc, body);
+  if (err) {
+    server->send(400, "text/plain", String("Invalid JSON: ") + err.c_str());
+    return;
+  }
+
+  if (!doc["index"].is<int>()) {
+    server->send(400, "text/plain", "Missing index");
+    return;
+  }
+
+  const int idx = doc["index"].as<int>();
+  const auto& credentials = WIFI_STORE.getCredentials();
+
+  if (idx == -1) {
+    // Clear backup designation
+    const auto* current = WIFI_STORE.getBackupCredential();
+    if (current) WIFI_STORE.setBackup(current->ssid, false);
+    LOG_DBG("WEB", "Cleared mobile backup designation");
+  } else {
+    if (idx < 0 || idx >= static_cast<int>(credentials.size())) {
+      server->send(400, "text/plain", "Invalid network index");
+      return;
+    }
+    WIFI_STORE.setBackup(credentials[static_cast<size_t>(idx)].ssid, true);
+    LOG_DBG("WEB", "Set mobile backup to index %d (SSID: %s)", idx, credentials[static_cast<size_t>(idx)].ssid.c_str());
+  }
+
   server->send(200, "text/plain", "OK");
 }
 

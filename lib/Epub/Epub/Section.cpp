@@ -11,8 +11,10 @@
 #include "parsers/ChapterHtmlSlimParser.h"
 
 namespace {
-// v28: anchors hashed to uint64_t (ARX); bump invalidates cached string maps.
-constexpr uint8_t SECTION_FILE_VERSION = 28;
+// v27: words NFC-composed at layout time; bump invalidates NFD section caches.
+// v28: anchors hashed to uint64_t (ARX); <pre>/<code> rendering; bump invalidates cached section files.
+// v29: <li> bullet deferred to first word block with hanging indent; changes layout for all lists.
+constexpr uint8_t SECTION_FILE_VERSION = 29;
 // Written into the version field while a build is in progress; patched to
 // SECTION_FILE_VERSION only when the build is finalized. A partial / abandoned /
 // crash-interrupted .bin therefore carries version 0, which loadSectionFile rejects

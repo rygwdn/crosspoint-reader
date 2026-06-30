@@ -18,6 +18,7 @@ class EpubReaderMenuActivity final : public Activity {
     GO_TO_PERCENT,
     AUTO_PAGE_TURN,
     ROTATE_SCREEN,
+    SUNLIGHT_MODE,
     BOOKMARKS,
     TOGGLE_BOOKMARK,
     SCREENSHOT,
@@ -29,7 +30,8 @@ class EpubReaderMenuActivity final : public Activity {
 
   explicit EpubReaderMenuActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, const std::string& title,
                                   const int currentPage, const int totalPages, const int bookProgressPercent,
-                                  const uint8_t currentOrientation, const bool hasFootnotes, bool hasBookmarks);
+                                  const uint8_t currentOrientation, const uint8_t currentSunlightMode,
+                                  const bool hasFootnotes, bool hasBookmarks);
 
   void onEnter() override;
   void onExit() override;
@@ -53,6 +55,7 @@ class EpubReaderMenuActivity final : public Activity {
   OptionPopup optionPopup;
   std::string title = "Reader Menu";
   uint8_t pendingOrientation = 0;
+  uint8_t pendingSunlightMode = 0;
   uint8_t selectedPageTurnOption = 0;
   const std::vector<StrId> orientationLabels = {StrId::STR_PORTRAIT, StrId::STR_LANDSCAPE_CW, StrId::STR_INVERTED,
                                                 StrId::STR_LANDSCAPE_CCW};

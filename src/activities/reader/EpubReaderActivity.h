@@ -45,6 +45,7 @@ class EpubReaderActivity final : public Activity {
   // Set when the reader is left at end-of-book and SETTINGS.moveFinishedToReadFolder is on.
   // Consumed in onExit() to relocate the finished book into /Read/.
   bool pendingReadFolderMove = false;
+  bool returnToCallerAtEnd = false;
 
   // Footnote support
   std::vector<FootnoteEntry> currentPageFootnotes;
@@ -72,13 +73,6 @@ class EpubReaderActivity final : public Activity {
   // background build chunk never noticeably delays input or a pending render.
   static constexpr int BUILD_PAGES_PER_CHUNK = 8;
   static constexpr int BACKGROUND_BUILD_PAGES_PER_TICK = 2;
-  // How many pages to keep laid out ahead of the reader for a still-building section. A page turn
-  // is ~1s on e-ink and a page builds in ~30ms, so the reader can't out-click the builder -- a
-  // tiny buffer is enough. The background build stops once the watermark is this far ahead and
-  // resumes as the reader advances, so a giant single-spine book (a whole novel in one spine item)
-  // barely builds ahead at all and lets the device sleep. A chapter smaller than this still builds
-  // fully and caches.
-  static constexpr int BUILD_WINDOW_AHEAD = 5;
   // Show the indexing popup when an initial build must lay out more than this many pages up front
   // (a deep resume/jump into a not-yet-built section), so it isn't a silent wait. Kept independent
   // of the small look-ahead window so ordinary landings stay popup-free.
@@ -112,6 +106,7 @@ class EpubReaderActivity final : public Activity {
  public:
   explicit EpubReaderActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, std::unique_ptr<Epub> epub)
       : Activity("EpubReader", renderer, mappedInput), epub(std::move(epub)) {}
+  void setReturnToCallerAtEnd(bool v) { returnToCallerAtEnd = v; }
   void onEnter() override;
   void onExit() override;
   void loop() override;

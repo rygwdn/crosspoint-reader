@@ -35,6 +35,7 @@ void WifiSelectionActivity::onEnter() {
   savePromptSelection = 0;
   forgetPromptSelection = 0;
   autoConnecting = false;
+  autoConnectingBackup = false;
 
   // Cache MAC address for display
   uint8_t mac[6];
@@ -120,6 +121,8 @@ void WifiSelectionActivity::processWifiScanResults() {
   networks.clear();
   networks.reserve(scanResult);
 
+  const auto* backupCred = WIFI_STORE.getBackupCredential();
+
   for (int i = 0; i < scanResult; i++) {
     char ssid[33];
     strlcpy(ssid, WiFi.SSID(i).c_str(), sizeof(ssid));
@@ -138,6 +141,7 @@ void WifiSelectionActivity::processWifiScanResults() {
       network.rssi = rssi;
       network.isEncrypted = (WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
       network.hasSavedPassword = WIFI_STORE.hasSavedCredential(network.ssid);
+      network.isBackup = backupCred && (backupCred->ssid == network.ssid);
       networks.push_back(std::move(network));
     } else if (rssi > it->rssi) {
       it->rssi = rssi;
@@ -229,6 +233,21 @@ void WifiSelectionActivity::attemptConnection() {
   }
 }
 
+bool WifiSelectionActivity::tryFallbackToBackup() {
+  if (!autoConnecting || autoConnectingBackup) return false;
+  const auto* backupCred = WIFI_STORE.getBackupCredential();
+  if (!backupCred || backupCred->ssid == selectedSSID) return false;
+
+  autoConnectingBackup = true;
+  selectedSSID = backupCred->ssid;
+  enteredPassword = backupCred->password;
+  selectedRequiresPassword = !backupCred->password.empty();
+  usedSavedPassword = true;
+  LOG_DBG("WIFI", "Primary failed, trying mobile backup: %s", selectedSSID.c_str());
+  attemptConnection();
+  return true;
+}
+
 void WifiSelectionActivity::checkConnectionStatus() {
   if (state != WifiSelectionState::CONNECTING && state != WifiSelectionState::AUTO_CONNECTING) {
     return;
@@ -278,6 +297,7 @@ void WifiSelectionActivity::checkConnectionStatus() {
   }
 
   if (status == WL_CONNECT_FAILED || status == WL_NO_SSID_AVAIL) {
+    if (tryFallbackToBackup()) return;
     connectionError = tr(STR_ERROR_GENERAL_FAILURE);
     if (status == WL_NO_SSID_AVAIL) {
       connectionError = tr(STR_ERROR_NETWORK_NOT_FOUND);
@@ -290,6 +310,7 @@ void WifiSelectionActivity::checkConnectionStatus() {
   // Check for timeout
   if (millis() - connectionStartTime > CONNECTION_TIMEOUT_MS) {
     WiFi.disconnect();
+    if (tryFallbackToBackup()) return;
     connectionError = tr(STR_ERROR_CONNECTION_TIMEOUT);
     state = WifiSelectionState::CONNECTION_FAILED;
     requestUpdate();
@@ -392,6 +413,13 @@ void WifiSelectionActivity::loop() {
   if (state == WifiSelectionState::CONNECTION_FAILED) {
     if (mappedInput.wasPressed(MappedInputManager::Button::Back) ||
         mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
+      // If backup auto-connect failed, go straight to scan without forgetting
+      if (autoConnectingBackup) {
+        autoConnectingBackup = false;
+        autoConnecting = false;
+        startWifiScan();
+        return;
+      }
       // If we were auto-connecting or using a saved credential, offer to forget
       // the network
       if (autoConnecting || usedSavedPassword) {
@@ -537,9 +565,14 @@ void WifiSelectionActivity::renderNetworkList(const Rect* screen, const ThemeMet
         renderer, Rect{screen->x, contentTop, screen->width, contentHeight}, static_cast<int>(networks.size()),
         selectedNetworkIndex, [this](int index) { return networks[index].ssid; }, nullptr, nullptr,
         [this](int index) {
-          auto network = networks[index];
-          return std::string(network.hasSavedPassword ? "+ " : "") + (network.isEncrypted ? "* " : "") +
-                 getSignalStrengthIndicator(network.rssi);
+          const auto& network = networks[index];
+          std::string indicator;
+          if (network.hasSavedPassword) indicator += "+";
+          if (network.isBackup) indicator += "B";
+          if (!indicator.empty()) indicator += " ";
+          if (network.isEncrypted) indicator += "* ";
+          indicator += getSignalStrengthIndicator(network.rssi);
+          return indicator;
         });
   }
 
@@ -561,8 +594,8 @@ void WifiSelectionActivity::renderConnecting(const Rect* screen, const ThemeMetr
   if (state == WifiSelectionState::SCANNING) {
     UITheme::drawCenteredText(renderer, *screen, UI_10_FONT_ID, top, tr(STR_SCANNING));
   } else {
-    UITheme::drawCenteredText(renderer, *screen, UI_12_FONT_ID, top - 40, tr(STR_CONNECTING), true,
-                              EpdFontFamily::BOLD);
+    const char* headline = autoConnectingBackup ? tr(STR_TRYING_MOBILE_BACKUP) : tr(STR_CONNECTING);
+    UITheme::drawCenteredText(renderer, *screen, UI_12_FONT_ID, top - 40, headline, true, EpdFontFamily::BOLD);
 
     std::string ssidInfo = std::string(tr(STR_TO_PREFIX)) + selectedSSID;
     if (ssidInfo.length() > 25) {

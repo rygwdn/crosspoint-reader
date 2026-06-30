@@ -286,6 +286,7 @@
     <a href="/files">File Manager</a>
     <a href="/settings" class="active">Settings</a>
     <a href="/fonts">Fonts</a>
+    <a href="/logs">Logs</a>
   </div>
 
   <div id="message" class="message"></div>
@@ -610,11 +611,18 @@
     const lastConnected = net.isLastConnected
       ? '<div style="margin-top:8px;color:var(--label-color);font-size:0.9em;">Last connected network</div>'
       : '';
+    const backupBadge = net.isBackup
+      ? '<span style="margin-left:8px;color:var(--label-color);font-size:0.9em;">(mobile backup)</span>'
+      : '';
+    const backupBtn = isNew ? '' :
+      net.isBackup
+        ? '<button class="btn-small" onclick="setWifiBackup(-1)" style="opacity:0.6;">Clear backup</button>'
+        : '<button class="btn-small" onclick="setWifiBackup(' + idx + ')">Set as backup</button>';
 
     return '<div class="opds-server" id="wifi-' + id + '">' +
       '<div class="setting-row">' +
         '<span class="setting-name">SSID</span>' +
-        '<span class="setting-control"><input type="text" id="wifi-ssid-' + id + '" value="' + escapeHtml(net.ssid || '') + '"></span>' +
+        '<span class="setting-control"><input type="text" id="wifi-ssid-' + id + '" value="' + escapeHtml(net.ssid || '') + '">' + backupBadge + '</span>' +
       '</div>' +
       '<div class="setting-row">' +
         '<span class="setting-name">Password</span>' +
@@ -623,6 +631,7 @@
       lastConnected +
       '<div class="opds-actions">' +
         '<button class="btn-small btn-save-server" onclick="saveWifiNetwork(' + idx + ')">Save</button>' +
+        backupBtn +
         (isNew ? '' : '<button class="btn-small btn-delete" onclick="deleteWifiNetwork(' + idx + ')">Delete</button>') +
       '</div>' +
     '</div>';
@@ -711,15 +720,38 @@
     }
   }
 
+  // idx == -1 clears the backup designation; otherwise sets that network as backup.
+  async function setWifiBackup(idx) {
+    try {
+      const resp = await fetch('/api/wifi/backup', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({index: idx})
+      });
+      if (!resp.ok) throw new Error(await resp.text());
+      showMessage(idx === -1 ? 'Mobile backup cleared' : 'Mobile backup updated', false);
+      await loadWifiNetworks();
+    } catch (e) {
+      showMessage('Error: ' + e.message, true);
+    }
+  }
+
   // --- OPDS Server Management ---
   // Dynamically renders an editable list of OPDS servers, communicating with the
   // /api/opds REST endpoints. Password fields are never pre-filled for security;
   // the "(unchanged)" placeholder indicates an existing password is preserved on save.
   let opdsServers = [];
 
+  function toggleSyncLimit(id) {
+    const checked = document.getElementById('opds-sync-' + id).checked;
+    const row = document.getElementById('opds-synclimit-row-' + id);
+    if (row) row.style.display = checked ? '' : 'none';
+  }
+
   function renderOpdsServer(srv, idx) {
     const isNew = idx === -1;
     const id = isNew ? 'new' : idx;
+    const syncEnabled = srv.sync_enabled || false;
     return '<div class="opds-server" id="opds-' + id + '">' +
       '<div class="setting-row">' +
         '<span class="setting-name">Server Name</span>' +
@@ -736,6 +768,26 @@
       '<div class="setting-row">' +
         '<span class="setting-name">Password</span>' +
         '<span class="setting-control"><input type="password" id="opds-pass-' + id + '" placeholder="' + (srv.hasPassword ? '(unchanged)' : '') + '"></span>' +
+      '</div>' +
+      '<div class="setting-row">' +
+        '<span class="setting-name">Show on Home</span>' +
+        '<span class="setting-control"><input type="checkbox" id="opds-home-' + id + '"' + (srv.show_on_home ? ' checked' : '') + '></span>' +
+      '</div>' +
+      '<div class="setting-row">' +
+        '<span class="setting-name">Cache feed offline</span>' +
+        '<span class="setting-control"><input type="checkbox" id="opds-cache-' + id + '"' + (srv.cache_enabled ? ' checked' : '') + '></span>' +
+      '</div>' +
+      '<div class="setting-row">' +
+        '<span class="setting-name">Download folder</span>' +
+        '<span class="setting-control"><input type="text" id="opds-dlpath-' + id + '" value="' + escapeHtml(srv.download_path || '') + '" placeholder="/ (default)"></span>' +
+      '</div>' +
+      '<div class="setting-row">' +
+        '<span class="setting-name">Auto-sync</span>' +
+        '<span class="setting-control"><input type="checkbox" id="opds-sync-' + id + '"' + (syncEnabled ? ' checked' : '') + ' onchange="toggleSyncLimit(\'' + id + '\')"></span>' +
+      '</div>' +
+      '<div class="setting-row" id="opds-synclimit-row-' + id + '"' + (syncEnabled ? '' : ' style="display:none"') + '>' +
+        '<span class="setting-name">Sync limit</span>' +
+        '<span class="setting-control"><input type="number" id="opds-limit-' + id + '" value="' + (srv.sync_limit || 20) + '" min="1" max="100" style="width:80px"></span>' +
       '</div>' +
       '<div class="opds-actions">' +
         '<button class="btn-small btn-save-server" onclick="saveOpdsServer(' + idx + ')">Save</button>' +
@@ -779,7 +831,7 @@
     const addBtn = card.querySelector('.btn-add').parentElement;
     // Prevent multiple unsaved new-server forms at once (idx -1 → id "new")
     if (document.getElementById('opds-new')) return;
-    addBtn.insertAdjacentHTML('beforebegin', renderOpdsServer({name:'',url:'',username:'',hasPassword:false}, -1));
+    addBtn.insertAdjacentHTML('beforebegin', renderOpdsServer({name:'',url:'',username:'',hasPassword:false,show_on_home:false,cache_enabled:false,download_path:'',sync_enabled:false,sync_limit:20}, -1));
   }
 
   async function saveOpdsServer(idx) {
@@ -788,6 +840,11 @@
       name: document.getElementById('opds-name-' + id).value,
       url: document.getElementById('opds-url-' + id).value,
       username: document.getElementById('opds-user-' + id).value,
+      show_on_home: document.getElementById('opds-home-' + id).checked,
+      cache_enabled: document.getElementById('opds-cache-' + id).checked,
+      download_path: document.getElementById('opds-dlpath-' + id).value.trim(),
+      sync_enabled: document.getElementById('opds-sync-' + id).checked,
+      sync_limit: parseInt(document.getElementById('opds-limit-' + id).value) || 20,
     };
     // Only include password in payload when the user actually typed something;
     // omitting it tells the server to keep the existing password.
