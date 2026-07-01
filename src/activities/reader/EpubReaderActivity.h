@@ -66,6 +66,7 @@ class EpubReaderActivity final : public Activity {
   void renderContents(std::unique_ptr<Page> page, int orientedMarginTop, int orientedMarginRight,
                       int orientedMarginBottom, int orientedMarginLeft);
   void renderStatusBar() const;
+  void silentIndexNextChapterIfNeeded(uint16_t viewportWidth, uint16_t viewportHeight);
   // Keep a small window of upcoming sections built ahead of the reader (off the
   // page-turn critical path) so navigating forward never blocks on indexing.
   // Pages laid out per incremental-build pump: on the render path (catching up to the page

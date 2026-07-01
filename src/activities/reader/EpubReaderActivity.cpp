@@ -1154,6 +1154,38 @@ bool EpubReaderActivity::applyDeferredReposition() {
   return changed;
 }
 
+void EpubReaderActivity::silentIndexNextChapterIfNeeded(const uint16_t viewportWidth, const uint16_t viewportHeight) {
+  if (!epub || !section || section->pageCount < 2) {
+    return;
+  }
+
+  // Build the next chapter cache while the penultimate page is on screen.
+  if (section->currentPage != section->pageCount - 2) {
+    return;
+  }
+
+  const int nextSpineIndex = currentSpineIndex + 1;
+  if (nextSpineIndex < 0 || nextSpineIndex >= epub->getSpineItemsCount()) {
+    return;
+  }
+
+  Section nextSection(epub, nextSpineIndex, renderer);
+  if (nextSection.loadSectionFile(SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(),
+                                  SETTINGS.extraParagraphSpacing, SETTINGS.paragraphAlignment, viewportWidth,
+                                  viewportHeight, SETTINGS.hyphenationEnabled, SETTINGS.embeddedStyle,
+                                  SETTINGS.imageRendering, SETTINGS.focusReadingEnabled)) {
+    return;
+  }
+
+  LOG_DBG("ERS", "Silently indexing next chapter: %d", nextSpineIndex);
+  if (!nextSection.createSectionFile(SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(),
+                                     SETTINGS.extraParagraphSpacing, SETTINGS.paragraphAlignment, viewportWidth,
+                                     viewportHeight, SETTINGS.hyphenationEnabled, SETTINGS.embeddedStyle,
+                                     SETTINGS.imageRendering, SETTINGS.focusReadingEnabled)) {
+    LOG_ERR("ERS", "Failed silent indexing for chapter: %d", nextSpineIndex);
+  }
+}
+
 bool EpubReaderActivity::saveProgress(int spineIndex, int currentPage, int pageCount) {
   return EpubReaderUtils::saveProgress(*epub, spineIndex, currentPage, pageCount);
 }
