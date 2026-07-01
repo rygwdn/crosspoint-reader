@@ -22,8 +22,15 @@ CLAUDE.md does not carry.
 | `scope-discipline` | adding a feature, activity, lib, setting, or dependency |
 | `refactor-for-review` | refactoring, cleaning up, or preparing a change for PR |
 
-Each skill ends with a self-review checklist Claude runs against its own diff
-before handing it back. Reviewing a PR? Those checklists double as a fast rubric.
+Each of the above ends with a self-review checklist Claude runs against its own
+diff before handing it back. Reviewing a PR? Those checklists double as a fast
+rubric.
+
+One skill here isn't a C++ writing skill: `device-network` covers talking to a
+physical device over the LAN (file browsing, log pulling, firmware upload) --
+operational knowledge, not code judgment, but worth keeping alongside these
+since it was hard-won in a real debugging session and future sessions
+shouldn't have to rediscover it.
 
 ## Maintaining these
 
