@@ -23,15 +23,16 @@ struct WifiNetworkInfo {
 
 // WiFi selection states
 enum class WifiSelectionState {
-  AUTO_CONNECTING,    // Trying to connect to the last known network
-  SCANNING,           // Scanning for networks
-  NETWORK_LIST,       // Displaying available networks
-  PASSWORD_ENTRY,     // Entering password for selected network
-  CONNECTING,         // Attempting to connect
-  CONNECTED,          // Successfully connected
-  SAVE_PROMPT,        // Asking user if they want to save the password
-  CONNECTION_FAILED,  // Connection failed
-  FORGET_PROMPT       // Asking user if they want to forget the network
+  AUTO_CONNECTING,        // Trying to connect to the last known network
+  SCANNING,               // Scanning for networks
+  NETWORK_LIST,           // Displaying available networks
+  PASSWORD_ENTRY,         // Entering password for selected network
+  CONNECTING,             // Attempting to connect
+  CHECKING_ALTERNATE_AP,  // Connected but signal is weak; scanning for a stronger AP with the same SSID
+  CONNECTED,              // Successfully connected
+  SAVE_PROMPT,            // Asking user if they want to save the password
+  CONNECTION_FAILED,      // Connection failed
+  FORGET_PROMPT           // Asking user if they want to forget the network
 };
 
 /**
@@ -86,6 +87,17 @@ class WifiSelectionActivity final : public Activity {
   static constexpr unsigned long CONNECTION_TIMEOUT_MS = 15000;
   unsigned long connectionStartTime = 0;
 
+  // A fast (first-match) connect landed on an AP weaker than this is treated as
+  // "weak" and triggers a one-time scan for a stronger AP with the same SSID.
+  static constexpr int32_t WEAK_SIGNAL_RSSI_THRESHOLD = -75;
+  // Minimum RSSI improvement required before switching to a different BSSID,
+  // to avoid ping-ponging between two APs of similar strength.
+  static constexpr int32_t ROAM_IMPROVEMENT_THRESHOLD_DB = 10;
+  // Whether we've already done the one-time weak-signal rescan for this connection attempt
+  bool weakSignalRetryDone = false;
+  // RSSI observed on the initial fast connect, used as the baseline a candidate AP must beat
+  int32_t weakSignalRssi = 0;
+
   void renderNetworkList(const Rect* screen, const ThemeMetrics* metrics) const;
   void renderPasswordEntry(const Rect* screen, const ThemeMetrics* metrics) const;
   void renderConnecting(const Rect* screen, const ThemeMetrics* metrics) const;
@@ -100,6 +112,8 @@ class WifiSelectionActivity final : public Activity {
   void attemptConnection();
   void checkConnectionStatus();
   bool tryFallbackToBackup();  // Initiates backup auto-connect; returns true if attempted
+  void checkAlternateApScanResults();
+  void onConnectionSucceeded();
   std::string getSignalStrengthIndicator(int32_t rssi) const;
 
   void onComplete(bool connected);
