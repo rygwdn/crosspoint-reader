@@ -184,6 +184,40 @@ TEST(FlatMap, OperatorBracket) {
   EXPECT_EQ(m["x"], 99);
 }
 
+// Regression test for a bug where operator[] handed back a reference to the WRONG slot
+// under Robin Hood displacement. insertHelper() carries a displaced occupant forward
+// after a swap; its final `return idx` described where that occupant landed, not where
+// the caller's own key ended up. operator[] used that index to return a value reference,
+// so `map[key] = value` could silently overwrite a *different* key's value while the
+// caller's own key was left holding a default-constructed Value{}.
+//
+// This mirrors CssParser::loadFromCache(), which reserve()s the map to exactly the cached
+// rule count (100% load factor -- no empty slots) and assigns each entry via
+// `rulesBySelector_[selector] = style;`. A 100%-full table maximizes displacement chains,
+// which is what originally surfaced the bug in production.
+TEST(FlatMap, OperatorBracketUnderDisplacementIsCorrect) {
+  FlatMap<std::string, int> m;
+  const int N = 60;
+  m.reserve(N);  // exact capacity, like loadFromCache's reserve(ruleCount)
+
+  std::vector<std::string> keys;
+  for (int i = 0; i < N; i++) keys.push_back("selector-" + std::to_string(i));
+
+  // Assign via operator[], exactly like `rulesBySelector_[selector] = style;`
+  for (int i = 0; i < N; i++) {
+    m[keys[i]] = i;
+  }
+
+  EXPECT_EQ(m.size(), (size_t)N);
+
+  // Every key must map back to its OWN value, not some other key's.
+  for (int i = 0; i < N; i++) {
+    auto it = m.find(keys[i]);
+    ASSERT_NE(it, m.end()) << "missing key: " << keys[i];
+    EXPECT_EQ(it->second, i) << "wrong value for key: " << keys[i];
+  }
+}
+
 // Stress: insert the same key repeatedly, size stays 1
 TEST(FlatMap, StressDuplicateKey) {
   CssMap m;

@@ -179,31 +179,42 @@ class FlatMap {
     return cap;
   }
 
+  // Returns the index where the caller's (key, value) pair ends up. Robin Hood insertion
+  // can displace an existing occupant partway through the probe sequence: once that
+  // happens, the local `key`/`value` stop referring to the caller's pair and instead
+  // carry the displaced occupant forward to its new home, so the loop's *last* `return idx`
+  // would describe where that cascaded occupant lands, not the caller's original pair.
+  // `resultIdx` is latched the first time the caller's pair is actually written into the
+  // table -- at an empty slot, an equal-key update, or the first swap -- so the return
+  // value always reflects the caller's own key, which operator[] depends on to hand back
+  // a reference to the right slot.
   size_t insertHelper(Key key, Value value) {
     size_t cap = keys_.size();
     size_t idx = idealIndex(key, cap);
     size_t dist = 0;
+    size_t resultIdx = cap;
     for (size_t probe = 0; probe < cap; ++probe) {
       if (!occupied_[idx]) {
         keys_[idx] = std::move(key);
         values_[idx] = std::move(value);
         occupied_[idx] = true;
         ++size_;
-        return idx;
+        return resultIdx == cap ? idx : resultIdx;
       }
       if (Equal{}(keys_[idx], key)) {
         values_[idx] = std::move(value);
-        return idx;
+        return resultIdx == cap ? idx : resultIdx;
       }
       size_t occupantDist = probeDistance(idealIndex(keys_[idx], cap), idx, cap);
       if (occupantDist < dist) {
         std::swap(key, keys_[idx]);
         std::swap(value, values_[idx]);
+        if (resultIdx == cap) resultIdx = idx;
         dist = occupantDist;
       }
       if (++idx >= cap) idx = 0;
       ++dist;
     }
-    return cap;  // unreachable if size_ < cap
+    return resultIdx;  // unreachable if size_ < cap
   }
 };
