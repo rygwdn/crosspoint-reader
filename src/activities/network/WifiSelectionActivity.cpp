@@ -6,6 +6,8 @@
 #include <Logging.h>
 #include <WiFi.h>
 
+#include <cstring>
+
 #include "CrossPointSettings.h"
 #include "MappedInputManager.h"
 #include "WifiCredentialStore.h"
@@ -35,6 +37,7 @@ void WifiSelectionActivity::onEnter() {
   savePromptSelection = 0;
   forgetPromptSelection = 0;
   autoConnecting = false;
+  weakSignalRetryDone = false;
 
   // Cache MAC address for display
   uint8_t mac[6];
@@ -209,6 +212,7 @@ void WifiSelectionActivity::attemptConnection() {
   connectionStartTime = millis();
   connectedIP.clear();
   connectionError.clear();
+  weakSignalRetryDone = false;
   requestUpdate();
 
   WiFi.persistent(false);  // Credentials are managed by WifiCredentialStore; suppress SDK NVS auto-connect
@@ -237,43 +241,25 @@ void WifiSelectionActivity::checkConnectionStatus() {
   const wl_status_t status = WiFi.status();
 
   if (status == WL_CONNECTED) {
-    // Successfully connected
-    IPAddress ip = WiFi.localIP();
-    char ipStr[16];
-    snprintf(ipStr, sizeof(ipStr), "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
-    connectedIP = ipStr;
-    autoConnecting = false;
-
-    // Sync RTC from NTP on the first successful WiFi connection only. The DS3231
-    // drifts ~2 ppm so one sync is enough; users can force a re-sync from
-    // Settings > Customise Status Bar > Sync clock now.
-    if (halClock.isAvailable() && !SETTINGS.clockHasBeenSynced) {
-      if (halClock.syncFromNTP()) {
-        SETTINGS.clockHasBeenSynced = 1;
-        SETTINGS.saveToFile();
+    // The initial connect uses the SDK's fast scan, which stops at the first AP
+    // matching the SSID rather than the strongest one. If that landed us on a
+    // weak signal, do a one-time scan (while still connected) to see whether a
+    // stronger AP with the same SSID exists before accepting this connection.
+    if (!weakSignalRetryDone) {
+      weakSignalRetryDone = true;
+      const int32_t rssi = WiFi.RSSI();
+      if (rssi < WEAK_SIGNAL_RSSI_THRESHOLD) {
+        LOG_DBG("WIFI", "Fast-connected to %s at %d dBm (weak); scanning for a stronger AP", selectedSSID.c_str(),
+                rssi);
+        weakSignalRssi = rssi;
+        state = WifiSelectionState::CHECKING_ALTERNATE_AP;
+        WiFi.scanNetworks(true);  // async; connection stays up, brief channel-hop gaps only
+        requestUpdate();
+        return;
       }
     }
 
-    // Save this as the last connected network - SD card operations need lock as
-    // we use SPI for both
-    {
-      RenderLock lock(*this);
-      WIFI_STORE.setLastConnectedSsid(selectedSSID);
-    }
-
-    // If we entered a new password, ask if user wants to save it
-    // Otherwise, immediately complete so parent can start web server
-    if (!usedSavedPassword && !enteredPassword.empty()) {
-      state = WifiSelectionState::SAVE_PROMPT;
-      savePromptSelection = 0;  // Default to "Yes"
-      requestUpdate();
-    } else {
-      // Using saved password or open network - complete immediately
-      LOG_DBG("WIFI",
-              "Connected with saved/open credentials, "
-              "completing immediately");
-      onComplete(true);
-    }
+    onConnectionSucceeded();
     return;
   }
 
@@ -297,6 +283,105 @@ void WifiSelectionActivity::checkConnectionStatus() {
   }
 }
 
+void WifiSelectionActivity::checkAlternateApScanResults() {
+  const int16_t scanResult = WiFi.scanComplete();
+  if (scanResult == WIFI_SCAN_RUNNING) {
+    return;
+  }
+
+  // If the scan knocked us off the AP, fall back to a normal fresh connect attempt.
+  if (WiFi.status() != WL_CONNECTED) {
+    WiFi.scanDelete();
+    attemptConnection();
+    return;
+  }
+
+  int32_t bestRssi = weakSignalRssi;
+  int bestIndex = -1;
+  if (scanResult > 0) {
+    for (int i = 0; i < scanResult; i++) {
+      char ssid[33];
+      strlcpy(ssid, WiFi.SSID(i).c_str(), sizeof(ssid));
+      if (selectedSSID != ssid) {
+        continue;
+      }
+      const int32_t rssi = WiFi.RSSI(i);
+      if (rssi > bestRssi) {
+        bestRssi = rssi;
+        bestIndex = i;
+      }
+    }
+  }
+
+  // No candidate found, or none clearly better than what we already have - keep
+  // the current connection rather than risk losing it over a marginal gain.
+  if (bestIndex < 0 || bestRssi < weakSignalRssi + ROAM_IMPROVEMENT_THRESHOLD_DB) {
+    WiFi.scanDelete();
+    onConnectionSucceeded();
+    return;
+  }
+
+  // Copy out of the scan record before scanDelete() frees it.
+  const auto scanIndex = static_cast<uint8_t>(bestIndex);
+  uint8_t bssid[6];
+  memcpy(bssid, WiFi.BSSID(scanIndex), sizeof(bssid));
+  const int32_t channel = WiFi.channel(scanIndex);
+  WiFi.scanDelete();
+
+  LOG_DBG("WIFI", "Found stronger AP for %s at %d dBm (was %d dBm); reconnecting", selectedSSID.c_str(), bestRssi,
+          weakSignalRssi);
+
+  state = autoConnecting ? WifiSelectionState::AUTO_CONNECTING : WifiSelectionState::CONNECTING;
+  connectionStartTime = millis();
+  WiFi.disconnect(true, true);
+  delay(100);
+  if (selectedRequiresPassword && !enteredPassword.empty()) {
+    WiFi.begin(selectedSSID.c_str(), enteredPassword.c_str(), channel, bssid);
+  } else {
+    WiFi.begin(selectedSSID.c_str(), nullptr, channel, bssid);
+  }
+  requestUpdate();
+}
+
+void WifiSelectionActivity::onConnectionSucceeded() {
+  IPAddress ip = WiFi.localIP();
+  char ipStr[16];
+  snprintf(ipStr, sizeof(ipStr), "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
+  connectedIP = ipStr;
+  autoConnecting = false;
+
+  // Sync RTC from NTP on the first successful WiFi connection only. The DS3231
+  // drifts ~2 ppm so one sync is enough; users can force a re-sync from
+  // Settings > Customise Status Bar > Sync clock now.
+  if (halClock.isAvailable() && !SETTINGS.clockHasBeenSynced) {
+    if (halClock.syncFromNTP()) {
+      SETTINGS.clockHasBeenSynced = 1;
+      SETTINGS.saveToFile();
+    }
+  }
+
+  // Save this as the last connected network - SD card operations need lock as
+  // we use SPI for both
+  {
+    RenderLock lock(*this);
+    WIFI_STORE.setLastConnectedSsid(selectedSSID);
+  }
+
+  // If we entered a new password, ask if user wants to save it
+  // Otherwise, immediately complete so parent can start web server
+  if (!usedSavedPassword && !enteredPassword.empty()) {
+    state = WifiSelectionState::SAVE_PROMPT;
+    savePromptSelection = 0;  // Default to "Yes"
+    requestUpdate();
+  } else {
+    // Using saved password or open network - complete immediately
+    LOG_DBG("WIFI",
+            "Connected with saved/open credentials, "
+            "completing immediately");
+    onComplete(true);
+  }
+}
+
 void WifiSelectionActivity::loop() {
   // Check scan progress
   if (state == WifiSelectionState::SCANNING) {
@@ -307,6 +392,12 @@ void WifiSelectionActivity::loop() {
   // Check connection progress
   if (state == WifiSelectionState::CONNECTING || state == WifiSelectionState::AUTO_CONNECTING) {
     checkConnectionStatus();
+    return;
+  }
+
+  // Check progress of the one-time "is there a stronger AP" scan
+  if (state == WifiSelectionState::CHECKING_ALTERNATE_AP) {
+    checkAlternateApScanResults();
     return;
   }
 
@@ -505,6 +596,9 @@ void WifiSelectionActivity::render(RenderLock&&) {
     case WifiSelectionState::CONNECTING:
       renderConnecting(&screen, &metrics);
       break;
+    case WifiSelectionState::CHECKING_ALTERNATE_AP:
+      renderConnecting(&screen, &metrics);
+      break;
     case WifiSelectionState::CONNECTED:
       renderConnected(&screen, &metrics);
       break;
@@ -558,7 +652,7 @@ void WifiSelectionActivity::renderConnecting(const Rect* screen, const ThemeMetr
   const auto height = renderer.getLineHeight(UI_10_FONT_ID);
   const auto top = screen->y + (screen->height - height) / 2;
 
-  if (state == WifiSelectionState::SCANNING) {
+  if (state == WifiSelectionState::SCANNING || state == WifiSelectionState::CHECKING_ALTERNATE_AP) {
     UITheme::drawCenteredText(renderer, *screen, UI_10_FONT_ID, top, tr(STR_SCANNING));
   } else {
     UITheme::drawCenteredText(renderer, *screen, UI_12_FONT_ID, top - 40, tr(STR_CONNECTING), true,
