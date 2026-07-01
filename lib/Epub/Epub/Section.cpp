@@ -387,8 +387,9 @@ bool Section::hasHtmlCache() const {
 
 std::optional<uint16_t> Section::findAnchorDuringBuild(const std::string& anchor) const {
   if (!build_ || !build_->parser) return std::nullopt;
+  const uint64_t targetHash = arxHash64(anchor);
   for (const auto& [key, page] : build_->parser->getAnchors()) {
-    if (key == anchor) return page;
+    if (key == targetHash) return page;
   }
   return std::nullopt;
 }
