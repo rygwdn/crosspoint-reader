@@ -253,7 +253,16 @@ void EpubReaderActivity::loop() {
     // mutation, so it flags this as always true.
     // cppcheck-suppress knownConditionTrueFalse
     if (section->isBuilding()) {
-      if (!section->buildSomeMore(BACKGROUND_BUILD_PAGES_PER_TICK)) {
+      const unsigned long tickStart = millis();
+      const bool tickOk = section->buildSomeMore(BACKGROUND_BUILD_PAGES_PER_TICK, BACKGROUND_BUILD_MAX_MS);
+      const unsigned long tickDuration = millis() - tickStart;
+      // Time-budget overrun (a single parseStep() call ran long, e.g. an image-heavy
+      // chunk) means this tick still blocked GPIO polling past BACKGROUND_BUILD_MAX_MS --
+      // logged so a slow reopen/page-turn can be correlated with a dropped button press.
+      if (tickDuration > BACKGROUND_BUILD_MAX_MS) {
+        LOG_DBG("ERS", "Background build tick ran %lums (budget %lums)", tickDuration, BACKGROUND_BUILD_MAX_MS);
+      }
+      if (!tickOk) {
         LOG_ERR("ERS", "Background section build failed");
         section.reset();
         requestUpdate();

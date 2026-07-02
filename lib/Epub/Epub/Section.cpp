@@ -356,14 +356,19 @@ bool Section::startBuild(const int fontId, const float lineCompression, const bo
   return true;
 }
 
-bool Section::buildSomeMore(const int maxPages) {
+bool Section::buildSomeMore(const int maxPages, const unsigned long maxDurationMs) {
   if (!build_ || !build_->parser) {
     LOG_ERR("SCT", "buildSomeMore with no active build");
     return false;
   }
   const int startCount = pageCount;
+  const unsigned long startTime = millis();
+  // A time-budgeted call also asks the parser to feed itself smaller chunks (see
+  // SMALL_PARSE_BUFFER_SIZE), so an image-dense run of markup can't advance past several
+  // <img> tags -- each a synchronous SD extract -- before the check below gets to run.
+  const bool useSmallChunks = maxDurationMs > 0;
   for (;;) {
-    const auto status = build_->parser->parseStep();
+    const auto status = build_->parser->parseStep(useSmallChunks);
     if (status == ChapterHtmlSlimParser::ParseStatus::Error) {
       LOG_ERR("SCT", "Parse error during incremental build");
       abandonBuild();
@@ -372,8 +377,11 @@ bool Section::buildSomeMore(const int maxPages) {
     if (status == ChapterHtmlSlimParser::ParseStatus::Done) {
       return finalizeBuild();
     }
-    // ParseStatus::More: yield once we've laid out the requested number of pages.
-    if (maxPages > 0 && (pageCount - startCount) >= maxPages) {
+    // ParseStatus::More: yield once we've laid out the requested number of pages, or
+    // (for the background tick only -- maxDurationMs == 0 for render-path callers that
+    // need a specific page now) once the time budget for this call is spent.
+    if ((maxPages > 0 && (pageCount - startCount) >= maxPages) ||
+        (maxDurationMs > 0 && millis() - startTime >= maxDurationMs)) {
       build_->bytesConsumed = build_->parser->parseBytesConsumed();
       return true;
     }

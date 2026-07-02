@@ -87,7 +87,11 @@ class Section {
                   uint8_t imageRendering, bool focusReadingEnabled, const std::function<void()>& popupFn = nullptr);
   // Lay out up to maxPages more pages (maxPages <= 0 = build to completion). Returns
   // false on error (the build is abandoned). Sets isBuildComplete() when finished.
-  bool buildSomeMore(int maxPages);
+  // maxDurationMs, if nonzero, also yields once that much time has elapsed since the call
+  // started -- for the background tick in EpubReaderActivity::loop(), which must return
+  // promptly so GPIO keeps getting polled; render-path callers that need a specific page
+  // now leave it at the default (0 = no time limit) and stay hot until that page exists.
+  bool buildSomeMore(int maxPages, unsigned long maxDurationMs = 0);
   bool isBuilding() const { return static_cast<bool>(build_); }
   bool isBuildComplete() const { return buildComplete_; }
   // Best-known total page count: the exact pageCount once finalized, or a smoothed byte-based

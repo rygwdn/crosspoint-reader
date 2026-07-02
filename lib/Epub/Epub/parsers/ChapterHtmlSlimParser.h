@@ -185,12 +185,21 @@ class ChapterHtmlSlimParser {
 
   // Resumable parse, for the incremental section builder. Drive as:
   //   if (!beginParse()) fail;
-  //   loop: switch (parseStep()) { More: keep going / yield; Done: finishParse(); Error: abortParse(); }
+  //   loop: switch (parseStep(useSmallChunks)) { More: keep going / yield; Done: finishParse(); Error: abortParse(); }
   // Pages are emitted via completePageFn as they complete during parseStep(), so
   // the caller can stop once enough pages are built and resume on a later tick.
+  // useSmallChunks: feed Expat a much smaller read chunk (see SMALL_PARSE_BUFFER_SIZE in the
+  // .cpp) so a single call can't advance past more than roughly one <img> tag. The normal
+  // PARSE_BUFFER_SIZE chunk is prose-sized and can contain a run of several image tags back to
+  // back; each one does a synchronous SD extract + dimension read that a page-count/time budget
+  // checked only *between* parseStep() calls can't see until the whole chunk is done. Pass true
+  // from a time-budgeted caller (the background build tick) so the caller's own budget check
+  // -- run after every parseStep() return -- gets a chance to yield roughly every image instead
+  // of every ~1KB of markup. The render-critical path (building the page about to be shown) has
+  // no time budget and passes false to parse at full chunk size as before.
   enum class ParseStatus { More, Done, Error };
   bool beginParse();
-  ParseStatus parseStep();
+  ParseStatus parseStep(bool useSmallChunks);
   bool finishParse();  // flush the trailing page and tear down; returns true
   void abortParse();   // tear down without flushing (error / abandon)
 

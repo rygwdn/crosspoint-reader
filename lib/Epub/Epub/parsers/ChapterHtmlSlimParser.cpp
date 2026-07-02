@@ -21,6 +21,14 @@
 // Minimum file size (in bytes) to show indexing popup - smaller chapters don't benefit from it
 constexpr size_t MIN_SIZE_FOR_POPUP = 10 * 1024;  // 10KB
 constexpr size_t PARSE_BUFFER_SIZE = 1024;
+// Used instead of PARSE_BUFFER_SIZE when the caller has a time budget to protect (the background
+// build tick). A normal <img> tag is well under this many bytes, so a chunk this size essentially
+// never spans two of them -- unlike a 1KB chunk, which can pack in a whole run of image tags from
+// a gallery-style chapter. Each image tag does a synchronous SD extract + dimension read, so this
+// keeps that cost to roughly one image per parseStep() call instead of however many land in 1KB,
+// giving the caller's own per-call time check (see EpubReaderActivity::BACKGROUND_BUILD_MAX_MS) a
+// chance to yield between images rather than only between whole buffers.
+constexpr size_t SMALL_PARSE_BUFFER_SIZE = 128;
 
 // Hard cap on the number of anchor IDs recorded per chapter. Legitimate navigation
 // anchors (TOC entries, footnotes, cross-references) rarely exceed a few hundred per
@@ -1403,14 +1411,15 @@ bool ChapterHtmlSlimParser::beginParse() {
   return true;
 }
 
-ChapterHtmlSlimParser::ParseStatus ChapterHtmlSlimParser::parseStep() {
-  void* const buf = XML_GetBuffer(xmlParser_, PARSE_BUFFER_SIZE);
+ChapterHtmlSlimParser::ParseStatus ChapterHtmlSlimParser::parseStep(const bool useSmallChunks) {
+  const size_t bufferSize = useSmallChunks ? SMALL_PARSE_BUFFER_SIZE : PARSE_BUFFER_SIZE;
+  void* const buf = XML_GetBuffer(xmlParser_, bufferSize);
   if (!buf) {
     LOG_ERR("EHP", "Couldn't allocate memory for buffer");
     return ParseStatus::Error;
   }
 
-  const size_t len = parseFile_.read(buf, PARSE_BUFFER_SIZE);
+  const size_t len = parseFile_.read(buf, bufferSize);
 
   if (len == 0 && parseFile_.available() > 0) {
     LOG_ERR("EHP", "File read error");
@@ -1466,7 +1475,7 @@ bool ChapterHtmlSlimParser::parseAndBuildPages() {
     return false;
   }
   for (;;) {
-    const ParseStatus status = parseStep();
+    const ParseStatus status = parseStep(false);  // one-shot: no caller budget to protect, use full chunks
     if (status == ParseStatus::Error) {
       abortParse();
       return false;

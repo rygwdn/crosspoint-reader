@@ -70,10 +70,17 @@ class EpubReaderActivity final : public Activity {
   // Keep a small window of upcoming sections built ahead of the reader (off the
   // page-turn critical path) so navigating forward never blocks on indexing.
   // Pages laid out per incremental-build pump: on the render path (catching up to the page
-  // being shown) and per loop() tick (background build of a large chapter). Kept small so a
-  // background build chunk never noticeably delays input or a pending render.
+  // being shown) and per loop() tick (background build of a large chapter).
   static constexpr int BUILD_PAGES_PER_CHUNK = 8;
   static constexpr int BACKGROUND_BUILD_PAGES_PER_TICK = 2;
+  // Time budget for a single background-tick call into buildSomeMore(). A page can take
+  // longer to lay out than BACKGROUND_BUILD_PAGES_PER_TICK alone bounds (e.g. image-heavy
+  // content), and that call runs under the RenderLock in loop() *before* the next
+  // gpio.update() -- so it was blocking button polling for however long those pages took.
+  // The render path (catching up to the page about to be shown) has no such budget and
+  // stays hot until that page exists; only the opportunistic background build needs to
+  // give GPIO polling a chance to run.
+  static constexpr unsigned long BACKGROUND_BUILD_MAX_MS = 15;
   // Show the indexing popup when an initial build must lay out more than this many pages up front
   // (a deep resume/jump into a not-yet-built section), so it isn't a silent wait. Kept independent
   // of the small look-ahead window so ordinary landings stay popup-free.
