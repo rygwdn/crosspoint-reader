@@ -25,6 +25,8 @@ constexpr int bookmarkStatusIconWidth = 16;
 constexpr int bookmarkStatusIconHeight = 14;
 constexpr int bookmarkStatusIconGap = 4;
 constexpr int bookmarkStatusIconTopCrop = 2;
+constexpr int footnoteStatusIconWidth = 16;
+constexpr int footnoteStatusIconGap = 4;
 
 bool statusBarTextLaneVisible() {
   return SETTINGS.statusBarChapterPageCount || SETTINGS.statusBarBookProgressPercentage ||
@@ -41,6 +43,13 @@ void drawBookmarkStatusIcon(const GfxRenderer& renderer, const int x, const int 
       renderer.drawPixel(x + col, y + row, (byte & mask) != 0);
     }
   }
+}
+
+// Asterisk marker matching the "*" footnote reference glyph used in the reader body text
+void drawFootnoteStatusIcon(const GfxRenderer& renderer, const int x, const int y) {
+  renderer.drawLine(x + 8, y + 1, x + 8, y + 12);
+  renderer.drawLine(x + 3, y + 3, x + 13, y + 10);
+  renderer.drawLine(x + 13, y + 3, x + 3, y + 10);
 }
 
 }  // namespace
@@ -749,7 +758,7 @@ void BaseTheme::fillPopupProgress(const GfxRenderer& renderer, const Rect& layou
 
 void BaseTheme::drawStatusBar(GfxRenderer& renderer, const float bookProgress, const int currentPage,
                               const int pageCount, std::string title, const int paddingBottom, const int textYOffset,
-                              const bool fillMargin, const bool isPageBookmarked) const {
+                              const bool fillMargin, const bool isPageBookmarked, const bool hasFootnotes) const {
   auto metrics = UITheme::getInstance().getMetrics();
   int orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft;
   renderer.getOrientedViewableTRBL(&orientedMarginTop, &orientedMarginRight, &orientedMarginBottom,
@@ -848,6 +857,15 @@ void BaseTheme::drawStatusBar(GfxRenderer& renderer, const float bookProgress, c
     const int bookmarkY = textY + 5;
     drawBookmarkStatusIcon(renderer, bookmarkX, bookmarkY);
     leftClusterWidth += bookmarkStatusIconWidth + bookmarkGap;
+  }
+
+  // Draw Footnote indicator
+  if (showStatusBarTextLane && hasFootnotes) {
+    const int footnoteGap = leftClusterWidth > 0 ? footnoteStatusIconGap : 0;
+    const int footnoteX = leftClusterX + leftClusterWidth + footnoteGap;
+    const int footnoteY = textY + 5;
+    drawFootnoteStatusIcon(renderer, footnoteX, footnoteY);
+    leftClusterWidth += footnoteStatusIconWidth + footnoteGap;
   }
 
   // Draw Title
