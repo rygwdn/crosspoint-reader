@@ -2164,6 +2164,24 @@ void ChapterHtmlSlimParser::makePages() {
 
   // Apply top spacing before the paragraph (stored in pixels)
   const BlockStyle& blockStyle = currentTextBlock->getBlockStyle();
+
+  // ORPHAN PREVENTION: if fewer than 2 lines would fit on the current page after
+  // the paragraph's top inset, push the whole paragraph to a new page.
+  if (currentPage && !currentPage->elements.empty()) {
+    const int remaining = viewportHeight - currentPageNextY - blockStyle.topInset();
+    if (remaining < lineHeight * 2) {
+      commitPendingPage();
+      completePageFn(std::move(currentPage), xpathParagraphIndex, xpathListItemIndex);
+      completedPageCount++;
+      currentPage.reset(new (std::nothrow) Page());
+      if (!currentPage) {
+        LOG_ERR("EHP", "OOM: orphan prevention page");
+        return;
+      }
+      currentPageNextY = 0;
+    }
+  }
+
   if (blockStyle.marginTop > 0) {
     currentPageNextY += blockStyle.marginTop;
   }
