@@ -260,6 +260,16 @@ void XtcReaderActivity::renderPage() {
 
     free(pageBuffer);
 
+    // The grayscale pass above leaves gray charge in the page region that a
+    // plain fast diff on the *next* page turn can't clear, so content there
+    // ghosts (same root cause EpubReaderActivity hit and fixed for its own
+    // grayscale AA pass, see its renderPage()'s pagesUntilFullRefresh=1,
+    // issue #2190). This branch never set that, so every XTH page ghosted
+    // into the next fast page-turn. Force the next page onto the HALF
+    // ghost-cleanup path, which drives every pixel to its target regardless
+    // of residue.
+    pagesUntilFullRefresh = 1;
+
     LOG_DBG("XTR", "Rendered page %lu/%lu (2-bit grayscale)", currentPage + 1, xtc->getPageCount());
     return;
   } else {
