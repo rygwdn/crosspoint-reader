@@ -151,6 +151,14 @@ void ReaderActivity::loop() {
   if (handleEndOfBookPageTurn(prevTriggered, nextTriggered)) return;
 
   const unsigned long heldMs = (touch.prev || touch.next) ? touch.heldMs : mappedInput.getHeldTime();
+
+  if (!fromTilt && SETTINGS.longPressButtonBehavior == CrossPointSettings::LP_BTN_FORCE_REFRESH &&
+      heldMs > ReaderUtils::SKIP_HOLD_MS) {
+    pagesUntilFullRefresh = 0;
+    requestUpdate();
+    return;
+  }
+
   const bool skip =
       !fromTilt && SETTINGS.longPressButtonBehavior == SETTINGS.CHAPTER_SKIP && heldMs > ReaderUtils::SKIP_HOLD_MS;
 

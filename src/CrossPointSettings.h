@@ -150,7 +150,8 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
     LP_MENU_DISABLED = 1,
     LP_MENU_BOOKMARK = 2,
     LP_MENU_DICTIONARY = 3,
-    LP_MENU_READER_MENU = 4,
+    LP_MENU_FORCE_REFRESH = 4,
+    LP_MENU_READER_MENU = 5,
     LONG_PRESS_MENU_FUNCTION_COUNT
   };
 
@@ -162,6 +163,7 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
     OFF = 0,
     CHAPTER_SKIP = 1,
     ORIENTATION_CHANGE = 2,
+    LP_BTN_FORCE_REFRESH = 3,
     LONG_PRESS_BUTTON_BEHAVIOR_COUNT
   };
 

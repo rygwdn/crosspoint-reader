@@ -237,19 +237,23 @@ void EpubReaderActivity::openReaderMenu() {
     bookProgress = epub->calculateProgress(currentSpineIndex, chapterProgress) * 100.0f;
   }
   const int bookProgressPercent = clampPercent(static_cast<int>(bookProgress + 0.5f));
-  startActivityForResult(std::make_unique<EpubReaderMenuActivity>(
-                             renderer, mappedInput, epub->getTitle(), currentPage, totalPages, bookProgressPercent,
-                             SETTINGS.orientation, !currentPageFootnotes.empty(), !cachedBookmarks.empty()),
-                         [this](const ActivityResult& result) {
-                           const auto& menu = std::get<MenuResult>(result.data);
-                           if (SETTINGS.orientation != menu.orientation) {
-                             applyOrientation(menu.orientation);
-                           }
-                           toggleAutoPageTurn(menu.pageTurnOption);
-                           if (!result.isCancelled) {
-                             onReaderMenuConfirm(static_cast<EpubReaderMenuActivity::MenuAction>(menu.action));
-                           }
-                         });
+  startActivityForResult(
+      std::make_unique<EpubReaderMenuActivity>(renderer, mappedInput, epub->getTitle(), currentPage, totalPages,
+                                               bookProgressPercent, SETTINGS.orientation, SETTINGS.fadingFix,
+                                               !currentPageFootnotes.empty(), !cachedBookmarks.empty()),
+      [this](const ActivityResult& result) {
+        // Always apply orientation and sunlight changes even if the menu was cancelled
+        const auto& menu = std::get<MenuResult>(result.data);
+        applyOrientation(menu.orientation);
+        toggleAutoPageTurn(menu.pageTurnOption);
+        if (SETTINGS.fadingFix != menu.sunlightMode) {
+          SETTINGS.fadingFix = menu.sunlightMode;
+          SETTINGS.saveToFile();
+        }
+        if (!result.isCancelled) {
+          onReaderMenuConfirm(static_cast<EpubReaderMenuActivity::MenuAction>(menu.action));
+        }
+      });
 }
 
 bool EpubReaderActivity::buildTickHeapGate() {
@@ -452,6 +456,13 @@ void EpubReaderActivity::loop() {
           return;
         }
         break;
+      case CrossPointSettings::LP_MENU_FORCE_REFRESH:
+        if (mappedInput.getHeldTime() >= ReaderUtils::BOOKMARK_HOLD_MS) {
+          pagesUntilFullRefresh = 0;
+          requestUpdate();
+          return;
+        }
+        break;
       case CrossPointSettings::LP_MENU_READER_MENU:
         // Confirm already opens the menu on release. This option exists for
         // boards whose capacitive Home key supplies the long-press action.
@@ -581,6 +592,13 @@ void EpubReaderActivity::loop() {
     return;
   }
 
+  if (longPress && SETTINGS.longPressButtonBehavior == CrossPointSettings::LP_BTN_FORCE_REFRESH) {
+    pagesUntilFullRefresh = 0;
+    requestUpdate();
+    return;
+  }
+
+  // No current section, attempt to rerender the book
   if (!section) {
     requestUpdate();
     return;
@@ -1095,6 +1113,17 @@ void EpubReaderActivity::renderBook() {
         : (pendingPageJump.has_value() || !pendingAnchor.empty() || currentSpineIndex != cachedSpineIndex)
             ? std::nullopt
             : cachedVisibleTextOffset;
+    if (!cacheLoaded && currentSpineIndex == cachedSpineIndex) {
+      // A cache miss forces a full rebuild from scratch here (corrupt/unreadable section file --
+      // e.g. an SCT deserialization failure -- or simply no cache yet), not a settings change.
+      // offsetJump above already consumed whatever repositioning cachedVisibleTextOffset could
+      // offer for this chapter, so clear it now. Left set, it survives until this section finishes
+      // building (which can take a long time in the background under heap pressure) and then
+      // applyDeferredReposition() remaps the current page back to this stale offset's page --
+      // discarding any real reading progress made while the rebuild was still in flight.
+      cachedChapterTotalPageCount = 0;
+      cachedVisibleTextOffset.reset();
+    }
     if (!cacheComplete) {
       if (section->isPartial()) {
         LOG_DBG("ERS", "Partial cache found (%d pages), resuming build...", section->pageCount);
@@ -1366,6 +1395,9 @@ bool EpubReaderActivity::applyDeferredReposition() {
       newPage = section->pageCount - 1;
     }
     if (newPage != section->currentPage) {
+      LOG_DBG("ERS", "Deferred reposition: spine=%d page %d -> %d (cachedOffset=%u, cachedTotalPages=%d)",
+              currentSpineIndex, section->currentPage, newPage, cachedVisibleTextOffset.value_or(0),
+              cachedChapterTotalPageCount);
       section->currentPage = newPage;
       changed = true;
     }
@@ -1418,12 +1450,33 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
 
   const bool pageHasImages = page->hasImages();
   const bool pageHasImagesNeedingDecode = pageHasImages && page->hasImagesNeedingDecode();
+  // Forced-refresh gating uses image *size*, not mere presence: a tiny
+  // decorative ornament (e.g. a section-break glyph) shouldn't force the
+  // next page turn into a slow HALF_REFRESH the way a full-bleed photo
+  // does. Grayscale pipeline routing below intentionally keeps using the
+  // plain existence check (pageHasImages) - that's an unrelated concern.
+  constexpr int32_t kSignificantImageAreaPx = 24 * 24;  // 576px^2
+  bool pageHasSignificantImages = false;
+  if (pageHasImages) {
+    int16_t bboxX, bboxY, bboxW, bboxH;
+    if (page->getImageBoundingBox(bboxX, bboxY, bboxW, bboxH)) {
+      pageHasSignificantImages = static_cast<int32_t>(bboxW) * static_cast<int32_t>(bboxH) >= kSignificantImageAreaPx;
+    }
+  }
   const bool manualRefreshPending = forcedRefreshPending;
   forcedRefreshPending = false;
   const bool cleanImageBasePending = manualRefreshPending || pagesUntilFullRefresh <= 1;
   const bool needsTextGrayscale = SETTINGS.textAntiAliasing;
-  const bool needsAnyGrayscale = needsTextGrayscale || pageHasImages;
-  const bool tiledGrayscale = needsAnyGrayscale && renderer.supportsStripGrayscale();
+  // Pre-render heuristic: whether grayscale rendering might be needed at all,
+  // used to decide the async/tiled render strategy before the BW pass runs
+  // (the actual per-page content check below isn't known this early).
+  const bool mayNeedGrayscale = needsTextGrayscale || pageHasImages;
+  const bool tiledGrayscale = mayNeedGrayscale && renderer.supportsStripGrayscale();
+  // Whole-plane buffering only pays when the BW refresh genuinely runs async
+  // underneath it; on blocking panels (X3) it would just spend ~50 KB for the
+  // identical serial timing. Image pages take the blocking double-FAST path
+  // below (no async refresh is ever started), so they'd spend the buffers with
+  // nothing in flight to overlap.
   // Paper Mono only (no other panel combines): defer the B/W base activation so
   // the gray planes join it in a single waveform. Displaying the base
   // separately makes the gray pass re-drive the whole text body — a visible
@@ -1445,16 +1498,31 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
     renderer.clearScreen();
   }
 
+  // Real content check (not just "has an image element" or "AA is on"):
+  // render the BW frame once, tracking whether any pixel actually needed a
+  // grey level along the way (GfxRenderer::noteGrayLevel, called from the
+  // text glyph, image-decode, and bitmap pixel-write paths). This tells us,
+  // before any display refresh fires, whether the follow-up LSB/MSB passes
+  // (and the image-page base refresh below) are needed at all - an image
+  // that decodes to pure black/white skips both entirely.
+  renderer.resetGrayscaleContentTracking();
   page->render(renderer, fontId, orientedMarginLeft, orientedMarginTop);
   renderStatusBar();
+  const bool needsAnyGrayscale = renderer.hadGrayscaleContent();
   const auto tBwRender = millis();
 
-  if (pageHasImages) {
+  if (pageHasImages && needsAnyGrayscale) {
     // Image pages use one base refresh before the grayscale pass. FAST leaves
     // the panel receptive to the gray waveform; pending cleanup still honors
     // the scheduled/manual HALF refresh.
     renderer.displayBuffer(cleanImageBasePending ? HalDisplay::HALF_REFRESH : HalDisplay::FAST_REFRESH);
-    pagesUntilFullRefresh = 1;
+    // Only a genuinely-sized image forces the next page turn onto the slow
+    // ghost-cleanup HALF_REFRESH path; a tiny decorative image skips this
+    // (the periodic SETTINGS.refreshFrequency safety net still bounds any
+    // ghosting it leaves behind - see ReaderUtils::displayWithRefreshCycle).
+    if (pageHasSignificantImages) {
+      pagesUntilFullRefresh = 1;
+    }
   } else if (combinedGrayscaleBase) {
     // Stash the base without activating; displayGrayBuffer() below commits
     // base + grays as one waveform.
@@ -1464,7 +1532,16 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   }
   const auto tDisplay = millis();
 
-  if (tiledGrayscale) {
+  // Tiled grayscale: render each plane band-by-band, leaving the BW
+  // framebuffer intact so no full-frame storeBwBuffer is needed; controller
+  // RAM is re-synced from the live framebuffer afterward. The page is
+  // re-rendered ceil(H/STRIP_ROWS) times per plane, but renderCharImpl culls
+  // out-of-band glyphs before decode so the cost stays close to one render.
+  // Both text (drawPixel) and images (DirectPixelWriter) honor the active
+  // strip target. When the BW refresh above went out async, the plane
+  // rendering below overlaps the panel's refresh time; only the controller
+  // RAM writes wait for BUSY.
+  if (tiledGrayscale && needsAnyGrayscale) {
     constexpr int STRIP_ROWS = 80;
     const int gh = renderer.getDisplayHeight();
     const int gwBytes = renderer.getDisplayWidthBytes();

@@ -180,7 +180,7 @@ inline SettingInfo buildDictionarySetting(const std::vector<DictionaryEntry>& di
 
 inline std::vector<StrId> buildLongPressMenuValues() {
   static constexpr StrId VALUES[] = {StrId::STR_KOSYNC, StrId::STR_DISABLED, StrId::STR_BOOKMARK_OPTION,
-                                     StrId::STR_DICTIONARY, StrId::STR_READER_MENU};
+                                     StrId::STR_DICTIONARY, StrId::STR_FORCE_REFRESH, StrId::STR_READER_MENU};
   const size_t count = BoardConfig::hasHomeKey() ? std::size(VALUES) : std::size(VALUES) - 1;
   return {VALUES, VALUES + count};
 }
@@ -312,7 +312,7 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
                             "frontButtonFollowOrientation", StrId::STR_CAT_CONTROLS),
         SettingInfo::Enum(StrId::STR_LONG_PRESS_BEHAVIOR, &CrossPointSettings::longPressButtonBehavior,
                           {StrId::STR_LONG_PRESS_BEHAVIOR_OFF, StrId::STR_LONG_PRESS_BEHAVIOR_SKIP,
-                           StrId::STR_LONG_PRESS_BEHAVIOR_ORIENTATION},
+                           StrId::STR_LONG_PRESS_BEHAVIOR_ORIENTATION, StrId::STR_LONG_PRESS_BEHAVIOR_REFRESH},
                           "longPressButtonBehavior", StrId::STR_CAT_CONTROLS),
         SettingInfo::Enum(StrId::STR_LONG_PRESS_MENU, &CrossPointSettings::longPressMenuFunction,
                           buildLongPressMenuValues(), "longPressMenuFunction", StrId::STR_CAT_CONTROLS),
