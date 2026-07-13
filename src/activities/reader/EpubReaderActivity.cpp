@@ -342,12 +342,30 @@ void EpubReaderActivity::loop() {
     }
   }
 
+  // but only within a small window ahead of the reader: an unbounded build monopolized the
+  // RenderLock and locked out page turns. The build follows the reader instead, and instant
+  // reopen comes from suspendBuild() persisting the laid-out pages as a partial on exit.
+  // Skip while the render mutex is busy so we never delay a pending render; re-check
+  // isBuilding() under the lock since render() may have just finished it.
+  // While extending a partial (rebuild from a previous session), pageCount is pinned at the
+  // partial's watermark until the build catches up, so the window check would wrongly read
+  // "far enough ahead" and stall the build at 0 pages -- then the first turn past the
+  // watermark re-parses the whole chapter synchronously. Keep ticking until it finalizes.
   if (section && section->isBuilding() && !RenderLock::peek() &&
       (section->isPartial() || static_cast<int>(section->pageCount) < section->currentPage + BUILD_WINDOW_AHEAD) &&
       buildTickHeapGate()) {
     RenderLock lock;
     if (section->isBuilding() && buildTickHeapGate()) {
-      if (!section->buildSomeMore(BACKGROUND_BUILD_PAGES_PER_TICK)) {
+      const unsigned long tickStart = millis();
+      const bool tickOk = section->buildSomeMore(BACKGROUND_BUILD_PAGES_PER_TICK, BACKGROUND_BUILD_MAX_MS);
+      const unsigned long tickDuration = millis() - tickStart;
+      // Time-budget overrun (a single parseStep() call ran long, e.g. an image-heavy
+      // chunk) means this tick still blocked GPIO polling past BACKGROUND_BUILD_MAX_MS --
+      // logged so a slow reopen/page-turn can be correlated with a dropped button press.
+      if (tickDuration > BACKGROUND_BUILD_MAX_MS) {
+        LOG_DBG("ERS", "Background build tick ran %lums (budget %lums)", tickDuration, BACKGROUND_BUILD_MAX_MS);
+      }
+      if (!tickOk) {
         LOG_ERR("ERS", "Background section build failed");
         section.reset();
         requestUpdate();

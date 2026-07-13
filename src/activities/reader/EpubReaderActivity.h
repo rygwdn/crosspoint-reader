@@ -77,6 +77,17 @@ class EpubReaderActivity final : public ReaderActivity {
   static constexpr size_t RENDER_MIN_FREE_HEAP = 24 * 1024;
   static constexpr int BUILD_WINDOW_AHEAD = 5;
   static constexpr int PARTIAL_REBUILD_START_MARGIN = 15;
+  // Time budget for a single background-tick call into buildSomeMore(). A page can take
+  // longer to lay out than BACKGROUND_BUILD_PAGES_PER_TICK alone bounds (e.g. image-heavy
+  // content), and that call runs under the RenderLock in loop() *before* the next
+  // gpio.update() -- so it was blocking button polling for however long those pages took.
+  // The render path (catching up to the page about to be shown) has no such budget and
+  // stays hot until that page exists; only the opportunistic background build needs to
+  // give GPIO polling a chance to run.
+  static constexpr unsigned long BACKGROUND_BUILD_MAX_MS = 15;
+  // Show the indexing popup when an initial build must lay out more than this many pages up front
+  // (a deep resume/jump into a not-yet-built section), so it isn't a silent wait. Kept independent
+  // of the small look-ahead window so ordinary landings stay popup-free.
   static constexpr int BUILD_POPUP_PAGE_THRESHOLD = 20;
   static constexpr size_t BUILD_POPUP_BYTE_THRESHOLD = 96 * 1024;
   static constexpr unsigned long BUILD_POPUP_DEADLINE_MS = 1000;
