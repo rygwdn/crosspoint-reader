@@ -22,10 +22,17 @@ Each skill is a directory containing `SKILL.md` whose `name` matches the directo
 | `hal-and-abstractions` | touching storage, input, display, settings, i18n, rendering |
 | `scope-discipline` | adding a feature, activity, lib, setting, or dependency |
 | `refactor-for-review` | refactoring, cleaning up, or preparing a change for PR |
+| `device-network` | talking to a physical device over the LAN: WebDAV, logs, firmware upload |
 
 Each skill ends with a self-review checklist the agent runs against its own
 diff before handing it back. Reviewing a PR? Those checklists double as a
 fast rubric.
+
+One skill here isn't a C++ writing skill: `device-network` covers talking to a
+physical device over the LAN (file browsing, log pulling, firmware upload) --
+operational knowledge, not code judgment, but worth keeping alongside these
+since it was hard-won in a real debugging session and future sessions
+shouldn't have to rediscover it.
 
 ## Maintaining these
 
