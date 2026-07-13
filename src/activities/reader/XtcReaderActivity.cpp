@@ -61,10 +61,84 @@ bool XtcReaderActivity::handleFormatInput() {
     openChapterSelection();
     return true;
   }
+
+  // Front Left/Right: step through the current manga page's zoom crops
+  // (full page -> panel 1 -> panel 2 -> ... -> wraps back to full page).
+  // Only meaningful when the book has per-page chapters (cbz2xteink emits
+  // one chapter per manga page, spanning its full view and crops).
+  // Intercepted here, before the base loop()'s detectPageTurn, so Left/Right
+  // don't also fire as page-turn aliases (see ReaderUtils::detectPageTurn's
+  // prevButton/nextButton fallback) while a zoom-chapter book is open.
+  if (hasZoomChapters()) {
+    if (mappedInput.wasReleased(MappedInputManager::Button::Right)) {
+      stepZoomCrop(+1);
+      return true;
+    }
+    if (mappedInput.wasReleased(MappedInputManager::Button::Left)) {
+      stepZoomCrop(-1);
+      return true;
+    }
+  }
+
   return false;
 }
 
 void XtcReaderActivity::applyInitialOrientation() { renderer.setOrientation(GfxRenderer::Orientation::Portrait); }
+
+bool XtcReaderActivity::hasZoomChapters() const { return xtc && xtc->hasChapters() && !xtc->getChapters().empty(); }
+
+int XtcReaderActivity::findCurrentChapterIndex() const {
+  if (!xtc || !xtc->hasChapters()) {
+    return -1;
+  }
+  const auto& chapters = xtc->getChapters();
+  const auto it = std::find_if(chapters.begin(), chapters.end(), [this](const xtc::ChapterInfo& chapter) {
+    return currentPage >= chapter.startPage && currentPage <= chapter.endPage;
+  });
+  if (it == chapters.end()) {
+    return -1;
+  }
+  return static_cast<int>(it - chapters.begin());
+}
+
+void XtcReaderActivity::stepZoomCrop(int direction) {
+  const int chapterIndex = findCurrentChapterIndex();
+  if (chapterIndex < 0) {
+    return;
+  }
+  const auto& chapter = xtc->getChapters()[chapterIndex];
+  const int span = static_cast<int>(chapter.endPage - chapter.startPage) + 1;
+  if (span <= 0) {
+    return;
+  }
+  const int offset = static_cast<int>(currentPage - chapter.startPage);
+  int next = (offset + direction) % span;
+  if (next < 0) {
+    next += span;
+  }
+  currentPage = chapter.startPage + static_cast<uint32_t>(next);
+  requestUpdate();
+}
+
+void XtcReaderActivity::stepChapter(int direction, int count) {
+  const auto& chapters = xtc->getChapters();
+  const int chapterIndex = findCurrentChapterIndex();
+  const int baseIndex = chapterIndex < 0 ? 0 : chapterIndex;
+  const int targetIndex = baseIndex + direction * count;
+
+  if (targetIndex < 0) {
+    currentPage = 0;
+    requestUpdate();
+    return;
+  }
+  if (targetIndex >= static_cast<int>(chapters.size())) {
+    currentPage = xtc->getPageCount();  // triggers the existing "End of book" handling
+    requestUpdate();
+    return;
+  }
+  currentPage = chapters[targetIndex].startPage;
+  requestUpdate();
+}
 
 void XtcReaderActivity::renderBook() {
   if (!xtc) {
@@ -305,6 +379,25 @@ void XtcReaderActivity::renderPage() {
 
 bool XtcReaderActivity::pageTurn(bool isForward) {
   if (!xtc) return false;
+  if (hasZoomChapters()) {
+    // With per-page chapters, page-turn moves by whole manga page instead of
+    // by individual XTC page, so normal reading skips straight past zoom
+    // crops -- front Left/Right (see handleFormatInput()) are the way to see
+    // them. But if a forward turn lands mid-chapter (on a zoom crop, not the
+    // full page), it snaps back to that page's full view first instead of
+    // advancing -- so escaping a deep zoom never costs a page of content,
+    // and forward progress is always at most one press away from "back to
+    // what I was reading."
+    if (isForward) {
+      const int chapterIndex = findCurrentChapterIndex();
+      if (chapterIndex >= 0 && currentPage != xtc->getChapters()[chapterIndex].startPage) {
+        currentPage = xtc->getChapters()[chapterIndex].startPage;
+        return true;
+      }
+    }
+    stepChapter(isForward ? +1 : -1, 1);
+    return true;
+  }
   if (isForward) {
     if (currentPage < xtc->getPageCount()) {
       currentPage++;
@@ -321,6 +414,14 @@ bool XtcReaderActivity::pageTurn(bool isForward) {
 
 bool XtcReaderActivity::skipPages(int amount) {
   if (!xtc) return false;
+  if (hasZoomChapters()) {
+    // Long-press chapter skip: always jump by whole chapters, no mid-chapter
+    // snap-back -- that's only for a plain forward tap; a deliberate big
+    // jump shouldn't get redirected back to a page already seen.
+    const int count = amount < 0 ? -amount : amount;
+    stepChapter(amount > 0 ? +1 : -1, count);
+    return true;
+  }
   int newPage = static_cast<int>(currentPage) + amount;
   if (newPage < 0) newPage = 0;
   if (newPage > static_cast<int>(xtc->getPageCount())) newPage = static_cast<int>(xtc->getPageCount());

@@ -33,6 +33,19 @@ class XtcReaderActivity final : public ReaderActivity {
   void renderBook() override;
   void applyInitialOrientation() override;
 
+  // Zoom navigation: when the book has per-page chapters (each chapter
+  // spans one manga page's full view followed by its panel/bubble-zoom
+  // crops, as produced by cbz2xteink), front Left/Right step through the
+  // *current* chapter's crops, and side/tilt page-turn moves by whole
+  // chapter instead of by individual XTC page -- so normal page-turning
+  // skips straight past zoom crops, and the front buttons are the way to
+  // drill into them. No-op (falls back to the original per-page behavior)
+  // when the book has no chapters, e.g. a plain single-image XTC.
+  bool hasZoomChapters() const;
+  int findCurrentChapterIndex() const;
+  void stepZoomCrop(int direction);
+  void stepChapter(int direction, int count);
+
  public:
   explicit XtcReaderActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, std::string bookPath,
                              bool allowFastInitialRefresh)
