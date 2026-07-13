@@ -153,10 +153,6 @@ class ChapterHtmlSlimParser {
   bool preLineHasContent = false;  // true after first non-whitespace char in current pre line
   bool pendingListBullet = false;  // bullet deferred until first word of <li> to avoid bullet-only blocks
 
-  // <pre> whitespace-preservation tracking
-  int preDepth = INT_MAX;          // depth at which <pre> was entered (INT_MAX = not in pre)
-  bool preLineHasContent = false;  // true after first non-whitespace char in current pre line
-
   // Footnote link tracking
   bool insideFootnoteLink = false;
   int footnoteLinkDepth = -1;
