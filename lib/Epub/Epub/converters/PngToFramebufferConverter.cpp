@@ -45,6 +45,12 @@ struct PngContext {
   uint8_t* grayLineBuffer{nullptr};
   uint8_t* alphaLineBuffer{nullptr};
   uint32_t lastYieldMs{0};  // throttle state for yieldDuringDecode()
+
+  // Set when any dithered pixel is a genuine grey level (1 or 2, not pure
+  // black/white 0/3). Checked once after decode to report real grayscale
+  // content to the renderer (see GfxRenderer::noteGrayLevel) - lets the
+  // caller skip the LSB/MSB passes for images that decode to pure B/W.
+  bool sawGrayscale{false};
 };
 
 // File I/O callbacks use pFile->fHandle to access the HalFile*,
@@ -296,6 +302,7 @@ int pngDrawCallback(PNGDRAW* pDraw) {
           }
           pw.writePixel(outX, ditheredGray, ctx->alphaLineBuffer != nullptr);
           if (caching) cw.writePixel(outX, ditheredGray);
+          if (ditheredGray == 1 || ditheredGray == 2) ctx->sawGrayscale = true;
         }
       }
 
@@ -481,6 +488,8 @@ bool PngToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
   if (ctx.caching) {
     ctx.cache.finalize();
   }
+
+  if (ctx.sawGrayscale) renderer.noteGrayLevel(1);
 
   return true;
 }

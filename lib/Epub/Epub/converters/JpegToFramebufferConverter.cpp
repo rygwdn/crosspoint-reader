@@ -48,6 +48,11 @@ struct JpegContext {
   bool caching{false};
 
   uint32_t lastYieldMs{0};  // throttle state for yieldDuringDecode()
+  // Set when any dithered pixel is a genuine grey level (1 or 2, not pure
+  // black/white 0/3). Checked once after decode to report real grayscale
+  // content to the renderer (see GfxRenderer::noteGrayLevel) - lets the
+  // caller skip the LSB/MSB passes for images that decode to pure B/W.
+  bool sawGrayscale{false};
 };
 
 // File I/O callbacks use pFile->fHandle to access the HalFile*,
@@ -207,6 +212,7 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
           dithered = gray / 85;
           if (dithered > 3) dithered = 3;
         }
+        if (dithered == 1 || dithered == 2) ctx->sawGrayscale = true;
         pw.writePixel(outX, dithered);
         if (caching) cw.writePixel(outX, dithered);
       }
@@ -266,6 +272,7 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
           dithered = gray / 85;
           if (dithered > 3) dithered = 3;
         }
+        if (dithered == 1 || dithered == 2) ctx->sawGrayscale = true;
         pw.writePixel(outX, dithered);
         if (caching) cw.writePixel(outX, dithered);
       }
@@ -289,6 +296,7 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
           dithered = gray / 85;
           if (dithered > 3) dithered = 3;
         }
+        if (dithered == 1 || dithered == 2) ctx->sawGrayscale = true;
         pw.writePixel(outX, dithered);
         if (caching) cw.writePixel(outX, dithered);
       }
@@ -315,6 +323,7 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
           dithered = gray / 85;
           if (dithered > 3) dithered = 3;
         }
+        if (dithered == 1 || dithered == 2) ctx->sawGrayscale = true;
         pw.writePixel(outX, dithered);
         if (caching) cw.writePixel(outX, dithered);
       }
@@ -348,6 +357,7 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
         dithered = gray / 85;
         if (dithered > 3) dithered = 3;
       }
+      if (dithered == 1 || dithered == 2) ctx->sawGrayscale = true;
       pw.writePixel(outX, dithered);
       if (caching) cw.writePixel(outX, dithered);
     }
@@ -509,6 +519,8 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
   if (ctx.caching) {
     ctx.cache.finalize();
   }
+
+  if (ctx.sawGrayscale) renderer.noteGrayLevel(1);
 
   return true;
 }

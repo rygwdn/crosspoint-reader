@@ -108,6 +108,13 @@ class GfxRenderer {
   // fonts.
   void ensureSdGlyphsResident(int fontId, const char* text, EpdFontFamily::Style style, bool metadataOnly) const;
 
+  // Set when a BW-mode render actually produces a genuine grey level (1 or
+  // 2, not pure black/white) via noteGrayLevel(). Lets callers detect,
+  // right after a single BW page render and before any display refresh,
+  // whether the page needs a follow-up grayscale (LSB/MSB) pass at all.
+  // Mutable for the same const-render-path reason as the fields above.
+  mutable bool _sawGrayscaleContent = false;
+
   void renderChar(const EpdFontFamily& fontFamily, uint32_t cp, int* x, int* y, bool pixelState,
                   EpdFontFamily::Style style) const;
   void freeBwBufferChunks();
@@ -316,6 +323,17 @@ class GfxRenderer {
   // Grayscale functions
   void setRenderMode(const RenderMode mode) { this->renderMode = mode; }
   RenderMode getRenderMode() const { return renderMode; }
+  // Real-content grayscale detection: call resetGrayscaleContentTracking()
+  // before a BW-mode page render, have pixel-writing call sites report the
+  // dithered level they saw via noteGrayLevel(), then read
+  // hadGrayscaleContent() afterward to know whether the page actually needs
+  // a follow-up LSB/MSB pass (as opposed to merely having an image element,
+  // which may have decoded to pure black/white).
+  void resetGrayscaleContentTracking() const { _sawGrayscaleContent = false; }
+  void noteGrayLevel(uint8_t level) const {
+    if (renderMode == BW && (level == 1 || level == 2)) _sawGrayscaleContent = true;
+  }
+  bool hadGrayscaleContent() const { return _sawGrayscaleContent; }
   // Grayscale preconditioning settle pass (no-op on X4). The rect overload
   // takes the gray region in LOGICAL screen coordinates and rotates it to the
   // panel; the no-arg overload settles the full frame. Call after the BW base
