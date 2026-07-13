@@ -69,6 +69,21 @@ constexpr uint32_t HEADER_SIZE = sizeof(uint8_t) + sizeof(int) + sizeof(float) +
                                  sizeof(uint16_t) + sizeof(uint16_t) + sizeof(uint16_t) + sizeof(bool) + sizeof(bool) +
                                  sizeof(uint8_t) + sizeof(bool) + sizeof(uint32_t) + sizeof(uint32_t) +
                                  sizeof(uint32_t) + sizeof(uint32_t) + sizeof(uint32_t);
+
+// Cap on BuildContext::lut (the in-RAM page-LUT window): 64 entries * 12 bytes/entry =
+// 768 bytes worst case, regardless of chapter size. Chosen comfortably above
+// EpubReaderActivity's BUILD_WINDOW_AHEAD (5) and PARTIAL_REBUILD_START_MARGIN (15) so
+// today's sequential build/read access patterns always hit RAM; anything older is read
+// back from the spill file via Section::getLutEntry. Without this cap the LUT grew for
+// the whole chapter (unbounded on a giant single-spine book) since nothing ever trimmed
+// it before commit -- see docs/notes/cross-chapter-lookahead.md.
+constexpr size_t LUT_RAM_WINDOW_PAGES = 64;
+// Bytes per on-disk PageLutEntry record in the spill file: uint32 fileOffset + uint16
+// paragraphIndex + uint16 listItemIndex + uint32 visibleTextOffset, written field-by-field
+// (not a raw struct write -- RISC-V faults on unaligned multi-byte loads from a packed
+// buffer), so this must track the fields written/read in Section::recordBuiltPage /
+// Section::getLutEntry exactly.
+constexpr uint32_t LUT_SPILL_RECORD_SIZE = sizeof(uint32_t) + sizeof(uint16_t) + sizeof(uint16_t) + sizeof(uint32_t);
 }  // namespace
 
 // Out-of-line so the unique_ptr<ChapterHtmlSlimParser> in BuildContext can be
@@ -363,6 +378,17 @@ bool Section::startBuild(const ReaderRenderSpec& spec, const std::function<void(
     if (!reusedHtml) Storage.remove(tmpHtmlPath.c_str());
     return false;
   }
+  // Fixed-size window, reserved once: recordBuiltPage never lets it grow past this.
+  ctx->lut.reserve(LUT_RAM_WINDOW_PAGES);
+  // Opened eagerly (like the other build files above) so a failure here fails startBuild
+  // cleanly instead of surfacing later as silently-lost LUT entries mid-build.
+  if (!Storage.openFileForWrite("SCT", lutSpillPath(), ctx->lutSpillFile)) {
+    LOG_ERR("SCT", "Failed to open LUT spill file");
+    file.close();
+    Storage.remove(binTmpPath().c_str());
+    if (!reusedHtml) Storage.remove(tmpHtmlPath.c_str());
+    return false;
+  }
   // htmlCached == "htmlPath is the live cache" (reused, or just promoted). finalizeBuild/abandonBuild
   // then leave the cached HTML alone; only an un-promoted temp (rename failed) is theirs to clean up.
   ctx->reusedHtml = htmlCached;
@@ -404,10 +430,9 @@ bool Section::startBuild(const ReaderRenderSpec& spec, const std::function<void(
       epub, ctxPtr->parsePath, renderer, spec.fontId, spec.lineCompression, spec.extraParagraphSpacing,
       spec.paragraphAlignment, spec.viewportWidth, spec.viewportHeight, spec.hyphenationEnabled,
       spec.focusReadingEnabled,
-      [this, ctxPtr](std::unique_ptr<Page> page, const uint16_t paragraphIndex, const uint16_t listItemIndex,
-                     const uint32_t visibleTextOffset) {
-        ctxPtr->lut.push_back(
-            {this->onPageComplete(std::move(page)), paragraphIndex, listItemIndex, visibleTextOffset});
+      [this](std::unique_ptr<Page> page, const uint16_t paragraphIndex, const uint16_t listItemIndex,
+             const uint32_t visibleTextOffset) {
+        this->recordBuiltPage(this->onPageComplete(std::move(page)), paragraphIndex, listItemIndex, visibleTextOffset);
       },
       spec.embeddedStyle, ctxPtr->contentBase, ctxPtr->imageBasePath, spec.imageRendering, std::move(tocAnchors),
       popupFn, ctxPtr->cssParser);
@@ -544,16 +569,25 @@ bool Section::commitBuildFile(const uint8_t version, const uint32_t bytesConsume
     // Explicit close() required before remove (member variable, O_RDWR handle).
     file.close();
     Storage.remove(binTmpPath().c_str());
+    if (build_->lutSpillFile) build_->lutSpillFile.close();
+    Storage.remove(lutSpillPath().c_str());
     return false;
   };
 
+  // Each of the four LUT arrays below re-reads every entry via getLutEntry rather than
+  // walking build_->lut directly -- build_->lut is only the recent RAM window post-Phase-1,
+  // getLutEntry transparently falls back to the spill file for older pages. Four passes
+  // over up to `builtPageCount_` 12-byte spill records (not four passes over the whole
+  // chapter's page *content*) -- accepted as simple over optimal given this only runs once
+  // per commit, not per tick.
   const uint32_t lutOffset = file.position();
-  for (const auto& entry : build_->lut) {
-    if (entry.fileOffset == 0) {
+  for (int page = 0; page < builtPageCount_; page++) {
+    const auto entry = getLutEntry(page);
+    if (!entry || entry->fileOffset == 0) {
       LOG_ERR("SCT", "Failed to write LUT due to invalid page positions");
       return failCommit();
     }
-    serialization::writePod(file, entry.fileOffset);
+    serialization::writePod(file, entry->fileOffset);
   }
 
   // Write anchor-to-page map for fragment navigation (e.g. footnote targets). For a
@@ -572,19 +606,24 @@ bool Section::commitBuildFile(const uint8_t version, const uint32_t bytesConsume
   }
 
   const uint32_t paragraphLutOffset = file.position();
-  serialization::writePod(file, static_cast<uint16_t>(build_->lut.size()));
-  for (const auto& entry : build_->lut) {
-    serialization::writePod(file, entry.paragraphIndex);
+  // builtPageCount_, not build_->lut.size() -- the latter is now just the RAM window size,
+  // not the total entry count this array must hold.
+  serialization::writePod(file, static_cast<uint16_t>(builtPageCount_));
+  for (int page = 0; page < builtPageCount_; page++) {
+    const auto entry = getLutEntry(page);
+    serialization::writePod(file, entry ? entry->paragraphIndex : uint16_t{0});
   }
 
   const uint32_t liLutFileOffset = static_cast<uint32_t>(file.position());
-  for (const auto& entry : build_->lut) {
-    serialization::writePod(file, entry.listItemIndex);
+  for (int page = 0; page < builtPageCount_; page++) {
+    const auto entry = getLutEntry(page);
+    serialization::writePod(file, entry ? entry->listItemIndex : uint16_t{0});
   }
 
   const uint32_t visibleLutFileOffset = static_cast<uint32_t>(file.position());
-  for (const auto& entry : build_->lut) {
-    serialization::writePod(file, entry.visibleTextOffset);
+  for (int page = 0; page < builtPageCount_; page++) {
+    const auto entry = getLutEntry(page);
+    serialization::writePod(file, entry ? entry->visibleTextOffset : uint32_t{0});
   }
 
   if (asPartial) {
@@ -607,6 +646,11 @@ bool Section::commitBuildFile(const uint8_t version, const uint32_t bytesConsume
   serialization::writePod(file, version);
   // Explicit close() required: member variable persists beyond function scope
   file.close();
+
+  // The spill file's data is now fully folded into the four arrays above; it's never
+  // read again regardless of commit outcome.
+  if (build_->lutSpillFile) build_->lutSpillFile.close();
+  Storage.remove(lutSpillPath().c_str());
 
   // Swap into place. A crash between remove and rename loses the old file but keeps a
   // fully-committed tmp; the next build just removes it and rebuilds.
@@ -682,6 +726,14 @@ void Section::suspendBuild() {
     file.close();
     Storage.remove(binTmpPath().c_str());
   }
+  // Not worth-keeping (dropped above) never reaches commitBuildFile, so it never gets the
+  // spill cleanup baked into that function's success/failCommit paths -- do it here too.
+  // Redundant (harmless no-op remove) when commitBuildFile's own failCommit() already did
+  // it; skipped entirely when commitBuildFile succeeded (committed == true).
+  if (!committed) {
+    if (build_->lutSpillFile) build_->lutSpillFile.close();
+    Storage.remove(lutSpillPath().c_str());
+  }
   if (!build_->reusedHtml && Storage.exists(build_->tmpHtmlPath.c_str())) {
     Storage.remove(build_->tmpHtmlPath.c_str());
   }
@@ -700,6 +752,8 @@ void Section::abandonBuild() {
     file.close();
     Storage.remove(binTmpPath().c_str());
   }
+  if (build_->lutSpillFile) build_->lutSpillFile.close();
+  Storage.remove(lutSpillPath().c_str());
   // A parse error would recur against the same HTML, so drop any partial too -- resuming
   // from it would just re-enter the failing build every open.
   if (Storage.exists(filePath.c_str())) {
@@ -716,22 +770,69 @@ void Section::abandonBuild() {
   builtPageCount_ = 0;
 }
 
+void Section::recordBuiltPage(const uint32_t fileOffset, const uint16_t paragraphIndex, const uint16_t listItemIndex,
+                              const uint32_t visibleTextOffset) {
+  if (!build_) return;
+
+  // Spill every entry immediately, same trick onPageComplete already applies to page
+  // content: nothing here needs to stay resident once it's on SD.
+  if (build_->lutSpillFile) {
+    serialization::writePod(build_->lutSpillFile, fileOffset);
+    serialization::writePod(build_->lutSpillFile, paragraphIndex);
+    serialization::writePod(build_->lutSpillFile, listItemIndex);
+    serialization::writePod(build_->lutSpillFile, visibleTextOffset);
+  } else {
+    LOG_ERR("SCT", "LUT spill file not open, entry for page %d not persisted", builtPageCount_ - 1);
+  }
+
+  build_->lut.push_back({fileOffset, paragraphIndex, listItemIndex, visibleTextOffset});
+  if (build_->lut.size() > LUT_RAM_WINDOW_PAGES) {
+    // O(window size), not O(pages built) -- the window is a small fixed constant.
+    build_->lut.erase(build_->lut.begin());
+  }
+}
+
+std::optional<Section::PageLutEntry> Section::getLutEntry(const int page) const {
+  if (!build_ || page < 0 || page >= static_cast<int>(builtPageCount_)) {
+    return std::nullopt;
+  }
+  const int windowStart = static_cast<int>(builtPageCount_) - static_cast<int>(build_->lut.size());
+  if (page >= windowStart) {
+    return build_->lut[static_cast<size_t>(page - windowStart)];
+  }
+  // Older than the RAM window: seek the spill file. Every entry was written there in page
+  // order at a fixed record size, so the offset is a direct computation, no index needed --
+  // same seek-read-restore pattern loadPageDuringBuild uses for page content on `file`.
+  if (!build_->lutSpillFile) {
+    return std::nullopt;
+  }
+  const uint32_t readPos = build_->lutSpillFile.position();
+  build_->lutSpillFile.seek(static_cast<uint32_t>(page) * LUT_SPILL_RECORD_SIZE);
+  PageLutEntry entry{};
+  serialization::readPod(build_->lutSpillFile, entry.fileOffset);
+  serialization::readPod(build_->lutSpillFile, entry.paragraphIndex);
+  serialization::readPod(build_->lutSpillFile, entry.listItemIndex);
+  serialization::readPod(build_->lutSpillFile, entry.visibleTextOffset);
+  build_->lutSpillFile.seek(readPos);
+  return entry;
+}
+
 std::unique_ptr<Page> Section::loadPageDuringBuild(const int page) {
-  if (!build_ || page < 0 || page >= static_cast<int>(build_->lut.size()) || !file) {
+  if (!build_ || page < 0 || page >= static_cast<int>(builtPageCount_) || !file) {
     return nullptr;
   }
-  const uint32_t pos = build_->lut[page].fileOffset;
-  if (pos == 0) {
+  const auto entry = getLutEntry(page);
+  if (!entry || entry->fileOffset == 0) {
     return nullptr;
   }
   // The .bin is open O_RDWR for the build. Read the already-written page, then restore
   // the write cursor so the next onPageComplete keeps appending where it left off.
   const uint32_t writePos = file.position();
-  file.seek(pos);
+  file.seek(entry->fileOffset);
   auto p = Page::deserialize(file);
   file.seek(writePos);
   if (p) {
-    p->visibleTextOffset = build_->lut[page].visibleTextOffset;
+    p->visibleTextOffset = entry->visibleTextOffset;
   }
   return p;
 }
@@ -778,7 +879,7 @@ std::unique_ptr<Page> Section::loadPage(const int page) {
   if (page < 0) {
     return nullptr;
   }
-  if (build_ && page < static_cast<int>(build_->lut.size())) {
+  if (build_ && page < static_cast<int>(builtPageCount_)) {
     return loadPageDuringBuild(page);
   }
   // Not (yet) in the active build: serve from the file on disk -- a finalized section,
@@ -986,8 +1087,9 @@ std::optional<uint16_t> Section::getPageForListItemIndex(const uint16_t liIndex)
 }
 
 std::optional<uint32_t> Section::getVisibleTextOffsetForPage(const uint16_t page) const {
-  if (build_ && page < build_->lut.size()) {
-    return build_->lut[page].visibleTextOffset;
+  if (build_ && page < builtPageCount_) {
+    const auto entry = getLutEntry(page);
+    if (entry) return entry->visibleTextOffset;
   }
 
   HalFile f;
@@ -1024,25 +1126,24 @@ std::optional<uint32_t> Section::getVisibleTextOffsetForPage(const uint16_t page
 
 std::optional<uint16_t> Section::getPageForVisibleTextOffset(const uint32_t offset,
                                                              const bool preferFirstAtOffset) const {
-  const auto findInEntries = [offset, preferFirstAtOffset](const auto& entries) -> std::optional<uint16_t> {
-    if (entries.empty()) return std::nullopt;
-    uint16_t result = 0;
-    for (size_t i = 0; i < entries.size(); i++) {
-      const uint32_t pageStart = entries[i].visibleTextOffset;
-      if (preferFirstAtOffset && pageStart == offset) {
-        return static_cast<uint16_t>(i);
-      }
-      if (pageStart > offset) break;
-      result = static_cast<uint16_t>(i);
-    }
-    return result;
-  };
-
-  if (build_ && !build_->lut.empty()) {
+  if (build_ && builtPageCount_ > 0) {
     // Resolve within the active build's known range. Later offsets may still be
     // covered by an on-disk partial that the resumed build has not reached yet.
-    if (offset <= build_->lut.back().visibleTextOffset) {
-      return findInEntries(build_->lut);
+    // getLutEntry(builtPageCount_ - 1) is always the sliding window's newest entry, so
+    // this never needs a spill-file read.
+    const auto lastEntry = getLutEntry(builtPageCount_ - 1);
+    if (lastEntry && offset <= lastEntry->visibleTextOffset) {
+      uint16_t result = 0;
+      for (uint16_t page = 0; page < builtPageCount_; page++) {
+        const auto entry = getLutEntry(page);
+        if (!entry) break;
+        if (preferFirstAtOffset && entry->visibleTextOffset == offset) {
+          return page;
+        }
+        if (entry->visibleTextOffset > offset) break;
+        result = page;
+      }
+      return result;
     }
   }
 
