@@ -121,6 +121,20 @@ class ChapterHtmlSlimParser {
   bool syntheticCharacterData = false;
   uint16_t nonVisibleTextDepth = 0;
 
+  // Widow prevention: hold the most recently filled page so makePages() can rescue
+  // its last line when a paragraph leaves only one line on the following page (a widow).
+  std::unique_ptr<Page> widowPendingPage;
+  uint16_t widowPendingParagraphIndex = 0;
+  uint16_t widowPendingListItemIndex = 0;
+  // Start offset of widowPendingPage itself (stable even if its last line is later
+  // rescued away) and the offset of that last line (used to correct the *next*
+  // page's start offset if a rescue moves that line there).
+  uint32_t widowPendingStartOffset = 0;
+  uint32_t widowPendingLastLineOffset = 0;
+  // Offset of the most recently added line, so a page can be deferred without
+  // losing track of what its (possibly rescuable) last line's offset was.
+  uint32_t lastLineVisibleOffset = 0;
+
   // Footnote link tracking
   bool insideFootnoteLink = false;
   int footnoteLinkDepth = -1;
@@ -150,6 +164,7 @@ class ChapterHtmlSlimParser {
   void setCurrentPageVisibleOffset(uint32_t offset);
   void makePages();
   static EpdFontFamily::Style fontStyleForTextDecoration(CssTextDecoration decoration);
+  void commitPendingPage();
   static void applyDirectionToEntry(StyleStackEntry& entry, const CssStyle& css);
   static void applyTextDecorationToEntry(StyleStackEntry& entry, const CssStyle& css);
   void pushTableTextStyleEntry(const CssStyle& cssStyle);

@@ -282,6 +282,10 @@ void ChapterHtmlSlimParser::flushPendingAnchor() {
   // block is flushed so the chapter starts on a fresh page.
   if (std::find(tocAnchors.begin(), tocAnchors.end(), pendingAnchorId) != tocAnchors.end()) {
     if (currentPage && !currentPage->elements.empty()) {
+      // Chapter boundaries aren't subject to widow rules (the new chapter always
+      // starts on a fresh page regardless), but any page still deferred from the
+      // widow check must be flushed first to keep page ordering/counts correct.
+      commitPendingPage();
       completePageFn(std::move(currentPage), xpathParagraphIndex, xpathListItemIndex, currentPageVisibleOffset);
       completedPageCount++;
       currentPage.reset(new Page());
@@ -432,7 +436,10 @@ void ChapterHtmlSlimParser::emitHorizontalRule(const BlockStyle& blockStyle) {
   const int16_t totalHeight = static_cast<int16_t>(topSpacing + ruleThickness + bottomSpacing);
 
   if (!currentPage->elements.empty() && currentPageNextY + totalHeight > viewportHeight) {
+    // Horizontal rules aren't subject to widow rules (makePages() never runs for them),
+    // but flush any page still deferred from the widow check first.
     setCurrentPageVisibleOffset(visibleTextOffset);
+    commitPendingPage();
     completePageFn(std::move(currentPage), xpathParagraphIndex, xpathListItemIndex, currentPageVisibleOffset);
     completedPageCount++;
     currentPage.reset(new (std::nothrow) Page());
@@ -1097,6 +1104,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
                 if (self->currentPage && !self->currentPage->elements.empty() &&
                     (self->currentPageNextY + imageMarginTop + displayHeight + imageMarginBottom >
                      self->viewportHeight)) {
+                  self->commitPendingPage();
                   self->completePageFn(std::move(self->currentPage), self->xpathParagraphIndex,
                                        self->xpathListItemIndex, self->currentPageVisibleOffset);
                   self->completedPageCount++;
@@ -2055,7 +2063,10 @@ bool ChapterHtmlSlimParser::finishParse() {
       anchorData.push_back({std::move(pendingAnchorId), static_cast<uint16_t>(completedPageCount)});
       pendingAnchorId.clear();
     }
+    // End of chapter: no further paragraphs can rescue a widow from this page, so flush
+    // it (and any still-deferred page from the widow check) unconditionally.
     setCurrentPageVisibleOffset(visibleTextOffset);
+    commitPendingPage();
     completePageFn(std::move(currentPage), xpathParagraphIndex, xpathListItemIndex, currentPageVisibleOffset);
     completedPageCount++;
     currentPage.reset();
@@ -2082,6 +2093,17 @@ bool ChapterHtmlSlimParser::parseAndBuildPages() {
   return finishParse();
 }
 
+void ChapterHtmlSlimParser::commitPendingPage() {
+  if (widowPendingPage) {
+    // widowPendingStartOffset is that page's own start offset, captured when it was
+    // deferred; it stays correct even if its last line was later rescued away, since
+    // removing the *last* line never changes the page's *first* line.
+    completePageFn(std::move(widowPendingPage), widowPendingParagraphIndex, widowPendingListItemIndex,
+                    widowPendingStartOffset);
+    widowPendingPage.reset();
+  }
+}
+
 void ChapterHtmlSlimParser::addLineToPage(std::shared_ptr<TextBlock> line, const uint32_t visibleOffset) {
   const int lineHeight =
       renderer.getLineHeight(fontId, lineCompression) + line->getRubyShift(renderer.getFontAscenderSize(fontId));
@@ -2093,14 +2115,23 @@ void ChapterHtmlSlimParser::addLineToPage(std::shared_ptr<TextBlock> line, const
   }
 
   if (currentPageNextY + lineHeight > viewportHeight) {
-    setCurrentPageVisibleOffset(visibleOffset);
-    completePageFn(std::move(currentPage), xpathParagraphIndex, xpathListItemIndex, currentPageVisibleOffset);
+    // Defer writing the filled page: widow fixup in makePages() may need to pull
+    // the last line back to accompany a lone widow on the next page. Record both
+    // this page's own start offset (for when it's eventually committed) and its
+    // last line's offset (for if that line gets rescued onto the next page).
+    commitPendingPage();
+    widowPendingPage = std::move(currentPage);
+    widowPendingParagraphIndex = xpathParagraphIndex;
+    widowPendingListItemIndex = xpathListItemIndex;
+    widowPendingStartOffset = currentPageVisibleOffset;
+    widowPendingLastLineOffset = lastLineVisibleOffset;
     completedPageCount++;
     currentPage.reset(new Page());
     currentPageNextY = 0;
     currentPageVisibleOffsetSet = false;
   }
   setCurrentPageVisibleOffset(visibleOffset);
+  lastLineVisibleOffset = visibleOffset;
 
   // Track cumulative words to assign footnotes to the page containing their anchor
   wordsExtractedInBlock += line->wordCount();
@@ -2145,9 +2176,32 @@ void ChapterHtmlSlimParser::makePages() {
   const uint16_t effectiveWidth =
       (horizontalInset < viewportWidth) ? static_cast<uint16_t>(viewportWidth - horizontalInset) : viewportWidth;
 
+  const int pageCountBefore = completedPageCount;
   currentTextBlock->layoutAndExtractLines(
       renderer, fontId, effectiveWidth,
       [this](const std::shared_ptr<TextBlock>& textBlock, const uint32_t offset) { addLineToPage(textBlock, offset); });
+
+  // WIDOW PREVENTION: if exactly one line of this paragraph landed on a fresh page
+  // (a typographic widow), rescue the last line from the pending page so the new
+  // page opens with two lines instead of one.
+  if (currentPage && currentPage->elements.size() == 1 && completedPageCount > pageCountBefore && widowPendingPage &&
+      widowPendingPage->elements.size() >= 2 && widowPendingPage->elements.back()->getTag() == TAG_PageLine) {
+    auto& rescuedEl = static_cast<PageLine&>(*widowPendingPage->elements.back());
+    auto& widowEl = static_cast<PageLine&>(*currentPage->elements.front());
+    auto rescuedBlock = rescuedEl.getBlock();
+    const int16_t rescuedX = rescuedEl.xPos;
+    auto widowBlock = widowEl.getBlock();
+    const int16_t widowX = widowEl.xPos;
+    widowPendingPage->elements.pop_back();
+    currentPage->elements.clear();
+    currentPage->elements.push_back(std::make_shared<PageLine>(std::move(rescuedBlock), rescuedX, 0));
+    currentPage->elements.push_back(
+        std::make_shared<PageLine>(std::move(widowBlock), widowX, static_cast<int16_t>(lineHeight)));
+    currentPageNextY = static_cast<int16_t>(lineHeight * 2);
+    // The rescued line is now this page's first line, not the original widow line —
+    // correct the recorded start offset to match what's actually rendered first.
+    currentPageVisibleOffset = widowPendingLastLineOffset;
+  }
 
   // Fallback: transfer any remaining pending footnotes to current page.
   // Normally addLineToPage handles this via word-index tracking, but this catches
