@@ -95,11 +95,19 @@ if (parsedSize != fileSize) {
 
 ## `section.bin`
 
-### Version 41
+### Version 43
 
 Each file in `sections/*.bin` stores one laid-out spine section. The header is
 also the cache-busting key: if any layout-affecting setting differs from the
 current reader settings, the section is discarded and rebuilt.
+
+Version 43 is binary-identical to version 42 except for the new `<li>` hanging
+indent layout behavior below, which changes cached page contents for all lists
+and so bumps the version to force a rebuild.
+
+Version 42 is binary-identical to version 41 except for the new `<pre>`/`<code>`
+layout behavior below, which changes cached page contents and so bumps the
+version to force a rebuild.
 
 Version 41 keeps the version 40 serialized layout unchanged. It was bumped
 because simple HTML table rows are now laid out as positioned columns rather
@@ -155,6 +163,10 @@ superscript, and subscript. The format also includes:
   NUL-terminated text blob, replacing v28's length-prefixed word strings. The
   on-disk order mirrors the in-RAM arena so the firmware reads a whole block
   payload with a single allocation and a single SD read
+- `<pre>` blocks preserve line breaks and leading-space indentation, and
+  `<code>` renders italic (v42)
+- `<li>` bullets defer to the first word block with a hanging indent (v43;
+  changes layout for all lists)
 
 ImHex pattern:
 
@@ -163,7 +175,7 @@ import std.mem;
 import std.string;
 import std.core;
 
-#define EXPECTED_VERSION 41
+#define EXPECTED_VERSION 43
 #define MAX_STRING_LENGTH 65535
 #define FOOTNOTE_NUMBER_LEN 32
 #define FOOTNOTE_HREF_LEN 256

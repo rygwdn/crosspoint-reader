@@ -135,6 +135,10 @@ class ChapterHtmlSlimParser {
   // losing track of what its (possibly rescuable) last line's offset was.
   uint32_t lastLineVisibleOffset = 0;
 
+  // <pre> whitespace-preservation tracking
+  int preDepth = INT_MAX;          // depth at which <pre> was entered (INT_MAX = not in pre)
+  bool preLineHasContent = false;  // true after first non-whitespace char in current pre line
+
   // Footnote link tracking
   bool insideFootnoteLink = false;
   int footnoteLinkDepth = -1;

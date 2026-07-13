@@ -22,10 +22,19 @@
 #include "Epub/converters/ImageDimsProbe.h"
 #include "Epub/converters/ImageToFramebufferDecoder.h"
 #include "Epub/htmlEntities.h"
+#include "Epub/parsers/PageBreakDecisions.h"
 
 // Minimum file size (in bytes) to show indexing popup - smaller chapters don't benefit from it
 constexpr size_t MIN_SIZE_FOR_POPUP = 10 * 1024;  // 10KB
 constexpr size_t PARSE_BUFFER_SIZE = 1024;
+// Used instead of PARSE_BUFFER_SIZE when the caller has a time budget to protect (the background
+// build tick). A normal <img> tag is well under this many bytes, so a chunk this size essentially
+// never spans two of them -- unlike a 1KB chunk, which can pack in a whole run of image tags from
+// a gallery-style chapter. Each image tag does a synchronous SD extract + dimension read, so this
+// keeps that cost to roughly one image per parseStep() call instead of however many land in 1KB,
+// giving the caller's own per-call time check (see EpubReaderActivity::BACKGROUND_BUILD_MAX_MS) a
+// chance to yield between images rather than only between whole buffers.
+constexpr size_t SMALL_PARSE_BUFFER_SIZE = 128;
 
 // This number comes from PR #73
 // If we have > 750 words buffered up, perform the layout and consume out all but the last line
@@ -52,9 +61,9 @@ constexpr uint8_t TABLE_ROW_SEPARATOR_THICKNESS = 1;
 constexpr int16_t TABLE_MIN_CELL_WIDTH_LINE_HEIGHTS = 3;
 
 constexpr const char* HEADER_TAGS[] = {"h1", "h2", "h3", "h4", "h5", "h6"};
-constexpr const char* BLOCK_TAGS[] = {"p", "li", "div", "br", "blockquote"};
+constexpr const char* BLOCK_TAGS[] = {"p", "li", "div", "br", "blockquote", "pre"};
 constexpr const char* BOLD_TAGS[] = {"b", "strong"};
-constexpr const char* ITALIC_TAGS[] = {"i", "em"};
+constexpr const char* ITALIC_TAGS[] = {"i", "em", "code"};
 constexpr const char* UNDERLINE_TAGS[] = {"u", "ins"};
 constexpr const char* LINETHROUGH_TAGS[] = {"del", "s", "strike"};
 constexpr const char* IMAGE_TAGS[] = {"img", "image"};
@@ -341,6 +350,10 @@ void ChapterHtmlSlimParser::flushPartWordBuffer() {
     fallbackTableRowToStacked();
   }
 
+  if (pendingListBullet) {
+    currentTextBlock->addWord("\xe2\x80\xa2", EpdFontFamily::REGULAR, false, false, partWordVisibleOffset);
+    pendingListBullet = false;
+  }
   currentTextBlock->addWord(partWordBuffer, fontStyle, false, nextWordContinues, partWordVisibleOffset);
   if (insideTableCell && !tableRowStacked) {
     tableCellTextBytes += wordBytes;
@@ -350,7 +363,6 @@ void ChapterHtmlSlimParser::flushPartWordBuffer() {
   }
   partWordBufferIndex = 0;
   nextWordContinues = false;
-  listItemBulletOnly = false;
 }
 
 // start a new text block if needed
@@ -380,17 +392,6 @@ void ChapterHtmlSlimParser::startNewTextBlock(const BlockStyle& blockStyle) {
       return;
     }
 
-    // <li> added a bullet as the first word, making the block non-empty. When a nested
-    // block-level child (<p>, <div>, etc.) opens, reuse the block instead of flushing
-    // the bullet to its own line. The bullet stays inline with the child's text.
-    if (listItemBulletOnly) {
-      const auto style = currentTextBlock->getBlockStyle();
-      currentTextBlock->setBlockStyle(style.getCombinedBlockStyle(blockStyle, BlockStyle::CombineAxis::Vertical));
-      listItemBulletOnly = false;
-      flushPendingAnchor();
-      return;
-    }
-
     makePages();
   }
   // If the pending anchor is a TOC chapter boundary, force a page break after the previous
@@ -398,7 +399,6 @@ void ChapterHtmlSlimParser::startNewTextBlock(const BlockStyle& blockStyle) {
   flushPendingAnchor();
   currentTextBlock.reset(new ParsedText(extraParagraphSpacing, hyphenationEnabled, focusReadingEnabled, blockStyle));
   wordsExtractedInBlock = 0;
-  listItemBulletOnly = false;
 }
 
 void ChapterHtmlSlimParser::emitHorizontalRule(const BlockStyle& blockStyle) {
@@ -1326,6 +1326,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
     self->currentCssStyle = cssStyle;
     auto headerBlockStyle = BlockStyle::fromCssStyle(cssStyle, emSize, CssTextAlign::Center, self->viewportWidth);
     headerBlockStyle.textAlignDefined = true;
+    headerBlockStyle.isHeading = true;
     if (self->embeddedStyle && cssStyle.hasTextAlign()) {
       headerBlockStyle.alignment = cssStyle.textAlign;
     }
@@ -1333,18 +1334,10 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
         self->blockStyleStack.back().getCombinedBlockStyle(headerBlockStyle, BlockStyle::CombineAxis::Horizontal);
     self->blockStyleStack.push_back(accumulated);
     self->startNewTextBlock(accumulated.withoutBottom());
-    // keep-with-next: if the heading would fall near the bottom of the page with
-    // insufficient room for the heading's top margin + heading line + at least two body
-    // lines after it, start a fresh page so the heading is never stranded at the bottom.
-    const int lineHeight = static_cast<int>(self->renderer.getLineHeight(self->fontId) * self->lineCompression);
-    if (self->currentPage && !self->currentPage->elements.empty() &&
-        self->currentPageNextY + accumulated.topInset() + lineHeight * 3 > self->viewportHeight) {
-      self->commitPendingPage();
-      self->completePageFn(std::move(self->currentPage), self->xpathParagraphIndex, self->xpathListItemIndex);
-      self->completedPageCount++;
-      self->currentPage.reset(new (std::nothrow) Page());
-      self->currentPageNextY = 0;
-    }
+    // Heading stranding (a heading left alone at the page bottom with no room for what
+    // follows it) is no longer decided here, before the heading's text even exists. See the
+    // heading-run rescue in makePages(), which reacts once the heading's real wrapped line
+    // count -- and what actually comes after it -- are both known.
     self->boldUntilDepth = std::min(self->boldUntilDepth, self->depth);
     self->updateEffectiveInlineStyle();
   } else if (matches(name, BLOCK_TAGS, std::size(BLOCK_TAGS))) {
@@ -1375,13 +1368,30 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
       self->currentCssStyle = cssStyle;
       const auto accumulated = self->blockStyleStack.back().getCombinedBlockStyle(userAlignmentBlockStyle,
                                                                                   BlockStyle::CombineAxis::Horizontal);
-      self->blockStyleStack.push_back(accumulated);
-      self->startNewTextBlock(accumulated.withoutBottom());
+      if (strcmp(name, "li") == 0) {
+        // Hanging indent: indent all wrapped lines so they align with text, not bullet.
+        const int16_t hangPx = static_cast<int16_t>(self->renderer.getLineHeight(self->fontId) * self->lineCompression);
+        auto liStyle = accumulated;
+        liStyle.paddingLeft = static_cast<int16_t>(liStyle.paddingLeft + hangPx);
+        liStyle.textIndent = static_cast<int16_t>(-hangPx);
+        liStyle.textIndentDefined = true;
+        self->blockStyleStack.push_back(liStyle);
+        self->startNewTextBlock(liStyle.withoutBottom());
+        self->pendingListBullet = true;
+      } else {
+        self->blockStyleStack.push_back(accumulated);
+        self->startNewTextBlock(accumulated.withoutBottom());
+      }
       self->updateEffectiveInlineStyle();
 
-      if (strcmp(name, "li") == 0) {
-        self->currentTextBlock->addWord("\xe2\x80\xa2", EpdFontFamily::REGULAR, false, false, self->visibleTextOffset);
-        self->listItemBulletOnly = true;
+      // Note: the <li> bullet itself is NOT added here — it's deferred via
+      // pendingListBullet (set above) until the first real word is flushed, so an
+      // empty <li> never leaves a bullet-only block, and a nested block-level child
+      // (<p>, <div>, etc.) transparently reuses this still-empty block instead of
+      // getting a separate line (see startNewTextBlock's isEmpty() reuse branch).
+      if (strcmp(name, "pre") == 0) {
+        self->preDepth = self->depth;
+        self->preLineHasContent = false;
       }
     }
   } else if (matches(name, UNDERLINE_TAGS, std::size(UNDERLINE_TAGS))) {
@@ -1582,10 +1592,44 @@ void XMLCALL ChapterHtmlSlimParser::characterData(void* userData, const XML_Char
   }
 
   uint32_t nextCodepointOffset = callbackVisibleOffset;
+  const bool insidePre = self->preDepth < INT_MAX;
+
   for (int i = 0; i < len; i++) {
     const uint32_t codepointOffset = nextCodepointOffset;
     if (countVisibleOffsets && (static_cast<uint8_t>(s[i]) & 0xC0) != 0x80) {
       nextCodepointOffset++;
+    }
+
+    // <pre> mode: preserve line structure before the normal whitespace-collapse path.
+    // \n becomes a forced line break; leading spaces on each line are NBSP-linked to
+    // preserve indentation; mid-line spaces remain normal word boundaries.
+    if (insidePre) {
+      if (s[i] == '\r') continue;
+      if (s[i] == '\n') {
+        if (self->partWordBufferIndex > 0) self->flushPartWordBuffer();
+        self->startNewTextBlock(self->blockStyleStack.back().withoutBottom());
+        self->preLineHasContent = false;
+        continue;
+      }
+      if (s[i] == ' ' || s[i] == '\t') {
+        if (!self->preLineHasContent) {
+          // Leading whitespace: NBSP-link to preserve indentation
+          if (self->partWordBufferIndex > 0) self->flushPartWordBuffer();
+          self->partWordBuffer[0] = ' ';
+          self->partWordBufferIndex = 1;
+          self->partWordVisibleOffset = codepointOffset;
+          self->nextWordContinues = true;
+          self->flushPartWordBuffer();
+          self->nextWordContinues = true;
+        } else {
+          // Mid-line space: normal word boundary (allow reflow at viewport edge)
+          if (self->partWordBufferIndex > 0) self->flushPartWordBuffer();
+          self->nextWordContinues = false;
+        }
+        continue;
+      }
+      // Non-whitespace: mark line has content, fall through to normal character handling
+      self->preLineHasContent = true;
     }
 
     if (isWhitespace(s[i])) {
@@ -1926,6 +1970,13 @@ void XMLCALL ChapterHtmlSlimParser::endElement(void* userData, const XML_Char* n
 
   // Clear block style when leaving header or block elements
   if (headerOrBlockTag && !insideSkippedSubtree) {
+    if (strcmp(name, "pre") == 0) {
+      self->preDepth = INT_MAX;
+      self->preLineHasContent = false;
+    }
+    if (strcmp(name, "li") == 0) {
+      self->pendingListBullet = false;  // empty <li> — no content arrived to consume the bullet
+    }
     self->currentCssStyle.reset();
     self->updateEffectiveInlineStyle();
 
@@ -1942,13 +1993,6 @@ void XMLCALL ChapterHtmlSlimParser::endElement(void* userData, const XML_Char* n
       // Start a new text block with the parent style to prevent subsequent bare text
       // from inheriting the closed block style (e.g. alignment or margins).
       self->startNewTextBlock(self->blockStyleStack.back());
-    }
-
-    // </li> closes: if the bullet never got inline text (empty <li> or <li> with only
-    // block children that were flushed), clear the flag so the next sibling doesn't
-    // merge into this block.
-    if (strcmp(name, "li") == 0) {
-      self->listItemBulletOnly = false;
     }
   }
   if (strcmp(name, "body") == 0) {
@@ -2020,14 +2064,15 @@ bool ChapterHtmlSlimParser::beginParse() {
   return true;
 }
 
-ChapterHtmlSlimParser::ParseStatus ChapterHtmlSlimParser::parseStep() {
-  void* const buf = XML_GetBuffer(xmlParser_, PARSE_BUFFER_SIZE);
+ChapterHtmlSlimParser::ParseStatus ChapterHtmlSlimParser::parseStep(const bool useSmallChunks) {
+  const size_t bufferSize = useSmallChunks ? SMALL_PARSE_BUFFER_SIZE : PARSE_BUFFER_SIZE;
+  void* const buf = XML_GetBuffer(xmlParser_, bufferSize);
   if (!buf) {
     LOG_ERR("EHP", "Couldn't allocate memory for buffer");
     return ParseStatus::Error;
   }
 
-  const size_t len = parseFile_.read(buf, PARSE_BUFFER_SIZE);
+  const size_t len = parseFile_.read(buf, bufferSize);
 
   if (len == 0 && parseFile_.available() > 0) {
     LOG_ERR("EHP", "File read error");
@@ -2076,11 +2121,17 @@ bool ChapterHtmlSlimParser::finishParse() {
       pendingAnchorId.clear();
     }
     // End of chapter: no further paragraphs can rescue a widow from this page, so flush
-    // it (and any still-deferred page from the widow check) unconditionally.
+    // it (and any still-deferred page from the widow check) unconditionally -- except when
+    // it has no elements at all (e.g. the trailing block was an empty/whitespace-only
+    // heading used purely as a TOC anchor), in which case emitting it would just show the
+    // reader a blank page.
     setCurrentPageVisibleOffset(visibleTextOffset);
     commitPendingPage();
-    completePageFn(std::move(currentPage), xpathParagraphIndex, xpathListItemIndex, currentPageVisibleOffset);
-    completedPageCount++;
+    if (PageBreakDecisions::shouldEmitFinalPage(currentPage != nullptr,
+                                                 currentPage && !currentPage->elements.empty())) {
+      completePageFn(std::move(currentPage), xpathParagraphIndex, xpathListItemIndex, currentPageVisibleOffset);
+      completedPageCount++;
+    }
     currentPage.reset();
     currentTextBlock.reset();
   }
@@ -2093,7 +2144,7 @@ bool ChapterHtmlSlimParser::parseAndBuildPages() {
     return false;
   }
   for (;;) {
-    const ParseStatus status = parseStep();
+    const ParseStatus status = parseStep(false);  // one-shot: no caller budget to protect, use full chunks
     if (status == ParseStatus::Error) {
       abortParse();
       return false;
@@ -2176,22 +2227,65 @@ void ChapterHtmlSlimParser::makePages() {
 
   // Apply top spacing before the paragraph (stored in pixels)
   const BlockStyle& blockStyle = currentTextBlock->getBlockStyle();
+  // Captured before being overwritten below: whether the block completed by the *previous*
+  // makePages() call was a heading, i.e. whether this block continues a run of headings.
+  const bool previousBlockWasHeading = lastCompletedBlockWasHeading;
+  // Recorded before layout, since this call is what completes (lays out) this block --
+  // read as previousBlockWasHeading the next time makePages() runs.
+  lastCompletedBlockWasHeading = blockStyle.isHeading;
 
   // ORPHAN PREVENTION: if fewer than 2 lines would fit on the current page after
   // the paragraph's top inset, push the whole paragraph to a new page.
-  if (currentPage && !currentPage->elements.empty()) {
-    const int remaining = viewportHeight - currentPageNextY - blockStyle.topInset();
-    if (remaining < lineHeight * 2) {
-      commitPendingPage();
-      completePageFn(std::move(currentPage), xpathParagraphIndex, xpathListItemIndex);
-      completedPageCount++;
-      currentPage.reset(new (std::nothrow) Page());
-      if (!currentPage) {
-        LOG_ERR("EHP", "OOM: orphan prevention page");
-        return;
-      }
-      currentPageNextY = 0;
+  if (currentPage &&
+      PageBreakDecisions::shouldBreakForOrphan(!currentPage->elements.empty(), currentPageNextY,
+                                                blockStyle.topInset(), lineHeight, viewportHeight)) {
+    // HEADING RUN RESCUE: the page we're about to flush may end with an unbroken run of
+    // heading blocks (e.g. a title/subtitle pair) that has real content before it. Rather
+    // than flush that run in place -- stranding it with nothing following, the residual bug
+    // the old pre-layout heading check couldn't fully solve for multi-line headings -- pull
+    // the run's lines off this page and carry them onto the fresh page instead, so they stay
+    // paired with whatever comes next (this block). This is the same pop-and-prepend trick as
+    // the widow-prevention rescue below, generalized from one rescued line to a whole run.
+    std::vector<std::shared_ptr<PageElement>> rescuedHeadingRun;
+    if (previousBlockWasHeading && headingRunStartElementCount > 0 &&
+        headingRunStartElementCount < currentPage->elements.size()) {
+      rescuedHeadingRun.assign(currentPage->elements.begin() + static_cast<long>(headingRunStartElementCount),
+                                currentPage->elements.end());
+      currentPage->elements.resize(headingRunStartElementCount);
     }
+    const int16_t rescuedRunHeight = static_cast<int16_t>(currentPageNextY - headingRunStartY);
+
+    commitPendingPage();
+    completePageFn(std::move(currentPage), xpathParagraphIndex, xpathListItemIndex, currentPageVisibleOffset);
+    completedPageCount++;
+    currentPage.reset(new (std::nothrow) Page());
+    if (!currentPage) {
+      LOG_ERR("EHP", "OOM: orphan prevention page");
+      return;
+    }
+    currentPageNextY = 0;
+    currentPageVisibleOffsetSet = false;
+
+    if (!rescuedHeadingRun.empty()) {
+      for (auto& el : rescuedHeadingRun) {
+        el->yPos = static_cast<int16_t>(el->yPos - headingRunStartY);
+        currentPage->elements.push_back(std::move(el));
+      }
+      currentPageNextY = rescuedRunHeight;
+      setCurrentPageVisibleOffset(headingRunStartVisibleOffset);
+      // The run now sits at the start of the fresh page, with nothing before it.
+      headingRunStartY = 0;
+      headingRunStartElementCount = 0;
+    }
+  }
+
+  // Track where an unbroken run of heading blocks begins on the page (evaluated after the
+  // break above has settled currentPage/currentPageNextY), so a later break -- triggered by
+  // whatever block follows the run -- can rescue the whole run rather than just its last
+  // block. Left untouched for subsequent headings within the same run.
+  if (blockStyle.isHeading && !previousBlockWasHeading) {
+    headingRunStartY = currentPageNextY;
+    headingRunStartElementCount = currentPage ? currentPage->elements.size() : 0;
   }
 
   if (blockStyle.marginTop > 0) {
@@ -2207,9 +2301,24 @@ void ChapterHtmlSlimParser::makePages() {
       (horizontalInset < viewportWidth) ? static_cast<uint16_t>(viewportWidth - horizontalInset) : viewportWidth;
 
   const int pageCountBefore = completedPageCount;
+  uint32_t blockFirstLineOffset = 0;
+  bool blockFirstLineOffsetCaptured = false;
   currentTextBlock->layoutAndExtractLines(
       renderer, fontId, effectiveWidth,
-      [this](const std::shared_ptr<TextBlock>& textBlock, const uint32_t offset) { addLineToPage(textBlock, offset); });
+      [this, &blockFirstLineOffset, &blockFirstLineOffsetCaptured](const std::shared_ptr<TextBlock>& textBlock,
+                                                                     const uint32_t offset) {
+        if (!blockFirstLineOffsetCaptured) {
+          blockFirstLineOffset = offset;
+          blockFirstLineOffsetCaptured = true;
+        }
+        addLineToPage(textBlock, offset);
+      });
+
+  // If this block started a new heading run, remember its first line's offset in case the
+  // run later needs to be rescued onto a fresh page (see above).
+  if (blockStyle.isHeading && !previousBlockWasHeading && blockFirstLineOffsetCaptured) {
+    headingRunStartVisibleOffset = blockFirstLineOffset;
+  }
 
   // WIDOW PREVENTION: if exactly one line of this paragraph landed on a fresh page
   // (a typographic widow), rescue the last line from the pending page so the new

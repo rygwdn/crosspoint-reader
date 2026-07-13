@@ -43,7 +43,11 @@ namespace {
 // v40: Ruby groups remain intact when a large text block is soft-flushed.
 // v41: Simple HTML table rows are laid out as positioned columns instead of
 //      flattened paragraphs with synthetic row/cell labels.
-constexpr uint8_t SECTION_FILE_VERSION = 41;
+// v42: <pre> blocks preserve line breaks and leading-space indentation; <code> renders
+//      italic.
+// v43: <li> bullet deferred to first word block with hanging indent (changes layout for
+//      all lists).
+constexpr uint8_t SECTION_FILE_VERSION = 43;
 // Written into the version field while a build is in progress; patched to
 // SECTION_FILE_VERSION only when the build is finalized. An abandoned /
 // crash-interrupted .bin therefore carries version 0, which loadSectionFile rejects
@@ -428,7 +432,7 @@ bool Section::startBuild(const ReaderRenderSpec& spec, const std::function<void(
   return true;
 }
 
-bool Section::buildSomeMore(const int maxPages) {
+bool Section::buildSomeMore(const int maxPages, const unsigned long maxDurationMs) {
   if (!build_ || !build_->parser) {
     LOG_ERR("SCT", "buildSomeMore with no active build");
     return false;
@@ -437,8 +441,13 @@ bool Section::buildSomeMore(const int maxPages) {
   // pageCount stays pinned at the partial's watermark until the build passes it, which
   // would otherwise turn one "small" chunk into a blocking rebuild of the whole watermark.
   const int startCount = builtPageCount_;
+  const unsigned long startTime = millis();
+  // A time-budgeted call also asks the parser to feed itself smaller chunks (see
+  // SMALL_PARSE_BUFFER_SIZE), so an image-dense run of markup can't advance past several
+  // <img> tags -- each a synchronous SD extract -- before the check below gets to run.
+  const bool useSmallChunks = maxDurationMs > 0;
   for (;;) {
-    const auto status = build_->parser->parseStep();
+    const auto status = build_->parser->parseStep(useSmallChunks);
     if (status == ChapterHtmlSlimParser::ParseStatus::Error) {
       LOG_ERR("SCT", "Parse error during incremental build");
       abandonBuild();
@@ -447,8 +456,11 @@ bool Section::buildSomeMore(const int maxPages) {
     if (status == ChapterHtmlSlimParser::ParseStatus::Done) {
       return finalizeBuild();
     }
-    // ParseStatus::More: yield once we've laid out the requested number of pages.
-    if (maxPages > 0 && (builtPageCount_ - startCount) >= maxPages) {
+    // ParseStatus::More: yield once we've laid out the requested number of pages, or
+    // (for the background tick only -- maxDurationMs == 0 for render-path callers that
+    // need a specific page now) once the time budget for this call is spent.
+    if ((maxPages > 0 && (builtPageCount_ - startCount) >= maxPages) ||
+        (maxDurationMs > 0 && millis() - startTime >= maxDurationMs)) {
       build_->bytesConsumed = build_->parser->parseBytesConsumed();
       return true;
     }
