@@ -134,10 +134,24 @@ class ChapterHtmlSlimParser {
   // Offset of the most recently added line, so a page can be deferred without
   // losing track of what its (possibly rescuable) last line's offset was.
   uint32_t lastLineVisibleOffset = 0;
+  // Set by makePages() to whether the block it just laid out was a heading. Read (as
+  // previousBlockWasHeading, captured before this gets overwritten) by the next call to
+  // makePages() to detect runs of consecutive heading blocks (title/subtitle pairs, etc).
+  bool lastCompletedBlockWasHeading = false;
+  // Heading-run tracking: the page Y position, currentPage->elements count, and first line's
+  // visible offset at the point an unbroken run of consecutive heading blocks began on the
+  // current page. Captured when the run starts and left untouched across subsequent heading
+  // blocks in the same run. makePages() reads this when a later block doesn't fit (the
+  // ordinary orphan-prevention break) to rescue the *whole* heading run -- not just the last
+  // heading -- onto the fresh page, instead of leaving it stranded with nothing following it.
+  int16_t headingRunStartY = 0;
+  size_t headingRunStartElementCount = 0;
+  uint32_t headingRunStartVisibleOffset = 0;
 
   // <pre> whitespace-preservation tracking
   int preDepth = INT_MAX;          // depth at which <pre> was entered (INT_MAX = not in pre)
   bool preLineHasContent = false;  // true after first non-whitespace char in current pre line
+  bool pendingListBullet = false;  // bullet deferred until first word of <li> to avoid bullet-only blocks
 
   // Footnote link tracking
   bool insideFootnoteLink = false;
@@ -218,12 +232,21 @@ class ChapterHtmlSlimParser {
 
   // Resumable parse, for the incremental section builder. Drive as:
   //   if (!beginParse()) fail;
-  //   loop: switch (parseStep()) { More: keep going / yield; Done: finishParse(); Error: abortParse(); }
+  //   loop: switch (parseStep(useSmallChunks)) { More: keep going / yield; Done: finishParse(); Error: abortParse(); }
   // Pages are emitted via completePageFn as they complete during parseStep(), so
   // the caller can stop once enough pages are built and resume on a later tick.
+  // useSmallChunks: feed Expat a much smaller read chunk (see SMALL_PARSE_BUFFER_SIZE in the
+  // .cpp) so a single call can't advance past more than roughly one <img> tag. The normal
+  // PARSE_BUFFER_SIZE chunk is prose-sized and can contain a run of several image tags back to
+  // back; each one does a synchronous SD extract + dimension read that a page-count/time budget
+  // checked only *between* parseStep() calls can't see until the whole chunk is done. Pass true
+  // from a time-budgeted caller (the background build tick) so the caller's own budget check
+  // -- run after every parseStep() return -- gets a chance to yield roughly every image instead
+  // of every ~1KB of markup. The render-critical path (building the page about to be shown) has
+  // no time budget and passes false to parse at full chunk size as before.
   enum class ParseStatus { More, Done, Error };
   bool beginParse();
-  ParseStatus parseStep();
+  ParseStatus parseStep(bool useSmallChunks);
   bool finishParse();  // flush the trailing page and tear down; returns true
   void abortParse();   // tear down without flushing (error / abandon)
 
