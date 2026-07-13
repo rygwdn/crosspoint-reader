@@ -73,6 +73,10 @@ void clearLastLogs();
 // this returns true so getLastLogs() does not dump corrupt data into crash reports.
 bool sanitizeLogHead();
 
+// Register a callback invoked after every log line is added to the ring buffer.
+// Pass nullptr to unregister. Not thread-safe; call once at boot before tasks start.
+void setDiskLogCallback(void (*cb)(const char*));
+
 class MySerialImpl : public Print {
  public:
   void begin(unsigned long baud) { logSerial.begin(baud); }
