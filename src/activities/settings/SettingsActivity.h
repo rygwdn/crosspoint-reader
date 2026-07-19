@@ -24,6 +24,9 @@ enum class SettingAction {
   Language,
   DownloadFonts,
   TextSettings,
+#ifdef ENABLE_LOG_VIEWER
+  ViewLogs,
+#endif
 };
 
 struct SettingInfo {

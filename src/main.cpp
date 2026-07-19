@@ -416,6 +416,9 @@ void setup() {
 
   SETTINGS.loadFromFile();
   DiskLogger::begin();
+  // Both boot-time consumers of the frozen ring-buffer snapshot (checkPanic() above and
+  // DiskLogger::begin() above) have run; release the transient heap copy.
+  clearBootLogSnapshot();
   APP_STATE.loadFromFile();
   RECENT_BOOKS.loadFromFile();
   I18N.setLanguage(static_cast<Language>(SETTINGS.language));

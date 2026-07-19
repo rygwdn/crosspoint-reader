@@ -15,10 +15,41 @@ volatile bool DiskLogger::reentrant = false;
 // the ring buffer content persists in RTC memory and will be written next time.
 static SemaphoreHandle_t flushMutex = nullptr;
 
+std::string DiskLogger::getLogFilePath(int generation) {
+  if (generation <= 0) {
+    return LOG_BASE_PATH;
+  }
+  return std::string(LOG_BASE_PATH) + "." + std::to_string(generation);
+}
+
 void DiskLogger::begin() {
   flushMutex = xSemaphoreCreateMutex();
   assert(flushMutex != nullptr);
+
+  // Preserve anything left over from before this boot into the previous session's log
+  // file before rotating it out. Must happen before setDiskLogCallback() below so a
+  // LOG_ERR from a failed SD op here can't re-enter logLine()/writeRingBufferToFile().
+  if (SETTINGS.diskLogsEnabled) {
+    flushBootSnapshot();
+  }
+  rotateGenerations();
+
   setDiskLogCallback(&DiskLogger::logLine);
+}
+
+void DiskLogger::flushBootSnapshot() {
+  std::string content = getBootLogSnapshot();
+  if (content.empty()) return;
+
+  HalFile file = Storage.open(LOG_BASE_PATH, O_WRITE | O_CREAT);
+  if (!file) {
+    LOG_ERR("LOG", "Failed to open %s for boot-snapshot flush", LOG_BASE_PATH);
+    return;
+  }
+  file.seek(file.fileSize());
+  file.write(content.c_str(), content.size());
+  file.flush();
+  // file closes automatically via DESTRUCTOR_CLOSES_FILE
 }
 
 void DiskLogger::logLine(const char* /*line*/) {
@@ -37,18 +68,20 @@ void DiskLogger::flushNow() {
 }
 
 void DiskLogger::clear() {
-  Storage.remove(LOG_PATH);
-  Storage.remove(LOG_PATH_OLD);
+  for (int gen = 0; gen < MAX_LOG_GENERATIONS; gen++) {
+    Storage.remove(getLogFilePath(gen).c_str());
+  }
 }
 
-void DiskLogger::rotateIfNeeded() {
-  HalFile check = Storage.open(LOG_PATH);
-  if (!check) return;
-  const size_t sz = check.fileSize();
-  check.close();
-  if (sz <= MAX_LOG_FILE_SIZE) return;
-  Storage.remove(LOG_PATH_OLD);
-  Storage.rename(LOG_PATH, LOG_PATH_OLD);
+void DiskLogger::rotateGenerations() {
+  // Drop the oldest generation, then shift each remaining one up by one slot, oldest
+  // shift first so we never clobber a file we haven't moved yet. Storage.remove/rename
+  // are no-ops (return false, no log spam) when the source doesn't exist, so this is
+  // safe to call unconditionally even before any log file has ever been written.
+  Storage.remove(getLogFilePath(MAX_LOG_GENERATIONS - 1).c_str());
+  for (int gen = MAX_LOG_GENERATIONS - 2; gen >= 0; --gen) {
+    Storage.rename(getLogFilePath(gen).c_str(), getLogFilePath(gen + 1).c_str());
+  }
 }
 
 void DiskLogger::writeRingBufferToFile() {
@@ -62,9 +95,16 @@ void DiskLogger::writeRingBufferToFile() {
 
   std::string content = getLastLogs();
   if (!content.empty()) {
-    rotateIfNeeded();
+    HalFile check = Storage.open(LOG_BASE_PATH);
+    if (check) {
+      const size_t sz = check.fileSize();
+      check.close();  // must close before reopening the same path below
+      if (sz > MAX_LOG_FILE_SIZE) {
+        rotateGenerations();
+      }
+    }
     // Open with O_WRITE | O_CREAT (no truncate), seek to end for append semantics.
-    HalFile file = Storage.open(LOG_PATH, O_WRITE | O_CREAT);
+    HalFile file = Storage.open(LOG_BASE_PATH, O_WRITE | O_CREAT);
     if (file) {
       file.seek(file.fileSize());
       file.write(content.c_str(), content.size());

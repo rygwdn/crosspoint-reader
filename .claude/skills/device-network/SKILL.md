@@ -74,10 +74,13 @@ touching the user's place in the book.
 
 ## Reading logs
 
-The **live** debug log is `/.crosspoint/debug.log` (and `.old` for the
-rotated-out half), NOT a root-level `/debug.log` -- that path can exist as a
-stale leftover from an old session and will quietly mislead you if you fetch
-it instead. Fetch both and check line counts / timestamps before trusting one.
+The **live** debug log is `/.crosspoint/debug.log`, NOT a root-level
+`/debug.log` -- that path can exist as a stale leftover from an old session
+and will quietly mislead you if you fetch it instead. Older sessions are kept
+as `/.crosspoint/debug.log.1` through `.4` (oldest last; see
+`DiskLogger::getGenerationCount()` in `src/DiskLogger.h`), rotated one boot at
+a time -- `.1` is the previous boot, not necessarily the previous crash. Check
+line counts / timestamps across generations before trusting one.
 
 Logging to this file is only flushed every ~16 log calls (see
 `src/DiskLogger.h`), and only if `SETTINGS.diskLogsEnabled`. If you add
