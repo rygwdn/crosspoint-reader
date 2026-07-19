@@ -201,7 +201,8 @@ void LogViewerActivity::render(RenderLock&&) {
     const int lineHeight = renderer.getLineHeight(UI_10_FONT_ID);
     int y = marginTop;
     for (const auto& line : lines) {
-      renderer.drawText(UI_10_FONT_ID, marginLeft, y, line.c_str());
+      const std::string clipped = renderer.truncatedText(UI_10_FONT_ID, line.c_str(), viewportWidth);
+      renderer.drawText(UI_10_FONT_ID, marginLeft, y, clipped.c_str());
       y += lineHeight;
     }
 
