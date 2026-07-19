@@ -396,6 +396,9 @@ void setup() {
   HalSystem::checkPanic();
 
   DiskLogger::begin();
+  // Both boot-time consumers of the frozen ring-buffer snapshot (checkPanic() above and
+  // DiskLogger::begin() above) have run; release the transient heap copy.
+  clearBootLogSnapshot();
   APP_STATE.loadFromFile();
   const bool isSleepWake = wakeupReason == HalGPIO::WakeupReason::PowerButton;
   const bool isPersistedSleepWake = isSleepWake && !APP_STATE.showBootScreen;

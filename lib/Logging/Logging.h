@@ -73,6 +73,22 @@ void clearLastLogs();
 // this returns true so getLastLogs() does not dump corrupt data into crash reports.
 bool sanitizeLogHead();
 
+// Freezes a copy of the current ring buffer contents. Must be called as the very first
+// thing in HalSystem::begin(), before any LOG_* call runs — otherwise boot bring-up
+// noise (gpio/power/clock init) gets appended to the live ring buffer ahead of the
+// snapshot and can crowd out genuine pre-boot/crash context in the small (16-line)
+// buffer. Cheap (<=4KB one-shot heap copy, well before fonts/framebuffer allocate).
+void snapshotBootLogs();
+
+// Returns the frozen snapshot captured by snapshotBootLogs(), or an empty string if
+// none was taken (e.g. cold boot with no prior content). Consumers (crash report, disk
+// log flush) should prefer this over getLastLogs() early in boot, since the live buffer
+// may already contain interleaved boot-noise lines by the time they run.
+std::string getBootLogSnapshot();
+
+// Releases the snapshot buffer once all boot-time consumers are done with it.
+void clearBootLogSnapshot();
+
 // Register a callback invoked after every log line is added to the ring buffer.
 // Pass nullptr to unregister. Not thread-safe; call once at boot before tasks start.
 void setDiskLogCallback(void (*cb)(const char*));

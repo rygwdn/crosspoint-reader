@@ -138,6 +138,33 @@ void IRAM_ATTR __wrap_panic_print_backtrace(const void* frame, int core) {
 namespace HalSystem {
 
 void begin() {
+  // Freeze whatever was in the ring buffer before this function's own logging (and the
+  // gpio/power/clock bring-up that follows in setup()) appends anything new. This must
+  // run before the very first LOG_* call below: on a panic reboot the buffer already
+  // holds pre-crash context sized right up against the 16-line cap, and boot noise
+  // appended ahead of a snapshot can crowd that context out before checkPanic() ever
+  // gets to dump it (see crash_report.txt in git history for a near-miss where 7 boot
+  // lines landed in a 16-line buffer that already held 9 pre-crash lines).
+  const bool logStateCorrupt = sanitizeLogHead();
+  if (!logStateCorrupt) {
+    snapshotBootLogs();
+  }
+
+  if (!isRebootFromPanic()) {
+    // This is mostly for the first boot: initialize panic info and logs to empty state.
+    clearPanic();
+  } else if (logStateCorrupt) {
+    // Panic occurred before the ring buffer was ever initialized (e.g. a crash in a
+    // static constructor before begin() ran). logMessages is untrusted garbage, and
+    // there was nothing valid to snapshot above, so wipe it rather than let
+    // getLastLogs() dump corrupt data into the crash report.
+    clearLastLogs();
+  }
+  // else: panic reboot with a valid buffer. Preserve panicMessage/panicStack and leave
+  // the live ring buffer alone — checkPanic() reads the frozen snapshot captured above
+  // for crash_report.txt, not the live buffer, so it doesn't matter that the boot-time
+  // logging below keeps appending to it.
+
   LOG_INF("SYS", "Reset reason: %s", resetReasonName(esp_reset_reason()));
 
   // The Arduino core auto-initializes the TWDT from sdkconfig defaults
@@ -151,20 +178,6 @@ void begin() {
   const esp_err_t wdtErr = esp_task_wdt_reconfigure(&wdtConfig);
   if (wdtErr != ESP_OK) {
     LOG_ERR("SYS", "Failed to extend task watchdog timeout: %d", (int)wdtErr);
-  }
-
-  // On a panic reboot, preserve diagnostics until checkPanic() has tried to write them to the SD card.
-  // Ordinary boots clear any stale retained diagnostics.
-  if (!isRebootFromPanic()) {
-    clearPanic();
-  } else {
-    // Panic reboot: preserve logs and panic info, but clamp logHead in case the
-    // panic occurred before begin() ever ran (e.g. in a static constructor).
-    // If logHead was out of range, logMessages is also garbage — clear it so
-    // getLastLogs() does not dump corrupt data into the crash report.
-    if (sanitizeLogHead()) {
-      clearLastLogs();
-    }
   }
 }
 
@@ -207,7 +220,14 @@ std::string getPanicInfo(bool full) {
     info += "CrossPoint version: " CROSSPOINT_VERSION;
     info += "\n\nReset reason: " + std::string(resetReasonName(esp_reset_reason()));
     info += "\n\nPanic reason: " + std::string(panicMessage);
-    info += "\n\nLast logs:\n" + getLastLogs();
+    // Prefer the boot snapshot: by the time this runs, the live ring buffer already has
+    // boot-time bring-up logging appended after it (see the ordering comment in
+    // HalSystem::begin()). Fall back to the live buffer if no snapshot was taken.
+    std::string logs = getBootLogSnapshot();
+    if (logs.empty()) {
+      logs = getLastLogs();
+    }
+    info += "\n\nLast logs:\n" + logs;
     info += "\n\nStack memory:\n";
 
     auto toHex = [](uint32_t value) {

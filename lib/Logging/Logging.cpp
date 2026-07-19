@@ -118,3 +118,21 @@ void clearLastLogs() {
   logHead = 0;
   rtcLogMagic = LOG_RTC_MAGIC;
 }
+
+// Plain heap std::string, not RTC memory: this only needs to survive a few function
+// calls within the current boot (not across resets), and is cleared once consumed.
+static std::string bootLogSnapshot;
+static bool bootLogSnapshotTaken = false;
+
+void snapshotBootLogs() {
+  bootLogSnapshot = getLastLogs();
+  bootLogSnapshotTaken = true;
+}
+
+std::string getBootLogSnapshot() { return bootLogSnapshotTaken ? bootLogSnapshot : std::string(); }
+
+void clearBootLogSnapshot() {
+  bootLogSnapshot.clear();
+  bootLogSnapshot.shrink_to_fit();
+  bootLogSnapshotTaken = false;
+}

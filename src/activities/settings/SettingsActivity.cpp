@@ -15,6 +15,9 @@
 #include "FontDownloadActivity.h"
 #include "KOReaderSettingsActivity.h"
 #include "LanguageSelectActivity.h"
+#ifdef ENABLE_LOG_VIEWER
+#include "LogViewerActivity.h"
+#endif
 #include "MappedInputManager.h"
 #include "OpdsServerListActivity.h"
 #include "OtaUpdateActivity.h"
@@ -92,8 +95,12 @@ void SettingsActivity::rebuildSettingsLists() {
   systemSettings.push_back(SettingInfo::Action(StrId::STR_CHECK_UPDATES, SettingAction::CheckForUpdates));
   systemSettings.push_back(SettingInfo::Action(StrId::STR_SD_FIRMWARE_UPDATE, SettingAction::SdFirmwareUpdate));
   systemSettings.push_back(SettingInfo::Action(StrId::STR_LANGUAGE, SettingAction::Language));
+#ifdef ENABLE_LOG_VIEWER
+  systemSettings.push_back(SettingInfo::Action(StrId::STR_VIEW_LOGS, SettingAction::ViewLogs));
+#endif
   readerSettings.insert(readerSettings.begin(),
                         SettingInfo::Action(StrId::STR_TEXT_SETTINGS, SettingAction::TextSettings));
+  // Insert "Manage Fonts" right after the font family setting so users discover it naturally
   readerSettings.insert(readerSettings.begin() + 1,
                         SettingInfo::Action(StrId::STR_MANAGE_FONTS, SettingAction::DownloadFonts));
   readerSettings.push_back(SettingInfo::Action(StrId::STR_CUSTOMISE_STATUS_BAR, SettingAction::CustomiseStatusBar));
@@ -370,6 +377,11 @@ void SettingsActivity::toggleCurrentSetting() {
                                  rebuildSettingsLists();
                                });
         break;
+#ifdef ENABLE_LOG_VIEWER
+      case SettingAction::ViewLogs:
+        startActivityForResult(std::make_unique<LogViewerActivity>(renderer, mappedInput), resultHandler);
+        break;
+#endif
       case SettingAction::None:
         // Do nothing
         break;
