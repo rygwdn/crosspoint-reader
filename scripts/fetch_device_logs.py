@@ -9,6 +9,12 @@ the device has rebooted through (see DiskLogger::MAX_LOG_GENERATIONS) -- a
 failure. The device also sleeps and drops WiFi periodically, so the whole
 run retries a few times before treating it as actually unreachable.
 
+Requests go through `curl` rather than Python's urllib: in some sandboxed
+environments, urllib's socket.getaddrinfo() fails to resolve .local mDNS
+hostnames even though curl and the OS resolver succeed against the exact
+same host -- same class of issue as the port-81 raw-socket problem documented
+in ws_upload.py, just showing up for hostname resolution instead.
+
 Usage:
   python3 scripts/fetch_device_logs.py                      # crosspoint.local, ./device_logs/
   python3 scripts/fetch_device_logs.py --host 192.168.0.143
@@ -16,9 +22,8 @@ Usage:
 """
 import argparse
 import json
+import subprocess
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 
 DEFAULT_HOST = "crosspoint.local"
@@ -31,6 +36,24 @@ STATUS_CHECK_TIMEOUT = 15.0
 FETCH_TIMEOUT = 15.0
 
 
+def curl_get(url: str, timeout: float, connect_timeout: float) -> tuple[bytes, int]:
+    """Fetch url via curl. Returns (body, http_status); raises ConnectionError if curl
+    itself couldn't complete the request at all (DNS failure, connection refused,
+    timeout) -- a real HTTP error response (404, 500, ...) is not an exception here,
+    it's a normal (body, code) return so callers can tell "device said no" apart from
+    "couldn't even reach the device"."""
+    result = subprocess.run(
+        ["curl", "-s", "-m", str(timeout), "--connect-timeout", str(connect_timeout), "-w", "\n%{http_code}", url],
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        raise ConnectionError(f"curl exit {result.returncode}: {result.stderr.decode(errors='replace').strip()}")
+    output = result.stdout
+    idx = output.rfind(b"\n")
+    body, code = (output[:idx], output[idx + 1 :]) if idx != -1 else (b"", output)
+    return body, int(code.strip() or 0)
+
+
 def fetch_one(host: str, remote_path: str, timeout: float = FETCH_TIMEOUT, retries: int = 2, delay: float = 2.0):
     """Returns (bytes, None) on success, (None, "missing") on 404, (None, reason) on
     unreachable after retries. A 404 is not retried -- it's a real answer, not a
@@ -39,13 +62,13 @@ def fetch_one(host: str, remote_path: str, timeout: float = FETCH_TIMEOUT, retri
     last_reason = "unknown error"
     for attempt in range(1, retries + 1):
         try:
-            with urllib.request.urlopen(url, timeout=timeout) as resp:
-                return resp.read(), None
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
+            body, code = curl_get(url, timeout=timeout, connect_timeout=timeout)
+            if code == 200:
+                return body, None
+            if code == 404:
                 return None, "missing"
-            last_reason = f"HTTP {e.code}"
-        except (urllib.error.URLError, OSError, TimeoutError) as e:
+            last_reason = f"HTTP {code}"
+        except ConnectionError as e:
             last_reason = str(e)
         if attempt < retries:
             time.sleep(delay)
@@ -53,14 +76,17 @@ def fetch_one(host: str, remote_path: str, timeout: float = FETCH_TIMEOUT, retri
 
 
 def check_device(host: str, retries: int = 3, delay: float = 3.0) -> dict | None:
+    url = f"http://{host}/api/status"
     for attempt in range(1, retries + 1):
         try:
-            with urllib.request.urlopen(f"http://{host}/api/status", timeout=STATUS_CHECK_TIMEOUT) as resp:
-                return json.loads(resp.read().decode())
-        except (urllib.error.URLError, OSError, TimeoutError) as e:
+            body, code = curl_get(url, timeout=STATUS_CHECK_TIMEOUT, connect_timeout=STATUS_CHECK_TIMEOUT)
+            if code == 200:
+                return json.loads(body.decode())
+            print(f"  [{attempt}/{retries}] {host} responded HTTP {code}")
+        except ConnectionError as e:
             print(f"  [{attempt}/{retries}] {host} not responding yet ({e})")
-            if attempt < retries:
-                time.sleep(delay)
+        if attempt < retries:
+            time.sleep(delay)
     return None
 
 

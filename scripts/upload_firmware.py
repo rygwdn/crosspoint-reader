@@ -6,13 +6,17 @@ just the standard verb instead of its WebSocket upload protocol. This does
 NOT flash the firmware; it just gets the .bin onto the SD card so you can
 flash it from the device itself via Settings -> Update Firmware from SD.
 
-Resilient by design, because this hardware is flaky in exactly these ways:
-  - crosspoint.local (mDNS) routinely fails to resolve even when the device
-    is reachable -- falls back to trying the hostname anyway (some
-    resolvers/networks do handle it) and gives a clear next step if it can't.
+Resilient by design, because this hardware (and this environment) is flaky in
+exactly these ways:
   - The device sleeps and drops WiFi periodically -- both the pre-flight
     status check and the PUT itself retry a few times with generous timeouts
     before giving up, rather than failing on the first slow response.
+  - In some sandboxed environments, Python's own resolver (socket.getaddrinfo,
+    which urllib uses) fails to resolve crosspoint.local's mDNS name even
+    though curl and the OS resolver succeed against the exact same host --
+    same class of issue as the port-81 raw-socket problem documented in
+    ws_upload.py. Every network call here goes through curl instead of
+    urllib/socket for exactly this reason.
 
 Usage:
   python3 scripts/upload_firmware.py                      # crosspoint.local, .pio/build/default/firmware.bin
@@ -24,8 +28,6 @@ import json
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -65,18 +67,36 @@ def default_remote_name() -> str:
     return f"firmware-{commit}{suffix}.bin"
 
 
+def curl_get(url: str, timeout: float, connect_timeout: float) -> tuple[bytes, int]:
+    """Fetch url via curl rather than urllib -- see the module docstring for why.
+    Returns (body, http_status); raises ConnectionError if curl couldn't complete the
+    request at all (DNS failure, connection refused, timeout)."""
+    result = subprocess.run(
+        ["curl", "-s", "-m", str(timeout), "--connect-timeout", str(connect_timeout), "-w", "\n%{http_code}", url],
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        raise ConnectionError(f"curl exit {result.returncode}: {result.stderr.decode(errors='replace').strip()}")
+    output = result.stdout
+    idx = output.rfind(b"\n")
+    body, code = (output[:idx], output[idx + 1 :]) if idx != -1 else (b"", output)
+    return body, int(code.strip() or 0)
+
+
 def check_device(host: str, retries: int = 3, delay: float = 3.0) -> dict | None:
     """GET /api/status a few times before giving up -- the device sleeps and
     periodically drops off WiFi, so one failed request doesn't mean it's gone."""
     url = f"http://{host}/api/status"
     for attempt in range(1, retries + 1):
         try:
-            with urllib.request.urlopen(url, timeout=STATUS_CHECK_TIMEOUT) as resp:
-                return json.loads(resp.read().decode())
-        except (urllib.error.URLError, OSError, TimeoutError) as e:
+            body, code = curl_get(url, timeout=STATUS_CHECK_TIMEOUT, connect_timeout=STATUS_CHECK_TIMEOUT)
+            if code == 200:
+                return json.loads(body.decode())
+            print(f"  [{attempt}/{retries}] {host} responded HTTP {code}")
+        except ConnectionError as e:
             print(f"  [{attempt}/{retries}] {host} not responding yet ({e})")
-            if attempt < retries:
-                time.sleep(delay)
+        if attempt < retries:
+            time.sleep(delay)
     return None
 
 
