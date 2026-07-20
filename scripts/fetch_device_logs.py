@@ -27,9 +27,11 @@ DEFAULT_OUT = Path("device_logs")
 # plus this many rotated backups (debug.log.1 .. debug.log.<N-1>).
 DEFAULT_GENERATIONS = 5
 CRASH_REPORT_REMOTE = "/crash_report.txt"
+STATUS_CHECK_TIMEOUT = 15.0
+FETCH_TIMEOUT = 15.0
 
 
-def fetch_one(host: str, remote_path: str, timeout: float = 10.0, retries: int = 2, delay: float = 2.0):
+def fetch_one(host: str, remote_path: str, timeout: float = FETCH_TIMEOUT, retries: int = 2, delay: float = 2.0):
     """Returns (bytes, None) on success, (None, "missing") on 404, (None, reason) on
     unreachable after retries. A 404 is not retried -- it's a real answer, not a
     transient failure."""
@@ -53,7 +55,7 @@ def fetch_one(host: str, remote_path: str, timeout: float = 10.0, retries: int =
 def check_device(host: str, retries: int = 3, delay: float = 3.0) -> dict | None:
     for attempt in range(1, retries + 1):
         try:
-            with urllib.request.urlopen(f"http://{host}/api/status", timeout=8) as resp:
+            with urllib.request.urlopen(f"http://{host}/api/status", timeout=STATUS_CHECK_TIMEOUT) as resp:
                 return json.loads(resp.read().decode())
         except (urllib.error.URLError, OSError, TimeoutError) as e:
             print(f"  [{attempt}/{retries}] {host} not responding yet ({e})")

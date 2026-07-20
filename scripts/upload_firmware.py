@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 """
-Upload a built firmware.bin to a CrossPoint Reader device's SD card, over the
-device's binary WebSocket file-upload protocol (port 81) -- the same one its
-own "Files" web UI uses. This does NOT flash the firmware; it just gets the
-.bin onto the SD card so you can flash it from the device itself via
-Settings -> Update Firmware from SD.
+Upload a built firmware.bin to a CrossPoint Reader device's SD card, over
+plain WebDAV PUT (port 80) -- the same server the device's own web UI uses,
+just the standard verb instead of its WebSocket upload protocol. This does
+NOT flash the firmware; it just gets the .bin onto the SD card so you can
+flash it from the device itself via Settings -> Update Firmware from SD.
 
 Resilient by design, because this hardware is flaky in exactly these ways:
   - crosspoint.local (mDNS) routinely fails to resolve even when the device
     is reachable -- falls back to trying the hostname anyway (some
     resolvers/networks do handle it) and gives a clear next step if it can't.
-  - The device sleeps and drops WiFi periodically -- the pre-flight status
-    check retries a few times before giving up, and the upload itself
-    (ws_upload.upload) retries on a mid-transfer broken pipe, which is normal
-    on weak signal, not a bug.
+  - The device sleeps and drops WiFi periodically -- both the pre-flight
+    status check and the PUT itself retry a few times with generous timeouts
+    before giving up, rather than failing on the first slow response.
 
 Usage:
   python3 scripts/upload_firmware.py                      # crosspoint.local, .pio/build/default/firmware.bin
@@ -30,13 +29,19 @@ import urllib.request
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-WS_UPLOAD = REPO_ROOT / ".claude" / "skills" / "device-network" / "scripts" / "ws_upload.py"
 
 DEFAULT_HOST = "crosspoint.local"
 DEFAULT_LOCAL_CANDIDATES = [
     REPO_ROOT / ".pio" / "build" / "default" / "firmware.bin",
     REPO_ROOT / ".pio" / "build" / "gh_release" / "firmware.bin",
 ]
+STATUS_CHECK_TIMEOUT = 15.0
+# The PUT itself needs much more headroom than the status check: a multi-MB
+# firmware image over weak WiFi (RSSI in the -80s is routine on this hardware,
+# see WebDAVHandler.cpp's PROPFIND comments) can legitimately take well over a
+# minute at the ~100-300KB/s observed on real devices.
+PUT_CONNECT_TIMEOUT = 15
+PUT_MAX_TIME = 180
 
 
 def git(*args):
@@ -66,13 +71,39 @@ def check_device(host: str, retries: int = 3, delay: float = 3.0) -> dict | None
     url = f"http://{host}/api/status"
     for attempt in range(1, retries + 1):
         try:
-            with urllib.request.urlopen(url, timeout=8) as resp:
+            with urllib.request.urlopen(url, timeout=STATUS_CHECK_TIMEOUT) as resp:
                 return json.loads(resp.read().decode())
         except (urllib.error.URLError, OSError, TimeoutError) as e:
             print(f"  [{attempt}/{retries}] {host} not responding yet ({e})")
             if attempt < retries:
                 time.sleep(delay)
     return None
+
+
+def upload_via_webdav(host: str, port: int, local_path: Path, remote_path: str, retries: int, retry_delay: float) -> bool:
+    url = f"http://{host}:{port}{remote_path}"
+    for attempt in range(1, retries + 1):
+        if attempt > 1:
+            print(f"=== Retry {attempt}/{retries} ===")
+        result = subprocess.run(
+            [
+                "curl",
+                "--fail",  # non-2xx (e.g. 403 from a protected path, 500) is a failure, not "done"
+                "--connect-timeout",
+                str(PUT_CONNECT_TIMEOUT),
+                "--max-time",
+                str(PUT_MAX_TIME),
+                "-T",
+                str(local_path),
+                url,
+            ]
+        )
+        if result.returncode == 0:
+            return True
+        print(f"  curl exited {result.returncode}")
+        if attempt < retries:
+            time.sleep(retry_delay)
+    return False
 
 
 def main():
@@ -82,15 +113,12 @@ def main():
     )
     parser.add_argument("--host", default=DEFAULT_HOST, help=f"Device host/IP (default: {DEFAULT_HOST})")
     parser.add_argument("--name", default=None, help="Remote filename (default: firmware-<commit>[-dirty].bin)")
-    parser.add_argument("--dir", default="/", help="Remote directory (default: /)")
-    parser.add_argument("--port", type=int, default=81, help="WebSocket upload port (default: 81)")
-    parser.add_argument("--retries", type=int, default=3, help="Upload retries on a dropped connection (default: 3)")
+    parser.add_argument("--dir", default="/", help="Remote directory on the device (default: /, must already exist)")
+    parser.add_argument("--port", type=int, default=80, help="WebDAV/HTTP port (default: 80)")
+    parser.add_argument("--retries", type=int, default=3, help="PUT retries on failure (default: 3)")
+    parser.add_argument("--retry-delay", type=float, default=3.0, help="Seconds between retries (default: 3)")
     parser.add_argument("--skip-status-check", action="store_true", help="Skip the pre-flight /api/status check")
     args = parser.parse_args()
-
-    if not WS_UPLOAD.exists():
-        print(f"error: expected {WS_UPLOAD} (WebSocket upload implementation) but it's missing", file=sys.stderr)
-        sys.exit(1)
 
     local_path = Path(args.local_path) if args.local_path else default_local_path()
     if local_path is None:
@@ -102,32 +130,29 @@ def main():
         sys.exit(1)
 
     remote_name = args.name or default_remote_name()
+    remote_dir = args.dir.rstrip("/")  # "" for the default "/", so the join below never double-slashes
+    remote_path = f"{remote_dir}/{remote_name}"
 
     print(f"Checking device at {args.host}...")
-    if args.skip_status_check:
-        status = None
-    else:
-        status = check_device(args.host)
+    status = None if args.skip_status_check else check_device(args.host)
     if status:
         print(f"  reachable: version={status.get('version')} rssi={status.get('rssi')} uptime={status.get('uptime')}")
     else:
         print(f"  {args.host} did not respond to /api/status -- proceeding anyway (may just be asleep/mid-reconnect)")
 
-    print(f"Uploading {local_path} ({local_path.stat().st_size} bytes) as {args.dir}{remote_name} ...")
-    sys.path.insert(0, str(WS_UPLOAD.parent))
-    import ws_upload  # noqa: E402
-
-    ok = ws_upload.upload(args.host, args.port, str(local_path), remote_name, args.dir, retries=args.retries)
+    print(f"Uploading {local_path} ({local_path.stat().st_size} bytes) to {remote_path} via WebDAV PUT ...")
+    ok = upload_via_webdav(args.host, args.port, local_path, remote_path, args.retries, args.retry_delay)
     if not ok:
         print(
             f"\nUpload failed after {args.retries} attempt(s). If {args.host} doesn't resolve, "
-            "try again with --host <device-ip>.",
+            "try again with --host <device-ip>. If --dir isn't '/', make sure that directory "
+            "already exists on the device -- WebDAV PUT won't create it.",
             file=sys.stderr,
         )
         sys.exit(1)
 
     print(
-        f"\nDone. {remote_name} is on the device's SD card at {args.dir}{remote_name}.\n"
+        f"\nDone. {remote_name} is on the device's SD card at {remote_path}.\n"
         "Flash it from the device: Settings -> Update Firmware from SD."
     )
 
