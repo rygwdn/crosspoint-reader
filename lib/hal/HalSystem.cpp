@@ -170,9 +170,17 @@ void begin() {
   // The Arduino core auto-initializes the TWDT from sdkconfig defaults
   // (5000ms) before setup() runs, so reconfigure rather than init. See the
   // comment on EXTENDED_TASK_WDT_TIMEOUT_MS above for why.
+  //
+  // idle_core_mask is a bitmask (1 << i = core i's idle task is watched), NOT a
+  // boolean/"don't care" -- 0 means no core's idle task is subscribed. Nothing else in
+  // this codebase (or the Arduino core's loopTask) ever calls esp_task_wdt_add(), so a
+  // mask of 0 silently disabled the watchdog's only safety net: a genuine hang/deadlock
+  // (not an explicit abort()) would spin forever with no reset and no crash_report.txt,
+  // which is exactly the "requires a hard reboot, never get a crash report" case this
+  // was meant to catch. ESP32-C3 has one core, so watch core 0.
   const esp_task_wdt_config_t wdtConfig = {
       .timeout_ms = EXTENDED_TASK_WDT_TIMEOUT_MS,
-      .idle_core_mask = 0,
+      .idle_core_mask = 1 << 0,
       .trigger_panic = true,
   };
   const esp_err_t wdtErr = esp_task_wdt_reconfigure(&wdtConfig);
