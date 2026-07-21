@@ -49,6 +49,24 @@ constexpr uint32_t XTCBZ_MAGIC = 0x005A5458;
 // "XTZH" = 0x58, 0x54, 0x5A, 0x48 -- extended container, 2-bit high quality mode (XTH page data).
 constexpr uint32_t XTCBZH_MAGIC = 0x485A5458;
 
+// XTCBZ/XTCBZH only: an "overlay" page (--mode magnify in cbz2xteink) stores
+// just the small bounding-box patch that the writer's compositing actually
+// touched, plus the (patchX, patchY) canvas position to paste it at -- not a
+// full, mostly-redundant canvas-sized bitmap. Every subpage group's first
+// page (its "full" view) is always a normal, non-overlay page; later
+// magnify/textzoom subpages in that group reference it implicitly (via
+// XtcReaderActivity's existing subpage-group lookup, not a stored field --
+// an overlay page is always composited onto its *own* group's full page) and
+// are reconstructed by pasting this patch onto that page's already-decoded
+// bitmap. Same bitmap packing as XTG/XTH, just a bigger header (see
+// XtgOverlayPageHeader) -- plain XTC/XTCH files never contain these (no
+// subpage groups to overlay onto), so this doesn't touch that format at all.
+// "XTGO\0"->little-endian is "XTGO" bytes, 'O' for overlay.
+// "XTGO" = 0x58, 0x54, 0x47, 0x4F
+constexpr uint32_t XTG_OVERLAY_MAGIC = 0x4F475458;
+// "XTHO" = 0x58, 0x54, 0x48, 0x4F
+constexpr uint32_t XTH_OVERLAY_MAGIC = 0x4F485458;
+
 // XTeink X4 display resolution
 constexpr uint16_t DISPLAY_WIDTH = 480;
 constexpr uint16_t DISPLAY_HEIGHT = 800;
@@ -119,6 +137,19 @@ struct XtgPageHeader {
   //   First plane: Bit1 for all pixels
   //   Second plane: Bit2 for all pixels
   //   pixelValue = (bit1 << 1) | bit2
+};
+#pragma pack(pop)
+
+// XTG/XTH overlay page data header (26 bytes) -- XtgPageHeader plus a
+// trailing paste position. `base.width`/`base.height` are the *patch's own*
+// dimensions (smaller than the canvas), not the canvas size -- see
+// XTG_OVERLAY_MAGIC. Composition (not duplication), same rationale as
+// XtcbzHeader wrapping XtcHeader.
+#pragma pack(push, 1)
+struct XtgOverlayPageHeader {
+  XtgPageHeader base;  // 0x00: identical layout/semantics to XtgPageHeader (22 bytes)
+  uint16_t patchX;     // 0x16: canvas X position to paste this page's bitmap at
+  uint16_t patchY;     // 0x18: canvas Y position to paste this page's bitmap at
 };
 #pragma pack(pop)
 

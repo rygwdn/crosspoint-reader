@@ -12,6 +12,7 @@
 #include <InflateStream.h>
 #include <Logging.h>
 
+#include <algorithm>
 #include <cstring>
 #include <vector>
 
@@ -549,62 +550,127 @@ const std::vector<SubpageGroup>& XtcParser::getSubpageGroups() {
 
 bool XtcParser::getPageInfo(uint32_t pageIndex, PageInfo& info) { return readPageTableEntry(pageIndex, info); }
 
-size_t XtcParser::loadPage(uint32_t pageIndex, uint8_t* buffer, size_t bufferSize) {
+bool XtcParser::getPageOverlayInfo(uint32_t pageIndex, PageOverlayInfo& info) {
+  info = PageOverlayInfo{};
+
+  PageInfo page;
+  if (!readPageTableEntry(pageIndex, page)) {
+    return false;
+  }
+  if (!ensureFileOpen()) {
+    return false;
+  }
+  if (!m_file.seek64(page.offset)) {
+    return false;
+  }
+
+  // Always read the larger (overlay) header size -- for a plain page the
+  // trailing 4 bytes actually belong to the start of its bitmap data, which
+  // is harmless here since this is a peek-only read (doesn't affect any
+  // other call's file position; loadPage() does its own independent seek).
+  XtgOverlayPageHeader header;
+  size_t bytesRead = m_file.read(reinterpret_cast<uint8_t*>(&header), sizeof(header));
+  if (bytesRead < sizeof(XtgPageHeader)) {
+    return false;
+  }
+
+  const bool isOverlayMagic = (header.base.magic == XTG_OVERLAY_MAGIC || header.base.magic == XTH_OVERLAY_MAGIC);
+  info.isOverlay = isOverlayMagic;
+  info.width = header.base.width;
+  info.height = header.base.height;
+  if (isOverlayMagic && bytesRead == sizeof(XtgOverlayPageHeader)) {
+    info.patchX = header.patchX;
+    info.patchY = header.patchY;
+  }
+  return true;
+}
+
+bool XtcParser::readPageBitmapHeader(uint32_t pageIndex, PageInfo& page, XtgPageHeader& pageHeader,
+                                     size_t& bitmapSize) {
   if (!m_isOpen) {
     m_lastError = XtcError::FILE_NOT_FOUND;
-    return 0;
+    return false;
   }
 
   if (pageIndex >= m_header.pageCount) {
     m_lastError = XtcError::PAGE_OUT_OF_RANGE;
-    return 0;
+    return false;
   }
 
-  PageInfo page;
   if (!readPageTableEntry(pageIndex, page)) {
     m_lastError = XtcError::READ_ERROR;
-    return 0;
+    return false;
   }
 
   if (!ensureFileOpen()) {
     m_lastError = XtcError::FILE_NOT_FOUND;
-    return 0;
+    return false;
   }
 
   // Seek to page data
   if (!m_file.seek64(page.offset)) {
     LOG_DBG("XTC", "Failed to seek to page %u at offset %llu", pageIndex, static_cast<unsigned long long>(page.offset));
     m_lastError = XtcError::READ_ERROR;
-    return 0;
+    return false;
   }
 
-  // Read page header (XTG for 1-bit, XTH for 2-bit - same structure)
-  XtgPageHeader pageHeader;
-  size_t headerRead = m_file.read(reinterpret_cast<uint8_t*>(&pageHeader), sizeof(XtgPageHeader));
-  if (headerRead != sizeof(XtgPageHeader)) {
+  // Read page header. Always read the larger (overlay) header size first --
+  // for a plain (non-overlay) page the trailing 4 bytes actually belong to
+  // the start of its bitmap data, so the code below explicitly re-seeks to
+  // the correct post-header offset once it knows which kind this is, rather
+  // than trusting this read's end position.
+  XtgOverlayPageHeader rawHeader;
+  size_t headerRead = m_file.read(reinterpret_cast<uint8_t*>(&rawHeader), sizeof(rawHeader));
+  if (headerRead < sizeof(XtgPageHeader)) {
     LOG_DBG("XTC", "Failed to read page header for page %u", pageIndex);
     m_lastError = XtcError::READ_ERROR;
-    return 0;
+    return false;
   }
+  pageHeader = rawHeader.base;
 
-  // Verify page magic (XTG for 1-bit, XTH for 2-bit)
-  const uint32_t expectedMagic = (m_bitDepth == 2) ? XTH_MAGIC : XTG_MAGIC;
+  // Verify page magic: XTG/XTH for a normal page, or XTG_OVERLAY_MAGIC/
+  // XTH_OVERLAY_MAGIC (XTCBZ/XTCBZH only -- see XtcTypes.h) for an overlay
+  // patch page, matching this file's own bit depth either way.
+  const bool isOverlay = (pageHeader.magic == XTG_OVERLAY_MAGIC || pageHeader.magic == XTH_OVERLAY_MAGIC);
+  const uint32_t expectedMagic = isOverlay ? (m_bitDepth == 2 ? XTH_OVERLAY_MAGIC : XTG_OVERLAY_MAGIC)
+                                            : (m_bitDepth == 2 ? XTH_MAGIC : XTG_MAGIC);
   if (pageHeader.magic != expectedMagic) {
     LOG_DBG("XTC", "Invalid page magic for page %u: 0x%08X (expected 0x%08X)", pageIndex, pageHeader.magic,
             expectedMagic);
     m_lastError = XtcError::INVALID_MAGIC;
-    return 0;
+    return false;
   }
 
-  // Calculate bitmap size based on bit depth
+  // Seek to the correct offset past whichever header size this page
+  // actually has, since the single over-sized read above may have
+  // consumed 4 bytes of bitmap data for a plain (non-overlay) page.
+  const size_t actualHeaderSize = isOverlay ? sizeof(XtgOverlayPageHeader) : sizeof(XtgPageHeader);
+  if (!m_file.seek64(page.offset + actualHeaderSize)) {
+    LOG_DBG("XTC", "Failed to seek past page header for page %u", pageIndex);
+    m_lastError = XtcError::READ_ERROR;
+    return false;
+  }
+
+  // Calculate bitmap size based on bit depth. pageHeader.width/height are
+  // this page's *own* on-disk bitmap dimensions -- the patch's own
+  // (smaller) size for an overlay page, not the canvas size.
   // XTG (1-bit): Row-major, ((width+7)/8) * height bytes
   // XTH (2-bit): Two bit planes, column-major, ((width * height + 7) / 8) * 2 bytes
-  size_t bitmapSize;
   if (m_bitDepth == 2) {
     // XTH: two bit planes, each containing (width * height) bits rounded up to bytes
     bitmapSize = ((static_cast<size_t>(pageHeader.width) * pageHeader.height + 7) / 8) * 2;
   } else {
     bitmapSize = ((pageHeader.width + 7) / 8) * pageHeader.height;
+  }
+  return true;
+}
+
+size_t XtcParser::loadPage(uint32_t pageIndex, uint8_t* buffer, size_t bufferSize) {
+  PageInfo page;
+  XtgPageHeader pageHeader;
+  size_t bitmapSize;
+  if (!readPageBitmapHeader(pageIndex, page, pageHeader, bitmapSize)) {
+    return 0;
   }
 
   // Check buffer size
@@ -675,88 +741,81 @@ size_t XtcParser::decompressPage(const XtgPageHeader& pageHeader, uint8_t* buffe
   return bufferSize;
 }
 
-XtcError XtcParser::loadPageStreaming(uint32_t pageIndex,
-                                      std::function<void(const uint8_t* data, size_t size, size_t offset)> callback,
-                                      size_t chunkSize) {
-  if (!m_isOpen) {
-    return XtcError::FILE_NOT_FOUND;
-  }
-
-  if (pageIndex >= m_header.pageCount) {
-    return XtcError::PAGE_OUT_OF_RANGE;
-  }
-
+bool XtcParser::streamPageBitmap(uint32_t pageIndex, PageChunkFn fn, void* ctx) {
   PageInfo page;
-  if (!readPageTableEntry(pageIndex, page)) {
-    return XtcError::READ_ERROR;
-  }
-
-  if (!ensureFileOpen()) {
-    return XtcError::FILE_NOT_FOUND;
-  }
-
-  // Seek to page data
-  if (!m_file.seek64(page.offset)) {
-    return XtcError::READ_ERROR;
-  }
-
-  // Read and skip page header (XTG for 1-bit, XTH for 2-bit)
   XtgPageHeader pageHeader;
-  size_t headerRead = m_file.read(reinterpret_cast<uint8_t*>(&pageHeader), sizeof(XtgPageHeader));
-  const uint32_t expectedMagic = (m_bitDepth == 2) ? XTH_MAGIC : XTG_MAGIC;
-  if (headerRead != sizeof(XtgPageHeader) || pageHeader.magic != expectedMagic) {
-    return XtcError::READ_ERROR;
-  }
-
-  // Calculate bitmap size based on bit depth
-  // XTG (1-bit): Row-major, ((width+7)/8) * height bytes
-  // XTH (2-bit): Two bit planes, ((width * height + 7) / 8) * 2 bytes
   size_t bitmapSize;
-  if (m_bitDepth == 2) {
-    bitmapSize = ((static_cast<size_t>(pageHeader.width) * pageHeader.height + 7) / 8) * 2;
-  } else {
-    bitmapSize = ((pageHeader.width + 7) / 8) * pageHeader.height;
+  if (!readPageBitmapHeader(pageIndex, page, pageHeader, bitmapSize)) {
+    return false;
   }
 
-  if (pageHeader.compression != 0 && pageHeader.compression != 1) {
-    return XtcError::DECOMPRESSION_ERROR;
-  }
+  // Small stack chunk buffer (well under the 256-byte local-variable budget):
+  // the whole point of this path is to never hold a full-bitmap-sized buffer,
+  // so this is intentionally tiny rather than sized for throughput.
+  constexpr size_t kChunkSize = 128;
+  uint8_t chunk[kChunkSize];
 
-  if (pageHeader.compression == 1) {
-    // No caller currently streams a compressed page (loadPageStreaming has no callers
-    // today -- see git history), so this favors simplicity over an incremental
-    // decompress-and-deliver loop: decompress the whole page once, then hand it to the
-    // callback in the requested chunk size.
-    std::vector<uint8_t> decompressed(bitmapSize);
-    if (decompressPage(pageHeader, decompressed.data(), bitmapSize) != bitmapSize) {
-      return XtcError::DECOMPRESSION_ERROR;
+  if (pageHeader.compression == 0) {
+    size_t offset = 0;
+    while (offset < bitmapSize) {
+      const size_t want = std::min(kChunkSize, bitmapSize - offset);
+      const size_t got = m_file.read(chunk, want);
+      if (got != want) {
+        LOG_DBG("XTC", "Page stream read error for page %u: expected %u, got %u", pageIndex, want, got);
+        m_lastError = XtcError::READ_ERROR;
+        return false;
+      }
+      fn(ctx, chunk, got, offset);
+      offset += got;
     }
-    size_t totalDelivered = 0;
-    while (totalDelivered < bitmapSize) {
-      const size_t toDeliver = std::min(chunkSize, bitmapSize - totalDelivered);
-      callback(decompressed.data() + totalDelivered, toDeliver, totalDelivered);
-      totalDelivered += toDeliver;
-    }
-    return XtcError::OK;
+    m_lastError = XtcError::OK;
+    return true;
   }
 
-  // Read in chunks
-  std::vector<uint8_t> chunk(chunkSize);
-  size_t totalRead = 0;
-
-  while (totalRead < bitmapSize) {
-    size_t toRead = std::min(chunkSize, bitmapSize - totalRead);
-    size_t bytesRead = m_file.read(chunk.data(), toRead);
-
-    if (bytesRead == 0) {
-      return XtcError::READ_ERROR;
-    }
-
-    callback(chunk.data(), bytesRead, totalRead);
-    totalRead += bytesRead;
+  if (pageHeader.compression != 1) {
+    LOG_DBG("XTC", "Unsupported page compression %u for page %u", pageHeader.compression, pageIndex);
+    m_lastError = XtcError::DECOMPRESSION_ERROR;
+    return false;
   }
 
-  return XtcError::OK;
+  constexpr size_t kReadChunkSize = 1024;
+  std::vector<uint8_t> readBuf(kReadChunkSize);
+  PageInflateCtx inflateCtx;
+  inflateCtx.file = &m_file;
+  inflateCtx.remaining = pageHeader.dataSize;
+  inflateCtx.readBuf = readBuf.data();
+  inflateCtx.readBufSize = readBuf.size();
+
+  InflateStream inflate;
+  if (!inflate.init(true)) {  // streaming: 32KB window instead of a full-bitmap output buffer
+    LOG_ERR("XTC", "Failed to init streaming inflate for page %u", pageIndex);
+    m_lastError = XtcError::DECOMPRESSION_ERROR;
+    return false;
+  }
+  inflate.setFill(pageInflateFillCallback, &inflateCtx);
+
+  size_t offset = 0;
+  while (offset < bitmapSize) {
+    size_t produced = 0;
+    const InflateStream::Status status = inflate.readAtMost(chunk, std::min(kChunkSize, bitmapSize - offset), &produced);
+    if (produced > 0) {
+      fn(ctx, chunk, produced, offset);
+      offset += produced;
+    }
+    if (status == InflateStream::Status::Error) {
+      LOG_DBG("XTC", "Streaming decompression failed for page %u at offset %zu", pageIndex, offset);
+      m_lastError = XtcError::DECOMPRESSION_ERROR;
+      return false;
+    }
+    if (status == InflateStream::Status::Done && offset < bitmapSize) {
+      LOG_DBG("XTC", "Streaming decompression truncated for page %u: got %zu of %zu bytes", pageIndex, offset,
+              bitmapSize);
+      m_lastError = XtcError::DECOMPRESSION_ERROR;
+      return false;
+    }
+  }
+  m_lastError = XtcError::OK;
+  return true;
 }
 
 bool XtcParser::isValidXtcFile(const char* filepath) {

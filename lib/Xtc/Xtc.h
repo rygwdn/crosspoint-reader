@@ -78,6 +78,11 @@ class Xtc {
   uint16_t getPageHeight() const;
   uint8_t getBitDepth() const;  // 1 = XTC (1-bit), 2 = XTCH (2-bit)
 
+  // XTCBZ/XTCBZH only -- see xtc::XtcParser::PageOverlayInfo/getPageOverlayInfo.
+  // Always isOverlay=false for a plain XTC/XTCH file or a non-overlay page.
+  using PageOverlayInfo = xtc::XtcParser::PageOverlayInfo;
+  bool getPageOverlayInfo(uint32_t pageIndex, PageOverlayInfo& info) const;
+
   /**
    * Load page bitmap data
    * @param pageIndex Page index (0-based)
@@ -87,16 +92,11 @@ class Xtc {
    */
   size_t loadPage(uint32_t pageIndex, uint8_t* buffer, size_t bufferSize) const;
 
-  /**
-   * Load page with streaming callback
-   * @param pageIndex Page index
-   * @param callback Callback for each chunk
-   * @param chunkSize Chunk size
-   * @return Error code
-   */
-  xtc::XtcError loadPageStreaming(uint32_t pageIndex,
-                                  std::function<void(const uint8_t* data, size_t size, size_t offset)> callback,
-                                  size_t chunkSize = 1024) const;
+  // See xtc::XtcParser::streamPageBitmap/PageChunkFn -- streams a page's decoded
+  // bitmap in small chunks (via InflateStream's windowed mode for compressed
+  // pages) instead of requiring one buffer sized to the whole bitmap.
+  using PageChunkFn = xtc::XtcParser::PageChunkFn;
+  bool streamPageBitmap(uint32_t pageIndex, PageChunkFn fn, void* ctx) const;
 
   // Progress calculation
   uint8_t calculateProgress(uint32_t currentPage) const;

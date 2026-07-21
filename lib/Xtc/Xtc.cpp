@@ -545,6 +545,14 @@ uint8_t Xtc::getBitDepth() const {
   return parser->getBitDepth();
 }
 
+bool Xtc::getPageOverlayInfo(uint32_t pageIndex, PageOverlayInfo& info) const {
+  if (!loaded || !parser) {
+    info = PageOverlayInfo{};
+    return false;
+  }
+  return const_cast<xtc::XtcParser*>(parser.get())->getPageOverlayInfo(pageIndex, info);
+}
+
 size_t Xtc::loadPage(uint32_t pageIndex, uint8_t* buffer, size_t bufferSize) const {
   if (!loaded || !parser) {
     return 0;
@@ -552,13 +560,11 @@ size_t Xtc::loadPage(uint32_t pageIndex, uint8_t* buffer, size_t bufferSize) con
   return const_cast<xtc::XtcParser*>(parser.get())->loadPage(pageIndex, buffer, bufferSize);
 }
 
-xtc::XtcError Xtc::loadPageStreaming(uint32_t pageIndex,
-                                     std::function<void(const uint8_t* data, size_t size, size_t offset)> callback,
-                                     size_t chunkSize) const {
+bool Xtc::streamPageBitmap(uint32_t pageIndex, PageChunkFn fn, void* ctx) const {
   if (!loaded || !parser) {
-    return xtc::XtcError::FILE_NOT_FOUND;
+    return false;
   }
-  return const_cast<xtc::XtcParser*>(parser.get())->loadPageStreaming(pageIndex, callback, chunkSize);
+  return const_cast<xtc::XtcParser*>(parser.get())->streamPageBitmap(pageIndex, fn, ctx);
 }
 
 uint8_t Xtc::calculateProgress(uint32_t currentPage) const {

@@ -18,6 +18,115 @@
 #include "components/UITheme.h"
 #include "fontIds.h"
 
+namespace {
+// Blits `patchBuffer` (an overlay page's own on-disk packed XTH bitmap,
+// `patchWidth` x `patchHeight` -- see Xtc::PageOverlayInfo) onto `pageBuffer`
+// (the canvas-sized base/full page bitmap, `canvasWidth` x `canvasHeight`) at
+// (patchX, patchY). XTH-only (bitDepth==2): the 1-bit (XTG) case is handled
+// by drawBasePageChunk/drawPatchChunk below instead, streaming straight to
+// the display without ever materializing a canvas-sized buffer. XTH still
+// needs the whole decoded bitmap resident, since its grayscale rendering
+// reads the same pixels across four separate passes (see renderPage()).
+void blitOverlayPatchXth(const uint8_t* patchBuffer, uint16_t patchWidth, uint16_t patchHeight, uint8_t* pageBuffer,
+                         uint16_t canvasWidth, uint16_t canvasHeight, uint16_t patchX, uint16_t patchY) {
+  // Two bit planes, column-major (right-to-left), 8 vertical pixels/byte --
+  // same layout XtcReaderActivity::renderPage()'s own getPixelValue lambda reads.
+  const size_t patchColBytes = (static_cast<size_t>(patchHeight) + 7) / 8;
+  const size_t canvasColBytes = (static_cast<size_t>(canvasHeight) + 7) / 8;
+  const size_t patchPlaneSize = (static_cast<size_t>(patchWidth) * patchHeight + 7) / 8;
+  const size_t canvasPlaneSize = (static_cast<size_t>(canvasWidth) * canvasHeight + 7) / 8;
+  const uint8_t* patchPlane1 = patchBuffer;
+  const uint8_t* patchPlane2 = patchBuffer + patchPlaneSize;
+  uint8_t* canvasPlane1 = pageBuffer;
+  uint8_t* canvasPlane2 = pageBuffer + canvasPlaneSize;
+
+  for (uint16_t py = 0; py < patchHeight; py++) {
+    for (uint16_t px = 0; px < patchWidth; px++) {
+      const size_t srcCol = static_cast<size_t>(patchWidth) - 1 - px;
+      const size_t srcByte = srcCol * patchColBytes + py / 8;
+      const size_t srcBit = 7 - (py % 8);
+      const uint8_t bit1 = (patchPlane1[srcByte] >> srcBit) & 1;
+      const uint8_t bit2 = (patchPlane2[srcByte] >> srcBit) & 1;
+
+      const uint16_t cx = patchX + px;
+      const uint16_t cy = patchY + py;
+      const size_t dstCol = static_cast<size_t>(canvasWidth) - 1 - cx;
+      const size_t dstByte = dstCol * canvasColBytes + cy / 8;
+      const size_t dstBit = 7 - (cy % 8);
+      if (bit1) {
+        canvasPlane1[dstByte] |= (1 << dstBit);
+      } else {
+        canvasPlane1[dstByte] &= ~(1 << dstBit);
+      }
+      if (bit2) {
+        canvasPlane2[dstByte] |= (1 << dstBit);
+      } else {
+        canvasPlane2[dstByte] &= ~(1 << dstBit);
+      }
+    }
+  }
+}
+
+// XTG (1-bit) streaming render: fed to XtcParser::streamPageBitmap() as
+// successive, non-overlapping byte ranges of the base page's row-major
+// bitmap, drawn straight to the display as they arrive -- no canvas-sized
+// buffer is ever allocated. Plain function pointer + ctx (not std::function)
+// per CLAUDE.md's render-path guidance.
+struct BasePageDrawCtx {
+  GfxRenderer* renderer;
+  uint16_t pageWidth;
+};
+
+void drawBasePageChunk(void* vctx, const uint8_t* data, size_t size, size_t offset) {
+  auto* ctx = static_cast<BasePageDrawCtx*>(vctx);
+  const size_t rowBytes = (static_cast<size_t>(ctx->pageWidth) + 7) / 8;
+  for (size_t i = 0; i < size; i++) {
+    const size_t byteIndex = offset + i;
+    const int y = static_cast<int>(byteIndex / rowBytes);
+    const size_t xByte = byteIndex % rowBytes;
+    const uint8_t b = data[i];
+    for (int bit = 0; bit < 8; bit++) {
+      const size_t x = xByte * 8 + static_cast<size_t>(bit);
+      if (x >= ctx->pageWidth) break;
+      const bool isBlack = !((b >> (7 - bit)) & 1);  // XTC: 0 = black, 1 = white
+      // White pixels are already cleared by clearScreen(), so only draw black.
+      if (isBlack) {
+        ctx->renderer->drawPixel(static_cast<int>(x), y, true);
+      }
+    }
+  }
+}
+
+// XTG overlay patch streaming render: same idea as drawBasePageChunk, but
+// offset onto the canvas at (patchX, patchY) and drawn unconditionally (both
+// black and white), since this overwrites whatever the base page pass already
+// drew at these canvas coordinates -- matching blitOverlayPatchXth's
+// unconditional set/clear for the XTH case.
+struct PatchDrawCtx {
+  GfxRenderer* renderer;
+  uint16_t patchWidth;
+  uint16_t patchX;
+  uint16_t patchY;
+};
+
+void drawPatchChunk(void* vctx, const uint8_t* data, size_t size, size_t offset) {
+  auto* ctx = static_cast<PatchDrawCtx*>(vctx);
+  const size_t rowBytes = (static_cast<size_t>(ctx->patchWidth) + 7) / 8;
+  for (size_t i = 0; i < size; i++) {
+    const size_t byteIndex = offset + i;
+    const size_t py = byteIndex / rowBytes;
+    const size_t xByte = byteIndex % rowBytes;
+    const uint8_t b = data[i];
+    for (int bit = 0; bit < 8; bit++) {
+      const size_t px = xByte * 8 + static_cast<size_t>(bit);
+      if (px >= ctx->patchWidth) break;
+      const bool isBlack = !((b >> (7 - bit)) & 1);
+      ctx->renderer->drawPixel(static_cast<int>(ctx->patchX + px), static_cast<int>(ctx->patchY + py), isBlack);
+    }
+  }
+}
+}  // namespace
+
 bool XtcReaderActivity::loadBook() {
   auto loadedXtc = makeUniqueNoThrow<Xtc>(bookPath, "/.crosspoint");
   if (!loadedXtc) {
@@ -273,45 +382,107 @@ void XtcReaderActivity::renderPage() {
   const uint16_t pageHeight = xtc->getPageHeight();
   const uint8_t bitDepth = xtc->getBitDepth();
 
-  size_t pageBufferSize;
-  if (bitDepth == 2) {
-    pageBufferSize = ((static_cast<size_t>(pageWidth) * pageHeight + 7) / 8) * 2;
-  } else {
-    pageBufferSize = ((pageWidth + 7) / 8) * pageHeight;
+  // XTCBZ/XTCBZH only: an overlay page (see Xtc::PageOverlayInfo) stores just
+  // a small patch to be pasted onto its subpage group's own "full" page
+  // bitmap, instead of a full standalone canvas -- resolve that base page
+  // below rather than currentPage directly, then draw the patch on top once
+  // it's loaded too. Always false for a plain XTC/XTCH file or a non-overlay
+  // XTCBZ/XTCBZH page, in which case this is a no-op and rendering proceeds
+  // exactly as before.
+  Xtc::PageOverlayInfo overlayInfo;
+  const bool isOverlay = xtc->getPageOverlayInfo(currentPage, overlayInfo) && overlayInfo.isOverlay;
+  uint32_t bitmapSourcePage = currentPage;
+
+  if (isOverlay) {
+    const int groupIndex = findCurrentSubpageGroupIndex();
+    if (groupIndex < 0) {
+      // Shouldn't happen -- an overlay page only ever exists inside a
+      // subpage group -- but fail safe rather than compositing garbage.
+      LOG_ERR("XTR", "Overlay page %lu has no subpage group", currentPage);
+      renderer.clearScreen();
+      renderer.drawCenteredText(UI_12_FONT_ID, 300, tr(STR_PAGE_LOAD_ERROR), true, EpdFontFamily::BOLD);
+      renderer.displayBuffer();
+      return;
+    }
+    bitmapSourcePage = xtc->getSubpageGroups()[groupIndex].startPage;
   }
-
-  uint8_t* pageBuffer = static_cast<uint8_t*>(malloc(pageBufferSize));
-  if (!pageBuffer) {
-    LOG_ERR("XTR", "Failed to allocate page buffer (%lu bytes)", pageBufferSize);
-    renderer.clearScreen();
-    renderer.drawCenteredText(UI_12_FONT_ID, 300, tr(STR_MEMORY_ERROR), true, EpdFontFamily::BOLD);
-    renderer.displayBuffer();
-    return;
-  }
-
-  // Load page data. This is where a compressed (.xtcbz/.xtcbzh) page runs through
-  // XtcParser::decompressPage()/InflateStream -- log + flush around it so a
-  // hang here is pinpointed instead of just showing the last loadBook() checkpoint.
-  LOG_DBG("XTR", "Loading page %lu (bufferSize=%lu, bitDepth=%u, heap: %u)", currentPage, pageBufferSize, bitDepth,
-          (unsigned)ESP.getFreeHeap());
-  DiskLogger::flushNow();
-  size_t bytesRead = xtc->loadPage(currentPage, pageBuffer, pageBufferSize);
-  LOG_DBG("XTR", "Loaded page %lu: %lu bytes (heap: %u)", currentPage, bytesRead, (unsigned)ESP.getFreeHeap());
-  if (bytesRead == 0) {
-    LOG_ERR("XTR", "Failed to load page %lu: bufferSize=%lu bitDepth=%u error=%s", currentPage, pageBufferSize,
-            bitDepth, xtc::errorToString(xtc->getLastError()));
-    free(pageBuffer);
-    renderer.clearScreen();
-    renderer.drawCenteredText(UI_12_FONT_ID, 300, tr(STR_PAGE_LOAD_ERROR), true, EpdFontFamily::BOLD);
-    renderer.displayBuffer();
-    return;
-  }
-
-  renderer.clearScreen();
-
-  const uint16_t maxSrcY = pageHeight;
 
   if (bitDepth == 2) {
+    // XTH needs the whole decoded canvas resident in RAM -- its grayscale
+    // rendering below reads the same pixels across four separate passes, so
+    // unlike the 1-bit path this still buffers pageBuffer/patchBuffer via
+    // malloc (unchanged from before this page/patch buffer was made
+    // streaming for the 1-bit case).
+    const size_t pageBufferSize = ((static_cast<size_t>(pageWidth) * pageHeight + 7) / 8) * 2;
+    uint8_t* pageBuffer = static_cast<uint8_t*>(malloc(pageBufferSize));
+    if (!pageBuffer) {
+      LOG_ERR("XTR", "Failed to allocate page buffer (%lu bytes)", pageBufferSize);
+      renderer.clearScreen();
+      renderer.drawCenteredText(UI_12_FONT_ID, 300, tr(STR_MEMORY_ERROR), true, EpdFontFamily::BOLD);
+      renderer.displayBuffer();
+      return;
+    }
+
+    // Load page data (the subpage group's base/full page when compositing an
+    // overlay, else currentPage itself). This is where a compressed
+    // (.xtcbz/.xtcbzh) page runs through XtcParser::decompressPage()/
+    // InflateStream -- log + flush around it so a hang here is pinpointed
+    // instead of just showing the last loadBook() checkpoint.
+    LOG_DBG("XTR", "Loading page %lu (bufferSize=%lu, bitDepth=%u, heap: %u)", bitmapSourcePage, pageBufferSize,
+            bitDepth, (unsigned)ESP.getFreeHeap());
+    DiskLogger::flushNow();
+    size_t bytesRead = xtc->loadPage(bitmapSourcePage, pageBuffer, pageBufferSize);
+    LOG_DBG("XTR", "Loaded page %lu: %lu bytes (heap: %u)", bitmapSourcePage, bytesRead, (unsigned)ESP.getFreeHeap());
+    if (bytesRead == 0) {
+      LOG_ERR("XTR", "Failed to load page %lu: bufferSize=%lu bitDepth=%u error=%s", bitmapSourcePage,
+              pageBufferSize, bitDepth, xtc::errorToString(xtc->getLastError()));
+      free(pageBuffer);
+      renderer.clearScreen();
+      renderer.drawCenteredText(UI_12_FONT_ID, 300, tr(STR_PAGE_LOAD_ERROR), true, EpdFontFamily::BOLD);
+      renderer.displayBuffer();
+      return;
+    }
+
+    if (isOverlay) {
+      const size_t patchBufferSize = ((static_cast<size_t>(overlayInfo.width) * overlayInfo.height + 7) / 8) * 2;
+      uint8_t* patchBuffer = static_cast<uint8_t*>(malloc(patchBufferSize));
+      if (!patchBuffer) {
+        LOG_ERR("XTR", "Failed to allocate overlay patch buffer (%lu bytes)", patchBufferSize);
+        free(pageBuffer);
+        renderer.clearScreen();
+        renderer.drawCenteredText(UI_12_FONT_ID, 300, tr(STR_MEMORY_ERROR), true, EpdFontFamily::BOLD);
+        renderer.displayBuffer();
+        return;
+      }
+      LOG_DBG("XTR", "Loading overlay patch %lu (%ux%u @ %u,%u, bufferSize=%lu, heap: %u)", currentPage,
+              overlayInfo.width, overlayInfo.height, overlayInfo.patchX, overlayInfo.patchY, patchBufferSize,
+              (unsigned)ESP.getFreeHeap());
+      size_t patchBytesRead = xtc->loadPage(currentPage, patchBuffer, patchBufferSize);
+      if (patchBytesRead == 0) {
+        LOG_ERR("XTR", "Failed to load overlay patch %lu: error=%s", currentPage,
+                xtc::errorToString(xtc->getLastError()));
+        free(patchBuffer);
+        free(pageBuffer);
+        renderer.clearScreen();
+        renderer.drawCenteredText(UI_12_FONT_ID, 300, tr(STR_PAGE_LOAD_ERROR), true, EpdFontFamily::BOLD);
+        renderer.displayBuffer();
+        return;
+      }
+      blitOverlayPatchXth(patchBuffer, overlayInfo.width, overlayInfo.height, pageBuffer, pageWidth, pageHeight,
+                          overlayInfo.patchX, overlayInfo.patchY);
+      free(patchBuffer);
+    }
+
+    // Clear screen first
+    renderer.clearScreen();
+
+    // XTH 2-bit mode: Two bit planes, column-major order
+    // - Columns scanned right to left (x = width-1 down to 0)
+    // - 8 vertical pixels per byte (MSB = topmost pixel in group)
+    // - First plane: Bit1, Second plane: Bit2
+    // - Pixel value = (bit1 << 1) | bit2
+    // - Grayscale: 0=White, 1=Dark Grey, 2=Light Grey, 3=Black
+
     const size_t planeSize = (static_cast<size_t>(pageWidth) * pageHeight + 7) / 8;
     const uint8_t* plane1 = pageBuffer;
     const uint8_t* plane2 = pageBuffer + planeSize;
@@ -401,25 +572,40 @@ void XtcReaderActivity::renderPage() {
 
     LOG_DBG("XTR", "Rendered page %lu/%lu (2-bit grayscale)", currentPage + 1, xtc->getPageCount());
     return;
-  } else {
-    const size_t srcRowBytes = (pageWidth + 7) / 8;
-
-    for (uint16_t srcY = 0; srcY < maxSrcY; srcY++) {
-      const size_t srcRowStart = srcY * srcRowBytes;
-
-      for (uint16_t srcX = 0; srcX < pageWidth; srcX++) {
-        const size_t srcByte = srcRowStart + srcX / 8;
-        const size_t srcBit = 7 - (srcX % 8);
-        const bool isBlack = !((pageBuffer[srcByte] >> srcBit) & 1);
-
-        if (isBlack) {
-          renderer.drawPixel(srcX, srcY, true);
-        }
-      }
-    }
   }
 
-  free(pageBuffer);
+  // 1-bit (XTG) mode: stream the decoded bitmap straight to the display as it
+  // decodes -- no canvas-sized buffer is ever allocated, so there is nothing
+  // to malloc/free per page turn (this used to be the source of the
+  // fragmentation reported in the overlay-patch case especially, where a
+  // second, variably-sized buffer was allocated on top of the first-page
+  // buffer on every single page turn).
+  renderer.clearScreen();
+
+  LOG_DBG("XTR", "Streaming page %lu (bitDepth=1, heap: %u)", bitmapSourcePage, (unsigned)ESP.getFreeHeap());
+  DiskLogger::flushNow();
+  BasePageDrawCtx baseCtx{&renderer, pageWidth};
+  if (!xtc->streamPageBitmap(bitmapSourcePage, drawBasePageChunk, &baseCtx)) {
+    LOG_ERR("XTR", "Failed to stream page %lu: error=%s", bitmapSourcePage, xtc::errorToString(xtc->getLastError()));
+    renderer.clearScreen();
+    renderer.drawCenteredText(UI_12_FONT_ID, 300, tr(STR_PAGE_LOAD_ERROR), true, EpdFontFamily::BOLD);
+    renderer.displayBuffer();
+    return;
+  }
+
+  if (isOverlay) {
+    LOG_DBG("XTR", "Streaming overlay patch %lu (%ux%u @ %u,%u, heap: %u)", currentPage, overlayInfo.width,
+            overlayInfo.height, overlayInfo.patchX, overlayInfo.patchY, (unsigned)ESP.getFreeHeap());
+    PatchDrawCtx patchCtx{&renderer, overlayInfo.width, overlayInfo.patchX, overlayInfo.patchY};
+    if (!xtc->streamPageBitmap(currentPage, drawPatchChunk, &patchCtx)) {
+      LOG_ERR("XTR", "Failed to stream overlay patch %lu: error=%s", currentPage,
+              xtc::errorToString(xtc->getLastError()));
+      renderer.clearScreen();
+      renderer.drawCenteredText(UI_12_FONT_ID, 300, tr(STR_PAGE_LOAD_ERROR), true, EpdFontFamily::BOLD);
+      renderer.displayBuffer();
+      return;
+    }
+  }
 
   if (SETTINGS.statusBarSpec().xtcMode == CrossPointSettings::XTC_STATUS_BAR_MODE::XTC_STATUS_BAR_TOP) {
     renderStatusBarOverlay(renderer, StatusBarOverlayPosition::Top);

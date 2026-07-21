@@ -9,7 +9,6 @@
 
 #include <HalStorage.h>
 
-#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -48,6 +47,30 @@ class XtcParser {
   bool getPageInfo(uint32_t pageIndex, PageInfo& info);
 
   /**
+   * Peek a page's own header (XTCBZ/XTCBZH only) to learn whether it's an
+   * overlay page (see XTG_OVERLAY_MAGIC/XTH_OVERLAY_MAGIC in XtcTypes.h) --
+   * a small patch meant to be pasted onto its subpage group's own "full"
+   * page bitmap at (patchX, patchY), rather than read as a standalone
+   * canvas-sized page. Always false/zero for a plain XTC/XTCH file or a
+   * non-overlay XTCBZ/XTCBZH page. `width`/`height` are the page's own
+   * on-disk bitmap dimensions either way -- the patch's own (smaller) size
+   * for an overlay page, matching what loadPage() will actually read.
+   *
+   * @param pageIndex Page index (0-based)
+   * @param info Output overlay info
+   * @return true if the page table entry and header were read successfully
+   *         (regardless of whether the page turns out to be an overlay)
+   */
+  struct PageOverlayInfo {
+    bool isOverlay = false;
+    uint16_t width = 0;
+    uint16_t height = 0;
+    uint16_t patchX = 0;
+    uint16_t patchY = 0;
+  };
+  bool getPageOverlayInfo(uint32_t pageIndex, PageOverlayInfo& info);
+
+  /**
    * Load page bitmap (raw 1-bit data, skipping XTG header)
    *
    * @param pageIndex Page index (0-based)
@@ -57,18 +80,26 @@ class XtcParser {
    */
   size_t loadPage(uint32_t pageIndex, uint8_t* buffer, size_t bufferSize);
 
+  // Plain function pointer (not std::function) so this never heap-allocates a
+  // closure on the render path -- ctx carries whatever state the caller needs.
+  // `offset` is the absolute byte offset within the page's decoded bitmap;
+  // successive calls cover non-overlapping, in-order ranges of the whole thing.
+  using PageChunkFn = void (*)(void* ctx, const uint8_t* data, size_t size, size_t offset);
+
   /**
-   * Streaming page load
-   * Memory-efficient method that reads page data in chunks.
+   * Stream a page's decoded bitmap in small chunks without ever holding the
+   * whole bitmap in one buffer. Compressed (XTCBZ/XTCBZH) pages are decoded
+   * via InflateStream's streaming/windowed mode (a fixed 32KB window, reused
+   * from the lent framebuffer when a FrameBufferLoan is active -- see
+   * InflateStream.h) instead of loadPage()'s one-shot mode, which requires
+   * one contiguous buffer sized to the whole bitmap.
    *
-   * @param pageIndex Page index
-   * @param callback Callback function to receive data chunks
-   * @param chunkSize Chunk size (default: 1024 bytes)
-   * @return Error code
+   * @param pageIndex Page index (0-based)
+   * @param fn Called 1+ times with successive chunks of the bitmap
+   * @param ctx Passed back to fn verbatim
+   * @return true on success
    */
-  XtcError loadPageStreaming(uint32_t pageIndex,
-                             std::function<void(const uint8_t* data, size_t size, size_t offset)> callback,
-                             size_t chunkSize = 1024);
+  bool streamPageBitmap(uint32_t pageIndex, PageChunkFn fn, void* ctx);
 
   // Get title/author from metadata
   std::string getTitle() const { return m_title; }
@@ -128,6 +159,11 @@ class XtcParser {
   // back to fileSize if nothing qualifies as a tighter bound.
   uint64_t nextSectionOffset(uint64_t sectionStart, uint64_t fileSize, uint64_t extraCandidate = 0) const;
   bool readPageTableEntry(uint32_t pageIndex, PageInfo& info);
+  // Shared by loadPage() and streamPageBitmap(): seeks past a page's header
+  // (handling the overlay-vs-plain header size ambiguity, see loadPage()'s
+  // original comment) and computes its on-disk bitmap size, leaving the file
+  // positioned at the start of the bitmap data either way.
+  bool readPageBitmapHeader(uint32_t pageIndex, PageInfo& page, XtgPageHeader& pageHeader, size_t& bitmapSize);
   size_t decompressPage(const XtgPageHeader& pageHeader, uint8_t* buffer, size_t bufferSize);
 
   // File handle management — reopen on demand, close after use
