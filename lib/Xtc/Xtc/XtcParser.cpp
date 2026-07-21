@@ -9,19 +9,47 @@
 
 #include <FsHelpers.h>
 #include <HalStorage.h>
+#include <InflateStream.h>
 #include <Logging.h>
 
 #include <cstring>
+#include <vector>
 
 namespace xtc {
+
+namespace {
+// Feeds InflateStream from a HalFile in small chunks -- same pattern as
+// ZipFile's zipFillCallback, reused here for XTCBZ/XTCBZH compressed pages.
+struct PageInflateCtx {
+  HalFile* file = nullptr;
+  size_t remaining = 0;
+  uint8_t* readBuf = nullptr;
+  size_t readBufSize = 0;
+};
+
+size_t pageInflateFillCallback(void* vctx, const uint8_t** data) {
+  auto* ctx = static_cast<PageInflateCtx*>(vctx);
+  if (ctx->remaining == 0) return 0;
+
+  const size_t toRead = ctx->remaining < ctx->readBufSize ? ctx->remaining : ctx->readBufSize;
+  const size_t bytesRead = ctx->file->read(ctx->readBuf, toRead);
+  ctx->remaining -= bytesRead;
+
+  *data = ctx->readBuf;
+  return bytesRead;
+}
+}  // namespace
 
 XtcParser::XtcParser()
     : m_isOpen(false),
       m_defaultWidth(DISPLAY_WIDTH),
       m_defaultHeight(DISPLAY_HEIGHT),
       m_bitDepth(1),
+      m_isExtended(false),
       m_hasChapters(false),
       m_chaptersLoaded(false),
+      m_subpageTableOffset(0),
+      m_subpageGroupsLoaded(false),
       m_lastError(XtcError::OK) {
   memset(&m_header, 0, sizeof(m_header));
 }
@@ -103,6 +131,10 @@ void XtcParser::close() {
   m_isOpen = false;
   m_chaptersLoaded = false;
   m_chapters.clear();
+  m_subpageGroupsLoaded = false;
+  m_subpageGroups.clear();
+  m_subpageTableOffset = 0;
+  m_isExtended = false;
   m_title.clear();
   m_author.clear();
   m_hasChapters = false;
@@ -123,20 +155,33 @@ void XtcParser::closeFile() {
 }
 
 XtcError XtcParser::readHeader() {
-  // Read first 56 bytes of header
+  // Read the shared 56-byte header, identical for XTC/XTCH and XTCBZ/XTCBZH (XtcbzHeader
+  // is XtcHeader plus a trailing subpageTableOffset -- see XtcTypes.h).
   size_t bytesRead = m_file.read(reinterpret_cast<uint8_t*>(&m_header), sizeof(XtcHeader));
   if (bytesRead != sizeof(XtcHeader)) {
     return XtcError::READ_ERROR;
   }
 
-  // Verify magic number (accept both XTC and XTCH)
-  if (m_header.magic != XTC_MAGIC && m_header.magic != XTCH_MAGIC) {
-    LOG_DBG("XTC", "Invalid magic: 0x%08X (expected 0x%08X or 0x%08X)", m_header.magic, XTC_MAGIC, XTCH_MAGIC);
+  // Verify magic number (XTC/XTCH: upstream format; XTCBZ/XTCBZH: CrossPoint's extended container)
+  const bool isExtended = m_header.magic == XTCBZ_MAGIC || m_header.magic == XTCBZH_MAGIC;
+  if (m_header.magic != XTC_MAGIC && m_header.magic != XTCH_MAGIC && !isExtended) {
+    LOG_DBG("XTC", "Invalid magic: 0x%08X (expected XTC/XTCH/XTCBZ/XTCBZH)", m_header.magic);
     return XtcError::INVALID_MAGIC;
   }
 
   // Determine bit depth from file magic
-  m_bitDepth = (m_header.magic == XTCH_MAGIC) ? 2 : 1;
+  m_bitDepth = (m_header.magic == XTCH_MAGIC || m_header.magic == XTCBZH_MAGIC) ? 2 : 1;
+
+  m_isExtended = isExtended;
+  m_subpageTableOffset = 0;
+  if (isExtended) {
+    uint64_t subpageTableOffset = 0;
+    if (m_file.read(reinterpret_cast<uint8_t*>(&subpageTableOffset), sizeof(subpageTableOffset)) !=
+        sizeof(subpageTableOffset)) {
+      return XtcError::READ_ERROR;
+    }
+    m_subpageTableOffset = subpageTableOffset;
+  }
 
   // Check version
   // Currently, version 1.0 is the only valid version, however some generators are swapping the bytes around, so we
@@ -153,16 +198,21 @@ XtcError XtcParser::readHeader() {
     return XtcError::CORRUPTED_HEADER;
   }
 
-  LOG_DBG("XTC", "Header: magic=0x%08X (%s), ver=%u.%u, pages=%u, bitDepth=%u", m_header.magic,
-          (m_header.magic == XTCH_MAGIC) ? "XTCH" : "XTC", m_header.versionMajor, m_header.versionMinor,
-          m_header.pageCount, m_bitDepth);
+  const char* magicName = m_header.magic == XTCH_MAGIC     ? "XTCH"
+                          : m_header.magic == XTCBZ_MAGIC  ? "XTCBZ"
+                          : m_header.magic == XTCBZH_MAGIC ? "XTCBZH"
+                                                            : "XTC";
+  LOG_DBG("XTC", "Header: magic=0x%08X (%s), ver=%u.%u, pages=%u, bitDepth=%u, subpages=%d", m_header.magic, magicName,
+          m_header.versionMajor, m_header.versionMinor, m_header.pageCount, m_bitDepth, isExtended);
 
   return XtcError::OK;
 }
 
 XtcError XtcParser::readTitle() {
-  constexpr auto titleOffset = 0x38;
-  if (!m_file.seek(titleOffset)) {
+  // Title immediately follows the header: 0x38 (56) for XTC/XTCH, 0x40 (64) for
+  // XTCBZ/XTCBZH's 8-byte-longer XtcbzHeader (see XtcTypes.h).
+  const uint64_t titleOffset = m_isExtended ? sizeof(XtcbzHeader) : sizeof(XtcHeader);
+  if (!m_file.seek64(titleOffset)) {
     return XtcError::READ_ERROR;
   }
 
@@ -176,8 +226,8 @@ XtcError XtcParser::readTitle() {
 
 XtcError XtcParser::readAuthor() {
   // Read author as null-terminated UTF-8 string with max length 64, directly following title
-  constexpr auto authorOffset = 0xB8;
-  if (!m_file.seek(authorOffset)) {
+  const uint64_t authorOffset = (m_isExtended ? sizeof(XtcbzHeader) : sizeof(XtcHeader)) + 128;
+  if (!m_file.seek64(authorOffset)) {
     return XtcError::READ_ERROR;
   }
 
@@ -263,6 +313,20 @@ bool XtcParser::readPageTableEntry(uint32_t pageIndex, PageInfo& info) {
   return true;
 }
 
+uint64_t XtcParser::nextSectionOffset(uint64_t sectionStart, uint64_t fileSize, uint64_t extraCandidate) const {
+  uint64_t end = fileSize;
+  auto consider = [&](uint64_t candidate) {
+    if (candidate > sectionStart && candidate <= fileSize && candidate < end) {
+      end = candidate;
+    }
+  };
+  consider(m_header.pageTableOffset);
+  consider(m_header.dataOffset);
+  consider(m_subpageTableOffset);
+  consider(extraCandidate);
+  return end;
+}
+
 XtcError XtcParser::readChapters() {
   m_chapters.clear();
 
@@ -299,13 +363,9 @@ XtcError XtcParser::readChapters() {
     return XtcError::OK;
   }
 
-  // Clamp maxOffset to fileSize so bogus header values can't inflate chapterCount
-  uint64_t maxOffset = fileSize;
-  if (m_header.pageTableOffset > chapterOffset && m_header.pageTableOffset <= fileSize) {
-    maxOffset = m_header.pageTableOffset;
-  } else if (m_header.dataOffset > chapterOffset && m_header.dataOffset <= fileSize) {
-    maxOffset = m_header.dataOffset;
-  }
+  // Clamp maxOffset to fileSize (and to the subpage table, if any -- see
+  // nextSectionOffset) so bogus header values can't inflate chapterCount
+  const uint64_t maxOffset = nextSectionOffset(chapterOffset, fileSize);
 
   if (maxOffset <= chapterOffset) {
     return XtcError::OK;
@@ -388,6 +448,105 @@ const std::vector<ChapterInfo>& XtcParser::getChapters() {
   return m_chapters;
 }
 
+XtcError XtcParser::readSubpageGroups() {
+  m_subpageGroups.clear();
+
+  if (m_subpageTableOffset == 0) {
+    return XtcError::OK;
+  }
+
+  if (!ensureFileOpen()) {
+    return XtcError::READ_ERROR;
+  }
+
+  const uint64_t fileSize = m_file.fileSize64();
+  constexpr size_t entrySize = sizeof(uint16_t) * 2;  // {startPage, endPage}, 1-based on disk
+  if (m_subpageTableOffset < sizeof(XtcHeader) || m_subpageTableOffset >= fileSize) {
+    return XtcError::OK;
+  }
+
+  // Read fresh (not cached on XtcParser) purely as a bound for nextSectionOffset below,
+  // same as readChapters() does locally -- lets the subpage table clamp against the
+  // chapter table's start when the two are adjacent, regardless of layout order.
+  uint64_t chapterOffset = 0;
+  if (m_file.seek(0x30)) {
+    m_file.read(reinterpret_cast<uint8_t*>(&chapterOffset), sizeof(chapterOffset));
+  }
+
+  // Clamp maxOffset to fileSize so bogus header values can't inflate the entry count
+  const uint64_t maxOffset = nextSectionOffset(m_subpageTableOffset, fileSize, chapterOffset);
+
+  if (maxOffset <= m_subpageTableOffset) {
+    return XtcError::OK;
+  }
+
+  const uint64_t available = maxOffset - m_subpageTableOffset;
+  // A group can span no fewer than one page, so there can never legitimately be more
+  // groups than pages -- cap here regardless of what the byte-range clamp above allows,
+  // so a bogus/corrupt table offset can't blow up reserve() into an OOM abort.
+  size_t groupCount = static_cast<size_t>(available / entrySize);
+  if (groupCount > m_header.pageCount) {
+    groupCount = m_header.pageCount;
+  }
+  if (groupCount == 0) {
+    return XtcError::OK;
+  }
+
+  if (!m_file.seek64(m_subpageTableOffset)) {
+    return XtcError::READ_ERROR;
+  }
+
+  m_subpageGroups.reserve(groupCount);
+  std::vector<uint8_t> entryBuf(entrySize);
+  for (size_t i = 0; i < groupCount; i++) {
+    if (m_file.read(entryBuf.data(), entrySize) != entrySize) {
+      return XtcError::READ_ERROR;
+    }
+
+    uint16_t startPage = 0;
+    uint16_t endPage = 0;
+    memcpy(&startPage, entryBuf.data(), sizeof(startPage));
+    memcpy(&endPage, entryBuf.data() + sizeof(startPage), sizeof(endPage));
+
+    if (startPage > 0) {
+      startPage--;
+    }
+    if (endPage > 0) {
+      endPage--;
+    }
+
+    if (startPage >= m_header.pageCount) {
+      continue;
+    }
+    if (endPage >= m_header.pageCount) {
+      endPage = m_header.pageCount - 1;
+    }
+    if (startPage > endPage) {
+      continue;
+    }
+
+    m_subpageGroups.push_back(SubpageGroup{startPage, endPage});
+  }
+
+  LOG_DBG("XTC", "Subpage groups: %u", static_cast<unsigned int>(m_subpageGroups.size()));
+  return XtcError::OK;
+}
+
+const std::vector<SubpageGroup>& XtcParser::getSubpageGroups() {
+  // Lazy load on first access, mirroring getChapters()
+  if (!m_subpageGroupsLoaded && m_subpageTableOffset != 0) {
+    const XtcError err = readSubpageGroups();
+    if (err != XtcError::OK) {
+      LOG_ERR("XTC", "Failed to lazy-load subpage groups: %s", errorToString(err));
+      m_subpageGroups.clear();
+      m_subpageTableOffset = 0;  // keeps hasSubpages() consistent with the now-empty result
+    }
+    m_subpageGroupsLoaded = true;
+    closeFile();
+  }
+  return m_subpageGroups;
+}
+
 bool XtcParser::getPageInfo(uint32_t pageIndex, PageInfo& info) { return readPageTableEntry(pageIndex, info); }
 
 size_t XtcParser::loadPage(uint32_t pageIndex, uint8_t* buffer, size_t bufferSize) {
@@ -455,16 +614,65 @@ size_t XtcParser::loadPage(uint32_t pageIndex, uint8_t* buffer, size_t bufferSiz
     return 0;
   }
 
-  // Read bitmap data
-  size_t bytesRead = m_file.read(buffer, bitmapSize);
-  if (bytesRead != bitmapSize) {
-    LOG_DBG("XTC", "Page read error: expected %u, got %u", bitmapSize, bytesRead);
-    m_lastError = XtcError::READ_ERROR;
+  if (pageHeader.compression == 0) {
+    // Read raw bitmap data
+    size_t bytesRead = m_file.read(buffer, bitmapSize);
+    if (bytesRead != bitmapSize) {
+      LOG_DBG("XTC", "Page read error: expected %u, got %u", bitmapSize, bytesRead);
+      m_lastError = XtcError::READ_ERROR;
+      return 0;
+    }
+    m_lastError = XtcError::OK;
+    return bytesRead;
+  }
+
+  if (pageHeader.compression != 1) {
+    LOG_DBG("XTC", "Unsupported page compression %u for page %u", pageHeader.compression, pageIndex);
+    m_lastError = XtcError::DECOMPRESSION_ERROR;
+    return 0;
+  }
+
+  // XTCBZ/XTCBZH only (see XtcTypes.h): pageHeader.dataSize is the on-disk deflated length,
+  // immediately following the header we already read.
+  // lib code can't call DiskLogger::flushNow() (src/-only, see the caller chain's
+  // flush points instead), but this still lands in the RTC ring buffer immediately,
+  // so it survives into a crash report even if the SD write hasn't happened yet.
+  LOG_DBG("XTC", "Decompressing page %u: %u -> %u bytes (heap: %u)", pageIndex, pageHeader.dataSize, bitmapSize,
+          (unsigned)ESP.getFreeHeap());
+  if (decompressPage(pageHeader, buffer, bitmapSize) != bitmapSize) {
+    LOG_DBG("XTC", "Failed to decompress page %u (compressed=%u -> expected %u)", pageIndex, pageHeader.dataSize,
+            bitmapSize);
+    m_lastError = XtcError::DECOMPRESSION_ERROR;
     return 0;
   }
 
   m_lastError = XtcError::OK;
-  return bytesRead;
+  return bitmapSize;
+}
+
+size_t XtcParser::decompressPage(const XtgPageHeader& pageHeader, uint8_t* buffer, size_t bufferSize) {
+  // One-shot mode: `buffer` holds the entire decompressed page, so back-references
+  // resolve inside it and no 32KB window is allocated (see InflateStream's header comment).
+  constexpr size_t kReadChunkSize = 1024;
+  std::vector<uint8_t> readBuf(kReadChunkSize);
+
+  PageInflateCtx ctx;
+  ctx.file = &m_file;
+  ctx.remaining = pageHeader.dataSize;
+  ctx.readBuf = readBuf.data();
+  ctx.readBufSize = readBuf.size();
+
+  InflateStream inflate;
+  if (!inflate.init(false)) {
+    LOG_ERR("XTC", "Failed to init inflate stream for page decompression");
+    return 0;
+  }
+  inflate.setFill(pageInflateFillCallback, &ctx);
+
+  if (!inflate.read(buffer, bufferSize)) {
+    return 0;
+  }
+  return bufferSize;
 }
 
 XtcError XtcParser::loadPageStreaming(uint32_t pageIndex,
@@ -510,6 +718,28 @@ XtcError XtcParser::loadPageStreaming(uint32_t pageIndex,
     bitmapSize = ((pageHeader.width + 7) / 8) * pageHeader.height;
   }
 
+  if (pageHeader.compression != 0 && pageHeader.compression != 1) {
+    return XtcError::DECOMPRESSION_ERROR;
+  }
+
+  if (pageHeader.compression == 1) {
+    // No caller currently streams a compressed page (loadPageStreaming has no callers
+    // today -- see git history), so this favors simplicity over an incremental
+    // decompress-and-deliver loop: decompress the whole page once, then hand it to the
+    // callback in the requested chunk size.
+    std::vector<uint8_t> decompressed(bitmapSize);
+    if (decompressPage(pageHeader, decompressed.data(), bitmapSize) != bitmapSize) {
+      return XtcError::DECOMPRESSION_ERROR;
+    }
+    size_t totalDelivered = 0;
+    while (totalDelivered < bitmapSize) {
+      const size_t toDeliver = std::min(chunkSize, bitmapSize - totalDelivered);
+      callback(decompressed.data() + totalDelivered, toDeliver, totalDelivered);
+      totalDelivered += toDeliver;
+    }
+    return XtcError::OK;
+  }
+
   // Read in chunks
   std::vector<uint8_t> chunk(chunkSize);
   size_t totalRead = 0;
@@ -543,7 +773,7 @@ bool XtcParser::isValidXtcFile(const char* filepath) {
     return false;
   }
 
-  return (magic == XTC_MAGIC || magic == XTCH_MAGIC);
+  return (magic == XTC_MAGIC || magic == XTCH_MAGIC || magic == XTCBZ_MAGIC || magic == XTCBZH_MAGIC);
 }
 
 }  // namespace xtc

@@ -1,6 +1,7 @@
 #include "InflateStream.h"
 
 #include <BuildScratch.h>
+#include <Logging.h>
 
 #include <cstdlib>
 #include <cstring>
@@ -86,6 +87,16 @@ InflateStream::Status InflateStream::readAtMost(uint8_t* dest, const size_t maxL
   const bool streaming = window != nullptr;
   if (!streaming && !oneShotStart) oneShotStart = dest;
 
+  // Diagnostic safety net: every code path below either consumes input,
+  // produces output, or returns -- so this loop should never legitimately
+  // spin without any of the three. If some edge case defeats that (corrupt
+  // stream state tinfl doesn't recognize as an error, etc.), fail loudly and
+  // boundedly instead of hanging forever. See lib/Xtc's compressed-page path,
+  // the only current caller of streaming=false decompression on
+  // device-supplied data, for why this matters here specifically.
+  int noProgressStreak = 0;
+  constexpr int MAX_NO_PROGRESS_ITERATIONS = 8;
+
   for (;;) {
     // Drain window bytes left over from a previous tinfl call. In ring mode
     // tinfl may produce more than the caller asked for in one shot -- the
@@ -133,6 +144,16 @@ InflateStream::Status InflateStream::readAtMost(uint8_t* dest, const size_t maxL
     }
     inPtr += inBytes;
     inAvail -= inBytes;
+
+    if (inBytes == 0 && outBytes == 0) {
+      if (++noProgressStreak >= MAX_NO_PROGRESS_ITERATIONS) {
+        LOG_ERR("INFLATE", "No forward progress after %d iterations (status=%d, inAvail=%u, exhausted=%d)",
+                noProgressStreak, static_cast<int>(status), (unsigned)inAvail, inputExhausted);
+        return Status::Error;
+      }
+    } else {
+      noProgressStreak = 0;
+    }
 
     if (status == TINFL_STATUS_DONE) {
       finished = true;  // drain any pending window bytes on the next pass

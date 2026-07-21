@@ -60,6 +60,10 @@ class Xtc {
   bool hasChapters() const;
   const std::vector<xtc::ChapterInfo>& getChapters();
 
+  // XTCBZ/XTCBZH only (see lib/Xtc/Xtc/XtcTypes.h) -- always empty/false for plain XTC/XTCH files.
+  bool hasSubpages() const;
+  const std::vector<xtc::SubpageGroup>& getSubpageGroups();
+
   // Cover image support (for sleep screen)
   std::string getCoverBmpPath() const;
   bool generateCoverBmp() const;

@@ -166,7 +166,8 @@ bool hasGifExtension(std::string_view fileName) { return checkFileExtension(file
 bool hasEpubExtension(std::string_view fileName) { return checkFileExtension(fileName, ".epub"); }
 
 bool hasXtcExtension(std::string_view fileName) {
-  return checkFileExtension(fileName, ".xtc") || checkFileExtension(fileName, ".xtch");
+  return checkFileExtension(fileName, ".xtc") || checkFileExtension(fileName, ".xtch") ||
+         checkFileExtension(fileName, ".xtcbz") || checkFileExtension(fileName, ".xtcbzh");
 }
 
 bool hasTxtExtension(std::string_view fileName) { return checkFileExtension(fileName, ".txt"); }

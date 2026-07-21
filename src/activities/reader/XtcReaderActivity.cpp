@@ -13,6 +13,7 @@
 #include "ProgressFile.h"
 #include "ReaderActivity.h"
 #include "ReaderUtils.h"
+#include "RecentBooksStore.h"
 #include "XtcReaderChapterSelectionActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
@@ -34,7 +35,28 @@ bool XtcReaderActivity::loadBook() {
   DiskLogger::flushNow();
   xtc = std::move(loadedXtc);
   xtc->setupCacheDir();
+  LOG_DBG("XTR", "loadBook: cache dir ready (heap: %u)", (unsigned)ESP.getFreeHeap());
+
   loadProgress();
+  LOG_DBG("XTR", "loadBook: progress loaded, page=%lu (heap: %u)", currentPage, (unsigned)ESP.getFreeHeap());
+
+  // Force both lazy-loads now, synchronously on the main task, before requestUpdate()
+  // hands off to the render task. getChapters()/getSubpageGroups() each seek xtc's
+  // shared HalFile to a different part of the file (and getSubpageGroups() closes it
+  // afterward) on first access -- handleFormatInput() calls both on every tick once
+  // xtc is set, and if that first access lands after the render task has already
+  // started reading page 0's (possibly multi-chunk, compressed) data, the interleaved
+  // seek corrupts the read it's mid-stream on. Loading them here, before the file is
+  // touched for any page, means the first tick always hits the already-cached fast
+  // path instead of racing the render task for the file cursor.
+  xtc->getChapters();
+  xtc->getSubpageGroups();
+  LOG_DBG("XTR", "loadBook: chapters/subpages prewarmed (heap: %u)", (unsigned)ESP.getFreeHeap());
+  // First render (renderPage() -> loadPage()) is the likeliest place a hang shows up
+  // for compressed (.xtcbz/.xtcbzh) pages -- flush so this checkpoint isn't lost to the
+  // next FLUSH_INTERVAL batch if it does.
+  DiskLogger::flushNow();
+
   return true;
 }
 
@@ -55,6 +77,19 @@ bool XtcReaderActivity::handleFormatInput() {
     return false;
   }
 
+  // Drop this book from Recent Books at End-of-Book; if the reader pages back in,
+  // re-add it. Acts only on the transition (guarded by recentsEntryRemoved) -- no
+  // per-frame writes. Same pattern as EpubReaderActivity::loop().
+  if (SETTINGS.removeReadBooksFromRecents) {
+    const bool atEndOfBook = isAtEndOfBook();
+    if (atEndOfBook && !recentsEntryRemoved) {
+      recentsEntryRemoved = RECENT_BOOKS.removeByPath(xtc->getPath());
+    } else if (!atEndOfBook && recentsEntryRemoved) {
+      RECENT_BOOKS.addBook(xtc->getPath(), xtc->getTitle(), xtc->getAuthor(), xtc->getThumbBmpPath());
+      recentsEntryRemoved = false;
+    }
+  }
+
   // Enter chapter selection activity on Confirm release or touch menu gesture
   if (mappedInput.wasReleased(MappedInputManager::Button::Confirm) ||
       ReaderUtils::isTouchMenuGesture(renderer, mappedInput)) {
@@ -62,20 +97,21 @@ bool XtcReaderActivity::handleFormatInput() {
     return true;
   }
 
-  // Front Left/Right: step through the current manga page's zoom crops
-  // (full page -> panel 1 -> panel 2 -> ... -> wraps back to full page).
-  // Only meaningful when the book has per-page chapters (cbz2xteink emits
-  // one chapter per manga page, spanning its full view and crops).
-  // Intercepted here, before the base loop()'s detectPageTurn, so Left/Right
-  // don't also fire as page-turn aliases (see ReaderUtils::detectPageTurn's
-  // prevButton/nextButton fallback) while a zoom-chapter book is open.
-  if (hasZoomChapters()) {
+  // Front Left/Right: step linearly through every crop in the whole book
+  // (full page -> panel 1 -> panel 2 -> ... -> next page's full page -> its
+  // panel 1 -> ...) so a single button can drive the entire reading flow.
+  // Only meaningful when the book has a subpage table (XTCBZ/XTCBZH; see
+  // Xtc::hasSubpages()). Intercepted here, before the base loop()'s
+  // detectPageTurn, so Left/Right don't also fire as page-turn aliases (see
+  // ReaderUtils::detectPageTurn's prevButton/nextButton fallback) while a
+  // subpage book is open.
+  if (hasSubpageGroups()) {
     if (mappedInput.wasReleased(MappedInputManager::Button::Right)) {
-      stepZoomCrop(+1);
+      stepSubpage(+1);
       return true;
     }
     if (mappedInput.wasReleased(MappedInputManager::Button::Left)) {
-      stepZoomCrop(-1);
+      stepSubpage(-1);
       return true;
     }
   }
@@ -85,45 +121,47 @@ bool XtcReaderActivity::handleFormatInput() {
 
 void XtcReaderActivity::applyInitialOrientation() { renderer.setOrientation(GfxRenderer::Orientation::Portrait); }
 
-bool XtcReaderActivity::hasZoomChapters() const { return xtc && xtc->hasChapters() && !xtc->getChapters().empty(); }
+bool XtcReaderActivity::hasSubpageGroups() const { return xtc && xtc->hasSubpages() && !xtc->getSubpageGroups().empty(); }
 
-int XtcReaderActivity::findCurrentChapterIndex() const {
-  if (!xtc || !xtc->hasChapters()) {
+int XtcReaderActivity::findCurrentSubpageGroupIndex() const {
+  if (!xtc || !xtc->hasSubpages()) {
     return -1;
   }
-  const auto& chapters = xtc->getChapters();
-  const auto it = std::find_if(chapters.begin(), chapters.end(), [this](const xtc::ChapterInfo& chapter) {
-    return currentPage >= chapter.startPage && currentPage <= chapter.endPage;
+  const auto& groups = xtc->getSubpageGroups();
+  const auto it = std::find_if(groups.begin(), groups.end(), [this](const xtc::SubpageGroup& group) {
+    return currentPage >= group.startPage && currentPage <= group.endPage;
   });
-  if (it == chapters.end()) {
+  if (it == groups.end()) {
     return -1;
   }
-  return static_cast<int>(it - chapters.begin());
+  return static_cast<int>(it - groups.begin());
 }
 
-void XtcReaderActivity::stepZoomCrop(int direction) {
-  const int chapterIndex = findCurrentChapterIndex();
-  if (chapterIndex < 0) {
-    return;
-  }
-  const auto& chapter = xtc->getChapters()[chapterIndex];
-  const int span = static_cast<int>(chapter.endPage - chapter.startPage) + 1;
-  if (span <= 0) {
-    return;
-  }
-  const int offset = static_cast<int>(currentPage - chapter.startPage);
-  int next = (offset + direction) % span;
+void XtcReaderActivity::stepSubpage(int direction) {
+  // Linear step across the *whole* book, not wrapped within the current
+  // subpage group -- lets a single button (front Left/Right) drive the
+  // entire reading flow. Each group's first page is always its own full
+  // view, so stepping forward past one group's last zoom crop lands
+  // directly on the next page's full view, then continues forward into
+  // that page's own crops -- "forward past the last panel goes to [the
+  // next] full page, then [continues into] the next page." The previous
+  // modulo wrap only ever cycled back through the *current* group's own
+  // crops and could never reach another page from here at all.
+  const int64_t next = static_cast<int64_t>(currentPage) + direction;
   if (next < 0) {
-    next += span;
+    currentPage = 0;
+  } else if (next >= static_cast<int64_t>(xtc->getPageCount())) {
+    currentPage = xtc->getPageCount();  // triggers the existing "End of book" handling
+  } else {
+    currentPage = static_cast<uint32_t>(next);
   }
-  currentPage = chapter.startPage + static_cast<uint32_t>(next);
   requestUpdate();
 }
 
-void XtcReaderActivity::stepChapter(int direction, int count) {
-  const auto& chapters = xtc->getChapters();
-  const int chapterIndex = findCurrentChapterIndex();
-  const int baseIndex = chapterIndex < 0 ? 0 : chapterIndex;
+void XtcReaderActivity::stepSubpageGroup(int direction, int count) {
+  const auto& groups = xtc->getSubpageGroups();
+  const int groupIndex = findCurrentSubpageGroupIndex();
+  const int baseIndex = groupIndex < 0 ? 0 : groupIndex;
   const int targetIndex = baseIndex + direction * count;
 
   if (targetIndex < 0) {
@@ -131,12 +169,12 @@ void XtcReaderActivity::stepChapter(int direction, int count) {
     requestUpdate();
     return;
   }
-  if (targetIndex >= static_cast<int>(chapters.size())) {
+  if (targetIndex >= static_cast<int>(groups.size())) {
     currentPage = xtc->getPageCount();  // triggers the existing "End of book" handling
     requestUpdate();
     return;
   }
-  currentPage = chapters[targetIndex].startPage;
+  currentPage = groups[targetIndex].startPage;
   requestUpdate();
 }
 
@@ -155,25 +193,35 @@ XtcReaderActivity::StatusBarInfo XtcReaderActivity::getStatusBarInfo() const {
   const int bookPage = static_cast<int>(currentPage) + 1;
   std::string title = sb.titleMode == CrossPointSettings::STATUS_BAR_TITLE::BOOK_TITLE ? xtc->getTitle() : "";
 
-  if (!xtc->hasChapters()) {
+  // Chapter title (if requested) is independent of the subpage counter below --
+  // a book can have real chapters, a subpage table, both, or neither.
+  if (sb.titleMode == CrossPointSettings::STATUS_BAR_TITLE::CHAPTER_TITLE && xtc->hasChapters()) {
+    const auto& chapters = xtc->getChapters();
+    const auto chapterIt = std::find_if(chapters.begin(), chapters.end(), [this](const xtc::ChapterInfo& chapter) {
+      return currentPage >= chapter.startPage && currentPage <= chapter.endPage;
+    });
+    if (chapterIt != chapters.end()) {
+      title = chapterIt->name.empty() ? tr(STR_UNNAMED) : chapterIt->name;
+    }
+  }
+
+  // The X-of-Y counter shows progress through the current subpage group (manga
+  // page + its zoom crops) when one exists, otherwise plain book page/count.
+  if (!xtc->hasSubpages()) {
     return StatusBarInfo{bookPage, bookPageCount, std::move(title)};
   }
 
-  const auto& chapters = xtc->getChapters();
-  const auto chapterIt = std::find_if(chapters.begin(), chapters.end(), [this](const xtc::ChapterInfo& chapter) {
-    return currentPage >= chapter.startPage && currentPage <= chapter.endPage;
+  const auto& groups = xtc->getSubpageGroups();
+  const auto groupIt = std::find_if(groups.begin(), groups.end(), [this](const xtc::SubpageGroup& group) {
+    return currentPage >= group.startPage && currentPage <= group.endPage;
   });
 
-  if (chapterIt == chapters.end() || chapterIt->endPage < chapterIt->startPage) {
+  if (groupIt == groups.end() || groupIt->endPage < groupIt->startPage) {
     return StatusBarInfo{bookPage, bookPageCount, std::move(title)};
   }
 
-  if (sb.titleMode == CrossPointSettings::STATUS_BAR_TITLE::CHAPTER_TITLE) {
-    title = chapterIt->name.empty() ? tr(STR_UNNAMED) : chapterIt->name;
-  }
-
-  return StatusBarInfo{static_cast<int>(currentPage - chapterIt->startPage) + 1,
-                       static_cast<int>(chapterIt->endPage - chapterIt->startPage) + 1, std::move(title)};
+  return StatusBarInfo{static_cast<int>(currentPage - groupIt->startPage) + 1,
+                       static_cast<int>(groupIt->endPage - groupIt->startPage) + 1, std::move(title)};
 }
 
 void XtcReaderActivity::renderStatusBarOverlay(GfxRenderer& renderer, const StatusBarOverlayPosition position) const {
@@ -241,7 +289,14 @@ void XtcReaderActivity::renderPage() {
     return;
   }
 
+  // Load page data. This is where a compressed (.xtcbz/.xtcbzh) page runs through
+  // XtcParser::decompressPage()/InflateStream -- log + flush around it so a
+  // hang here is pinpointed instead of just showing the last loadBook() checkpoint.
+  LOG_DBG("XTR", "Loading page %lu (bufferSize=%lu, bitDepth=%u, heap: %u)", currentPage, pageBufferSize, bitDepth,
+          (unsigned)ESP.getFreeHeap());
+  DiskLogger::flushNow();
   size_t bytesRead = xtc->loadPage(currentPage, pageBuffer, pageBufferSize);
+  LOG_DBG("XTR", "Loaded page %lu: %lu bytes (heap: %u)", currentPage, bytesRead, (unsigned)ESP.getFreeHeap());
   if (bytesRead == 0) {
     LOG_ERR("XTR", "Failed to load page %lu: bufferSize=%lu bitDepth=%u error=%s", currentPage, pageBufferSize,
             bitDepth, xtc::errorToString(xtc->getLastError()));
@@ -379,23 +434,23 @@ void XtcReaderActivity::renderPage() {
 
 bool XtcReaderActivity::pageTurn(bool isForward) {
   if (!xtc) return false;
-  if (hasZoomChapters()) {
-    // With per-page chapters, page-turn moves by whole manga page instead of
+  if (hasSubpageGroups()) {
+    // With a subpage table, page-turn moves by whole manga page instead of
     // by individual XTC page, so normal reading skips straight past zoom
     // crops -- front Left/Right (see handleFormatInput()) are the way to see
-    // them. But if a forward turn lands mid-chapter (on a zoom crop, not the
+    // them. But if a forward turn lands mid-group (on a zoom crop, not the
     // full page), it snaps back to that page's full view first instead of
     // advancing -- so escaping a deep zoom never costs a page of content,
     // and forward progress is always at most one press away from "back to
     // what I was reading."
     if (isForward) {
-      const int chapterIndex = findCurrentChapterIndex();
-      if (chapterIndex >= 0 && currentPage != xtc->getChapters()[chapterIndex].startPage) {
-        currentPage = xtc->getChapters()[chapterIndex].startPage;
+      const int groupIndex = findCurrentSubpageGroupIndex();
+      if (groupIndex >= 0 && currentPage != xtc->getSubpageGroups()[groupIndex].startPage) {
+        currentPage = xtc->getSubpageGroups()[groupIndex].startPage;
         return true;
       }
     }
-    stepChapter(isForward ? +1 : -1, 1);
+    stepSubpageGroup(isForward ? +1 : -1, 1);
     return true;
   }
   if (isForward) {
@@ -414,12 +469,12 @@ bool XtcReaderActivity::pageTurn(bool isForward) {
 
 bool XtcReaderActivity::skipPages(int amount) {
   if (!xtc) return false;
-  if (hasZoomChapters()) {
-    // Long-press chapter skip: always jump by whole chapters, no mid-chapter
+  if (hasSubpageGroups()) {
+    // Long-press skip: always jump by whole subpage groups, no mid-group
     // snap-back -- that's only for a plain forward tap; a deliberate big
     // jump shouldn't get redirected back to a page already seen.
     const int count = amount < 0 ? -amount : amount;
-    stepChapter(amount > 0 ? +1 : -1, count);
+    stepSubpageGroup(amount > 0 ? +1 : -1, count);
     return true;
   }
   int newPage = static_cast<int>(currentPage) + amount;

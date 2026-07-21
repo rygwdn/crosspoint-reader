@@ -52,7 +52,8 @@ inline bool hasEpubExtension(const String& fileName) {
   return hasEpubExtension(std::string_view{fileName.c_str(), fileName.length()});
 }
 
-// Check for either .xtc or .xtch extension (case-insensitive)
+// Check for .xtc, .xtch (upstream format), .xtcbz, or .xtcbzh (CrossPoint's extended
+// container -- see lib/Xtc/Xtc/XtcTypes.h) extension (case-insensitive)
 bool hasXtcExtension(std::string_view fileName);
 
 // Check for .txt extension (case-insensitive)

@@ -77,6 +77,10 @@ class XtcParser {
   bool hasChapters() const { return m_hasChapters; }
   const std::vector<ChapterInfo>& getChapters();
 
+  // XTCBZ/XTCBZH only (see XtcTypes.h) -- always empty/false for plain XTC/XTCH files.
+  bool hasSubpages() const { return m_subpageTableOffset != 0; }
+  const std::vector<SubpageGroup>& getSubpageGroups();
+
   // Validation
   static bool isValidXtcFile(const char* filepath);
 
@@ -89,13 +93,23 @@ class XtcParser {
   bool m_isOpen;
   XtcHeader m_header;
   std::vector<ChapterInfo> m_chapters;
+  std::vector<SubpageGroup> m_subpageGroups;
   std::string m_title;
   std::string m_author;
   uint16_t m_defaultWidth;
   uint16_t m_defaultHeight;
   uint8_t m_bitDepth;  // 1 = XTC/XTG (1-bit), 2 = XTCH/XTH (2-bit)
+  // true for XTCBZ/XTCBZH: header is XtcbzHeader (64 bytes), so metadata starts 8 bytes
+  // later than in a classic XTC/XTCH file. Independent of hasSubpages() -- an
+  // XTCBZ/XTCBZH file can have m_subpageTableOffset == 0 (no subpage table) and still
+  // need the extended header's title/author offsets.
+  bool m_isExtended;
   bool m_hasChapters;
   bool m_chaptersLoaded;
+  // 0 for plain XTC/XTCH (upstream format, never has subpages). Read from the
+  // XtcbzHeader tail for XTCBZ/XTCBZH; see readHeader().
+  uint64_t m_subpageTableOffset;
+  bool m_subpageGroupsLoaded;
   XtcError m_lastError;
 
   // Internal helper functions
@@ -104,7 +118,17 @@ class XtcParser {
   XtcError readTitle();
   XtcError readAuthor();
   XtcError readChapters();
+  XtcError readSubpageGroups();
+  // Tightest known offset that starts the section *after* the one beginning at
+  // `sectionStart`, out of {chapter table, subpage table, page table, first page's
+  // data} -- so a variable-length table's entry count isn't over-counted into a
+  // neighboring section regardless of which order they're laid out in. `extraCandidate`
+  // lets a caller pass an offset it knows locally but that isn't an XtcParser member
+  // (e.g. chapterOffset, read fresh from disk each call rather than cached). Falls
+  // back to fileSize if nothing qualifies as a tighter bound.
+  uint64_t nextSectionOffset(uint64_t sectionStart, uint64_t fileSize, uint64_t extraCandidate = 0) const;
   bool readPageTableEntry(uint32_t pageIndex, PageInfo& info);
+  size_t decompressPage(const XtgPageHeader& pageHeader, uint8_t* buffer, size_t bufferSize);
 
   // File handle management — reopen on demand, close after use
   bool ensureFileOpen();

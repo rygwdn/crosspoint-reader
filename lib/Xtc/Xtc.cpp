@@ -10,6 +10,7 @@
 #include <Bitmap.h>
 #include <HalStorage.h>
 #include <Logging.h>
+#include <Memory.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
@@ -22,10 +23,14 @@ void yieldDuringThumbnail(uint8_t& rowsSinceYield) {
 }  // namespace
 
 bool Xtc::load() {
-  LOG_DBG("XTC", "Loading XTC: %s", filepath.c_str());
+  LOG_DBG("XTC", "Loading XTC: %s (heap: %u)", filepath.c_str(), (unsigned)ESP.getFreeHeap());
 
   // Initialize parser
-  parser.reset(new xtc::XtcParser());
+  parser = makeUniqueNoThrow<xtc::XtcParser>();
+  if (!parser) {
+    LOG_ERR("XTC", "OOM allocating XtcParser");
+    return false;
+  }
 
   // Open XTC file
   xtc::XtcError err = parser->open(filepath.c_str());
@@ -36,7 +41,12 @@ bool Xtc::load() {
   }
 
   loaded = true;
-  LOG_DBG("XTC", "Loaded XTC: %s (%lu pages)", filepath.c_str(), parser->getPageCount());
+  LOG_DBG("XTC", "Loaded XTC: %s (%lu pages, bitDepth=%u, heap: %u)", filepath.c_str(), parser->getPageCount(),
+          parser->getBitDepth(), (unsigned)ESP.getFreeHeap());
+  // Caller (ReaderActivity::loadXtc) flushes the disk log immediately after this
+  // returns -- lib code can't depend on src/DiskLogger.h, and the next step
+  // (entering the reader activity, then decoding page 0) is where a hang has
+  // been observed with compressed (.xtcbz/.xtcbzh) pages.
   return true;
 }
 
@@ -119,6 +129,21 @@ const std::vector<xtc::ChapterInfo>& Xtc::getChapters() {
     return kEmpty;
   }
   return parser->getChapters();
+}
+
+bool Xtc::hasSubpages() const {
+  if (!loaded || !parser) {
+    return false;
+  }
+  return parser->hasSubpages();
+}
+
+const std::vector<xtc::SubpageGroup>& Xtc::getSubpageGroups() {
+  static const std::vector<xtc::SubpageGroup> kEmpty;
+  if (!loaded || !parser) {
+    return kEmpty;
+  }
+  return parser->getSubpageGroups();
 }
 
 std::string Xtc::getCoverBmpPath() const { return cachePath + "/cover.bmp"; }

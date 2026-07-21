@@ -10,6 +10,10 @@
 class XtcReaderActivity final : public ReaderActivity {
   std::shared_ptr<Xtc> xtc;
   uint32_t currentPage = 0;
+  // Tracks whether this book is currently removed from Recent Books by the
+  // removeReadBooksFromRecents feature (set at End-of-Book, cleared if paged
+  // back in) -- same pattern as EpubReaderActivity's own recentsEntryRemoved.
+  bool recentsEntryRemoved = false;
 
   enum class StatusBarOverlayPosition { Bottom, Top };
   struct StatusBarInfo {
@@ -33,18 +37,22 @@ class XtcReaderActivity final : public ReaderActivity {
   void renderBook() override;
   void applyInitialOrientation() override;
 
-  // Zoom navigation: when the book has per-page chapters (each chapter
-  // spans one manga page's full view followed by its panel/bubble-zoom
-  // crops, as produced by cbz2xteink), front Left/Right step through the
-  // *current* chapter's crops, and side/tilt page-turn moves by whole
-  // chapter instead of by individual XTC page -- so normal page-turning
-  // skips straight past zoom crops, and the front buttons are the way to
-  // drill into them. No-op (falls back to the original per-page behavior)
-  // when the book has no chapters, e.g. a plain single-image XTC.
-  bool hasZoomChapters() const;
-  int findCurrentChapterIndex() const;
-  void stepZoomCrop(int direction);
-  void stepChapter(int direction, int count);
+  // Zoom navigation: when the book has a subpage table (XTCBZ/XTCBZH only -- each
+  // group spans one manga page's full view followed by its panel/bubble-zoom
+  // crops, as produced by cbz2xteink), front Left/Right step *linearly*
+  // through every crop in the whole book -- forward past a page's last zoom
+  // crop lands on the next page's full view, then its own crops, so a single
+  // button can drive the entire reading flow without ever needing side/tilt.
+  // Side/tilt page-turn instead moves by whole group (skips straight past
+  // zoom crops), landing on a group's full view either way -- a quicker path
+  // for a reader who doesn't want to see every crop. No-op (falls back to the
+  // original per-page behavior) when the book has no subpage table, e.g. a
+  // plain XTC or a single-image book. Independent of real chapters
+  // (openChapterSelection), which a subpage book may or may not also have.
+  bool hasSubpageGroups() const;
+  int findCurrentSubpageGroupIndex() const;
+  void stepSubpage(int direction);
+  void stepSubpageGroup(int direction, int count);
 
  public:
   explicit XtcReaderActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, std::string bookPath,
