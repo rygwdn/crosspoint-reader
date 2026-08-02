@@ -37,6 +37,11 @@ struct BlockStyle {
   // NOT propagated through getCombinedBlockStyle so it can't leak into sibling blocks.
   bool fromBrElement = false;
 
+  // Set on heading (h1-h6) blocks. Used by the keep-with-next page-break check to detect
+  // when a heading immediately follows another heading (e.g. a title/subtitle pair), so the
+  // second heading doesn't reserve room for body text that was never coming.
+  bool isHeading = false;
+
   // Combined insets (margin + padding)
   [[nodiscard]] int16_t leftInset() const { return marginLeft + paddingLeft; }
   [[nodiscard]] int16_t rightInset() const { return marginRight + paddingRight; }
