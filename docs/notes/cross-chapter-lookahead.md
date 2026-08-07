@@ -418,51 +418,58 @@ turns, TOC/anchor jumps, percent-jump, bookmark restore, partial
 suspend/resume all still correct) — no on-disk format change means no
 `.crosspoint/` cache-clear is needed to test.
 
-### Phase 2 — Make `startBuild()`'s HTML materialization interruptible
+### Phase 2 — Revised: gate background prefetch on `hasHtmlCache()` instead of making unzip interruptible
 
-**Problem being fixed**: per the scheduling/responsiveness investigation,
-`Section::startBuild()` (`Section.cpp:246-421`) does a fully synchronous,
-uninterruptible sequence before the resumable parser can even begin: on an
-HTML-cache miss, a blocking unzip-to-SD stream in 8KB chunks
-(`Section.cpp:290-320`, documented as "multi-second on a giant spine"),
-plus directory setup, tmp-file handling, two file opens, header write, and
-TOC-anchor vector construction (`Section.cpp:339-412`) — none of it
-time-boxed. A next-chapter prefetch calling `startBuild()` on a fresh
-`Section` mid-tick would hit this same unbounded stall the existing
-`BUILD_POPUP_BYTE_THRESHOLD` popup logic already exists to warn users
-about, except with no popup to explain the freeze (background tick, not a
-foreground open).
+**Original plan (superseded, kept below for context)**: split
+`startBuild()`'s HTML-materialization step into a resumable
+`continueMaterializingHtml(maxDurationMs)`, mirroring
+`buildSomeMore(maxPages, maxDurationMs)`.
 
-**Design**: split `startBuild()` into an explicit resumable phase, mirroring
-how `ChapterHtmlSlimParser` already does `beginParse()`/`parseStep()`/
-`finishParse()`:
-1. New `Section` build sub-state (e.g. an enum on `BuildContext` or a
-   separate small state machine) distinguishing "materializing HTML" from
-   "parsing." Entered via a `startBuildAsync()` (or extend `startBuild()`
-   with a chunked mode) that does just the cheap setup (dir/tmp-file/header)
-   synchronously, then does the unzip-to-SD stream in bounded chunks driven
-   by repeated calls, same shape as `buildSomeMore(maxPages,
-   maxDurationMs)` — i.e. a `continueMaterializingHtml(maxDurationMs)` that
-   does one bounded burst of the existing 8KB-chunk loop
-   (`Section.cpp:290-320`) and returns, to be called from
-   `EpubReaderActivity::loop()`'s tick alongside `buildSomeMore()`.
-2. `EpubReaderActivity::loop()`'s tick logic checks which phase the active
-   build (current-chapter or, after Phase 3, prefetch) is in and calls the
-   matching bounded step function, so a single `RenderLock`-free tick
-   never spans more than its budget regardless of which phase it's in.
-3. Existing callers of `startBuild()` that need it to run to completion
-   synchronously (first foreground open, percent-jump navigation) keep a
-   `startBuild()` wrapper that loops the new chunked calls with no time
-   limit — same blocking behavior as today for those paths, since fixing
-   *their* responsiveness is out of scope for this plan (the doc already
-   notes this as a pre-existing gap, not something this feature introduces
-   or needs to solve).
+**Why superseded**: `Section::startBuild()`'s unzip-to-SD path
+(`Section.cpp:290-320`) delegates to `Epub::readItemContentsToStream()` →
+`ZipFile::readFileToStream()` (`lib/ZipFile/ZipFile.cpp:440-556`), which for
+the `ZIP_METHOD_DEFLATED` case (the common one) runs a single monolithic
+loop driving a miniz `InflateStream` to completion, with the inflate
+window/huffman-table state and two `malloc`'d buffers all local to that one
+function call. Making this genuinely resumable across time-sliced calls
+means lifting `ZipFile`, `InflateStream`, and `ZipInflateCtx` out of local
+scope into something that can be paused and re-entered — a real,
+cross-cutting change to the zip/miniz layer shared by *every* EPUB's HTML
+extraction (also used for the container.xml/content.opf/NCX/nav/CSS/cover
+parses — see the `readItemContentsToStream` call sites in `Epub.cpp`), not
+scoped to Section.cpp. Attempting that quickly, without dedicated testing of
+the inflate path, risks silent corruption on every book's HTML extraction
+for the sake of one background-prefetch edge case — too large a blast
+radius for this plan.
 
-**Done when**: `pio run -e default` builds clean; opening a chapter whose
-HTML isn't yet SD-cached, via the background-tick path (once Phase 3 uses
-it), no longer produces a multi-second single tick — verify by timing/
-logging individual tick durations the same way `EpubReaderActivity.cpp:443-448`
-already logs tick overrun today.
+**Revised design**: don't make the unzip interruptible at all. Instead,
+never let the *background* prefetch path (Phase 3) trigger it in the first
+place. `Section::hasHtmlCache()` (`Section.h:129`, `Section.cpp:446-449`)
+already answers "is this spine's HTML already unzipped to SD" cheaply (one
+`Storage.exists()` check, no I/O of the HTML itself). Phase 3's prefetch
+tick checks this *before* calling `startBuild()` on a fresh `Section`:
+- HTML cached → safe to prefetch in the background; `startBuild()`'s
+  remaining work (dir/tmp-file/header setup, `BuildContext` alloc, TOC-anchor
+  collection) is cheap map/vector work, nothing else in that function
+  approaches the unzip's cost.
+- HTML not cached → skip prefetching that spine for now. Falls back to
+  today's existing behavior when the reader actually turns into it
+  (foreground open, `BUILD_POPUP_BYTE_THRESHOLD`-gated popup as needed) —
+  not a regression, just no prefetch benefit for that specific chapter
+  transition. A book being read start-to-finish for the first time won't
+  get seamless transitions into not-yet-visited chapters; a re-read, or any
+  chapter reached a second time (HTML persists in the per-book cache once
+  extracted, per the comment at `Section.cpp:291-296`), does.
+
+This is a narrower guarantee than the original plan (only re-reads /
+already-cached chapters get seamless prefetched transitions), but it's safe,
+small, fully contained to Phase 3's own gating logic, and needs zero changes
+to `Section::startBuild()` or the zip/miniz layer. If interruptible unzip is
+wanted later, it's a separable follow-up against `ZipFile.cpp`, not part of
+this branch.
+
+**Done when**: folded into Phase 3's "done when" below — no separate
+Section.cpp change for this phase.
 
 ### Phase 3 — Option A: chained single-slot prefetch
 
@@ -520,13 +527,13 @@ the next open of that chapter shows the partial's pages instantly.
 
 ### Sequencing note
 
-Phase 3 explicitly depends on Phase 1 (a prefetch build's LUT is bounded
-"for free," satisfying the memory-quantification finding's prerequisite
-without extra work in Phase 3) and Phase 2 (a prefetch build's HTML-open
-step can't stall the shared render/input task otherwise). Phase 1 has
-standalone value even if Phases 2-3 are deferred or reworked later — it
-fixes a real unbounded-growth gap in every build today, not just future
-prefetch builds.
+Phase 3 depends on Phase 1 (a prefetch build's LUT is bounded "for free,"
+satisfying the memory-quantification finding's prerequisite without extra
+work in Phase 3) and incorporates revised-Phase-2's `hasHtmlCache()` gate
+directly into its own tick logic (no separate implementation step, no
+Section.cpp change needed for it). Phase 1 has standalone value even if
+Phase 3 is deferred or reworked later — it fixes a real unbounded-growth gap
+in every build today, not just future prefetch builds.
 
 ## Pre-existing bug found while stress-testing Phase 1 (2026-08-06, not caused by this branch)
 
@@ -609,3 +616,28 @@ one path (eviction) the earlier, smaller demo-book test couldn't reach. The
 still-open, unrelated pre-existing bug (previous section) remains
 unresolved and un-investigated beyond confirming it isn't this branch's
 fault.
+
+**Follow-up attempt (2026-08-07)**: tried to root-cause the pre-existing bug
+properly before moving on, per a direct request to fix it. Added
+thread-ID-tagged logging around the write path (`onPageComplete`) and read
+path (`loadPageDuringBuild`) and reproduced again. Confirmed concretely: the
+main content `file` handle genuinely is written from two different OS
+threads over one build's lifetime — the first `BUILD_PAGES_PER_CHUNK`-ish
+pages synchronously on the render task (the "Indexing" popup path in
+`render()`), the rest via the background tick on the main/loop task
+(`EpubReaderActivity.cpp:397-420`) — while all page *reads* for display
+happen exclusively on the render task. Traced the locking on both paths:
+both acquire `RenderLock` (a real `xSemaphoreCreateMutex()`,
+`ActivityManager.h:71`) for the full duration before touching `build_`/
+`file`, including an explicit re-check-under-the-lock for exactly the
+TOCTOU race this shape of code invites (comment at
+`EpubReaderActivity.cpp:401-403`). No gap found in either path. Adding the
+logging itself measurably shifted the failure point later (heisenbug
+behavior — strong evidence of genuine timing sensitivity, but not proof of
+where), and it didn't reproduce at all within 100 presses with the
+instrumentation in place. Did not reach a confirmed root cause; declined to
+apply a speculative fix to concurrency-sensitive code without one. Asked the
+user how to proceed; decision was to leave this uninvestigated further for
+now and move on to Phase 2/3. Revisit with better tooling (thread sanitizer,
+a hardware debugger, or the native SDL2 simulator with real threads instead
+of the wasm pthread-proxy shim) if it turns out to matter for this work.
