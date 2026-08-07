@@ -23,8 +23,10 @@ class Section {
   void writeSectionFileHeader(const ReaderRenderSpec& spec);
   uint32_t onPageComplete(std::unique_ptr<Page> page);
 
-  // Page-offset table entry, kept in RAM while an incremental build is running so
-  // already-built pages can be located in the partially-written .bin.
+  // Page-offset table entry. Only a small sliding window of the most recent entries is
+  // kept in RAM (see BuildContext::lut below); every entry is also spilled to
+  // lutSpillPath() as it's produced, so older entries stay reachable by seek instead of
+  // growing the in-RAM copy for the whole chapter.
   struct PageLutEntry {
     uint32_t fileOffset;
     uint16_t paragraphIndex;
@@ -33,10 +35,18 @@ class Section {
   };
   // Held only while an incremental build is in progress (see startBuild). Carries the
   // live parser plus the strings it references (the parser stores them by reference)
-  // and the in-RAM page-offset table.
+  // and a bounded window of the most-recently-built page-offset entries.
   struct BuildContext {
     std::unique_ptr<ChapterHtmlSlimParser> parser;
+    // Sliding window of the LUT_RAM_WINDOW_PAGES most recently built entries (oldest
+    // evicted from the front via recordBuiltPage) -- NOT indexed by absolute page number.
+    // Use getLutEntry(page) for lookup by page; never index this directly.
     std::vector<PageLutEntry> lut;
+    // Every PageLutEntry ever produced by this build, in page order, 12 bytes/record --
+    // written by recordBuiltPage as pages complete, read back by getLutEntry for any page
+    // that has aged out of the RAM window above. Removed once the build is committed or
+    // abandoned; never promoted like the main tmp .bin.
+    HalFile lutSpillFile;
     std::string parsePath;
     std::string contentBase;
     std::string imageBasePath;
@@ -55,8 +65,11 @@ class Section {
   };
   std::unique_ptr<BuildContext> build_;
   bool buildComplete_ = false;
-  // Pages laid out by the active build (== build_->lut.size()). Distinct from pageCount,
-  // which is the pages *available to read* and also counts a loaded partial file's pages.
+  // Pages laid out by the active build. The authoritative total -- build_->lut is only the
+  // bounded in-RAM window (see BuildContext::lut), so it is NOT builtPageCount_ once the
+  // window has evicted anything; use getLutEntry(page), never build_->lut.size(), to reason
+  // about how many pages exist. Distinct from pageCount, which is the pages *available to
+  // read* and also counts a loaded partial file's pages.
   uint16_t builtPageCount_ = 0;
   // A partial section file (suspended build from a previous session) is loaded at filePath.
   // Its pages 0..partialPageCount_-1 are readable while a rebuild extends past them.
@@ -72,10 +85,25 @@ class Section {
   // Builds write here and are swapped over filePath only on commit, so a prior
   // partial/finalized file stays readable while a rebuild is in progress.
   std::string binTmpPath() const { return filePath + ".part"; }
+  // Where recordBuiltPage spills LUT entries during a build. Always a build-scoped
+  // temporary: never promoted/renamed like binTmpPath, always removed alongside it
+  // (see abandonBuild/commitBuildFile).
+  std::string lutSpillPath() const { return filePath + ".lutspill"; }
   std::unique_ptr<Page> loadPageAt(int page) const;
-  // Read a page already laid out by the in-progress build (page < build LUT size), from
+  // Read a page already laid out by the in-progress build (page < builtPageCount_), from
   // the partially-written tmp .bin without disturbing the build's write cursor.
   std::unique_ptr<Page> loadPageDuringBuild(int page);
+  // Append a newly built page's offset-table entry to the spill file and the in-RAM
+  // window, evicting the oldest window entry past LUT_RAM_WINDOW_PAGES -- mirrors how
+  // onPageComplete already streams page content straight to disk instead of holding it
+  // in RAM, applied to the per-page offset table.
+  void recordBuiltPage(uint32_t fileOffset, uint16_t paragraphIndex, uint16_t listItemIndex,
+                       uint32_t visibleTextOffset);
+  // Look up a built page's LUT entry by absolute page number: from the in-RAM window if
+  // it's recent, otherwise by seeking lutSpillFile -- same seek-read-restore pattern
+  // loadPageDuringBuild uses for page content. The only correct way to read a build-time
+  // LUT entry; build_->lut must never be indexed directly by page number.
+  std::optional<PageLutEntry> getLutEntry(int page) const;
 
  public:
   uint16_t pageCount = 0;
@@ -168,6 +196,8 @@ class Section {
   // False with no build running -- there is nothing left to wait for, so the on-disk
   // cache answers directly.
   bool buildReachedVisibleTextOffset(uint32_t offset) const {
-    return build_ && !build_->lut.empty() && offset <= build_->lut.back().visibleTextOffset;
+    if (!build_ || builtPageCount_ == 0) return false;
+    const auto lastEntry = getLutEntry(builtPageCount_ - 1);
+    return lastEntry.has_value() && offset <= lastEntry->visibleTextOffset;
   }
 };
