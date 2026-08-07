@@ -641,3 +641,47 @@ user how to proceed; decision was to leave this uninvestigated further for
 now and move on to Phase 2/3. Revisit with better tooling (thread sanitizer,
 a hardware debugger, or the native SDL2 simulator with real threads instead
 of the wasm pthread-proxy shim) if it turns out to matter for this work.
+
+## Phase 3 implemented and validated (2026-08-07)
+
+Implemented as designed: `prefetchSection`/`prefetchSpineIndex`/
+`prefetchAheadPages` members on `EpubReaderActivity`, a tick block in
+`loop()` (serialized against the current section's own tick via
+`tickedCurrentSectionThisPass`, gated on `hasHtmlCache()` per the revised
+Phase 2 plan), and promotion at both forward-navigation sites (`pageTurn()`
+and the chapter-skip long-press handler).
+
+**Bug found and fixed during testing**: neither of the two backward
+navigation sites (`pageTurn()`'s back branch, the chapter-skip long-press
+handler's back branch) reset `prefetchSpineIndex`/`prefetchAheadPages`.
+Since prefetch only ever looks forward from `currentSpineIndex`, going
+backward leaves that accounting describing spines that are no longer ahead
+of the (now lower) `currentSpineIndex` — a real bug, caught because the
+wasm test showed the prefetch gate permanently reporting `totalAhead=10`
+(stale) after paging backward through 3 chapters, silently blocking all
+further prefetch activity from that point on. Fixed by resetting
+(discarding any live `prefetchSection` too) on both backward sites.
+
+**Validated in the wasm simulator** using the same synthetic multi-chapter
+book: read forward through titlepage → preface → chapter1 into chapter2
+(caching all three small chapters' HTML), paged back to titlepage, then
+confirmed via temporary instrumentation (reverted, not in the diff) that
+the prefetch chain correctly raced ahead through preface (3 pages) and
+partway into chapter1 during the idle time between page-turns, accumulating
+10 pages of lookahead against the `BUILD_WINDOW_AHEAD = 5` target and then
+correctly going quiet (`willTick=0`) once satisfied. Confirmed the actual
+payoff: paging forward from titlepage into preface showed `Cache found,
+skipping build...` — no `Cache not found, building...` stall, i.e. no
+indexing popup / rebuild — because the chapter was already prefetched.
+Heap stayed flat throughout a full forward/backward/forward run with zero
+errors.
+
+Not separately re-verified: the live "free handoff" promotion path
+specifically (`prefetchSection` still mid-build exactly when the reader
+arrives) — what was observed is the more common case for fast-to-build
+small chapters, where the chain finishes and folds a chapter *before* the
+reader arrives, so the reader's subsequent entry is a fast on-disk cache-hit
+reopen rather than a literal in-memory `std::move`. Both paths achieve the
+user-visible goal (no stall entering a prefetched chapter); the live-handoff
+path specifically would need a large-enough next chapter (build still in
+progress when the reader catches up) to exercise directly.

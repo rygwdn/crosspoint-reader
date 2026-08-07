@@ -19,6 +19,22 @@ class EpubReaderActivity final : public ReaderActivity {
   std::unique_ptr<Section> section = nullptr;
   int currentSpineIndex = 0;
   int nextPageNumber = 0;
+  // Cross-chapter background prefetch (maintains a constant pages-ahead budget across spine
+  // boundaries instead of resetting to 0 at each one -- see docs/notes/cross-chapter-lookahead.md).
+  // At most one of {section, prefetchSection} is ever actively building at a time (see loop()'s
+  // tickedCurrentSectionThisPass guard), so peak memory stays "one extra Section shell, one
+  // BuildContext" over today's single-section build. Invisible to progress/TOC/bookmark logic,
+  // which all key off currentSpineIndex only, until a page turn promotes it (see pageTurn()).
+  std::unique_ptr<Section> prefetchSection;
+  // Spine index prefetchSection targets, or that prefetchAheadPages' count already covers if
+  // prefetchSection is null (finalized and folded, or HTML not cached yet so this is where the
+  // chain is stalled -- see loop()). -1 = chain not started / reset.
+  int prefetchSpineIndex = -1;
+  // Pages already known-available (finalized-and-discarded, or on-disk from a previous session)
+  // in spine items strictly between currentSpineIndex and prefetchSpineIndex. Reset to 0 whenever
+  // the reader's own currentSpineIndex reaches or passes prefetchSpineIndex -- that lookahead is
+  // spent once the reader actually gets there.
+  int prefetchAheadPages = 0;
   std::optional<uint16_t> pendingPageJump;
   std::string pendingAnchor;
   int cachedSpineIndex = 0;

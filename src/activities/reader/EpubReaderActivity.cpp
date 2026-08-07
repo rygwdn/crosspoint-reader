@@ -355,11 +355,16 @@ void EpubReaderActivity::loop() {
   // partial's watermark until the build catches up, so the window check would wrongly read
   // "far enough ahead" and stall the build at 0 pages -- then the first turn past the
   // watermark re-parses the whole chapter synchronously. Keep ticking until it finalizes.
+  // tickedCurrentSectionThisPass also gates the cross-chapter prefetch tick below: the two
+  // never tick in the same pass, so at most one BuildContext (current section's or the
+  // prefetch's) is ever actively building at a time.
+  bool tickedCurrentSectionThisPass = false;
   if (section && section->isBuilding() && !RenderLock::peek() &&
       (section->isPartial() || static_cast<int>(section->pageCount) < section->currentPage + BUILD_WINDOW_AHEAD) &&
       buildTickHeapGate()) {
     RenderLock lock;
     if (section->isBuilding() && buildTickHeapGate()) {
+      tickedCurrentSectionThisPass = true;
       const unsigned long tickStart = millis();
       const bool tickOk = section->buildSomeMore(BACKGROUND_BUILD_PAGES_PER_TICK, BACKGROUND_BUILD_MAX_MS);
       const unsigned long tickDuration = millis() - tickStart;
@@ -379,6 +384,66 @@ void EpubReaderActivity::loop() {
     }
   }
 
+  // Cross-chapter prefetch: maintain a constant pages-ahead budget across spine boundaries
+  // instead of it resetting to 0 at each currentSpineIndex++ (see
+  // docs/notes/cross-chapter-lookahead.md for the full design). Only attempted once render()
+  // has run at least once (buildViewportWidth > 0, matching the partial-resume gate above) and
+  // never in the same pass as the current section's own tick.
+  if (!tickedCurrentSectionThisPass && section && !RenderLock::peek() && buildViewportWidth > 0 &&
+      buildTickHeapGate()) {
+    const int currentAhead =
+        std::max(static_cast<int>(section->pageCount) - (section->currentPage + 1), 0);
+    int totalAhead = currentAhead + prefetchAheadPages;
+    if (prefetchSection) totalAhead += static_cast<int>(prefetchSection->pageCount);
+    if (totalAhead < BUILD_WINDOW_AHEAD) {
+      RenderLock lock;
+      // cppcheck-suppress knownConditionTrueFalse
+      if (section && buildTickHeapGate()) {
+        if (!prefetchSection) {
+          const int nextIndex = (prefetchSpineIndex >= 0 ? prefetchSpineIndex : currentSpineIndex) + 1;
+          if (nextIndex < epub->getSpineItemsCount()) {
+            auto candidate = std::make_unique<Section>(epub, nextIndex, renderer);
+            // Gate: never trigger the multi-second HTML unzip in the background (see the
+            // revised Phase 2 plan) -- only chain into a spine whose HTML is already cached.
+            if (candidate->hasHtmlCache()) {
+              const ReaderRenderSpec buildSpec = SETTINGS.readerRenderSpec(buildViewportWidth, buildViewportHeight);
+              if (candidate->loadSectionFile(buildSpec) && !candidate->isPartial()) {
+                // Already fully built from a previous visit: nothing to prefetch here, just
+                // count it and let next tick's nextIndex computation continue the chain past it.
+                prefetchAheadPages += candidate->pageCount;
+                prefetchSpineIndex = nextIndex;
+              } else if (candidate->startBuild(buildSpec)) {
+                prefetchSection = std::move(candidate);
+                prefetchSpineIndex = nextIndex;
+              }
+              // else: startBuild failed -- leave prefetchSpineIndex where it was; next tick
+              // just retries hasHtmlCache()/loadSectionFile() from scratch.
+            }
+            // else: HTML not cached -- skip prefetching this spine. prefetchSpineIndex is
+            // deliberately left unadvanced so this remains the chain's target; if the reader
+            // later visits it via a normal foreground open (caching its HTML), the next
+            // prefetch tick picks the chain back up from here.
+          }
+        }
+        if (prefetchSection) {
+          const bool tickOk = prefetchSection->buildSomeMore(BACKGROUND_BUILD_PAGES_PER_TICK, BACKGROUND_BUILD_MAX_MS);
+          if (!tickOk) {
+            LOG_ERR("ERS", "Background prefetch build failed for spine %d", prefetchSpineIndex);
+            prefetchSection.reset();
+          } else if (prefetchSection->isBuildComplete()) {
+            // Fold into the running total and discard -- frees this BuildContext immediately
+            // rather than holding a second finalized Section alive; a later promotion (see
+            // pageTurn()) or reopen reads it back from its now-committed file, a cache hit.
+            prefetchAheadPages += prefetchSection->pageCount;
+            prefetchSection.reset();
+          }
+        }
+      }
+    }
+  }
+
+  // End-of-Book screen reached (currentSpineIndex == spine count) means the book is
+  // finished. Two independent finished-book features key off this same condition.
   const bool atEndOfBook = currentSpineIndex > 0 && currentSpineIndex >= epub->getSpineItemsCount();
   clearEndOfBookOptionsIfNeeded();
 
@@ -984,7 +1049,25 @@ bool EpubReaderActivity::pageTurn(bool isForwardTurn) {
       RenderLock lock;
       nextPageNumber = 0;
       currentSpineIndex++;
-      section.reset();
+      if (prefetchSection && prefetchSpineIndex == currentSpineIndex) {
+        // Free handoff: the background prefetch chain already reached exactly here, with a
+        // live (possibly still-building) Section ready -- no reopen needed.
+        section = std::move(prefetchSection);
+        prefetchSpineIndex = -1;
+        prefetchAheadPages = 0;
+      } else {
+        // Prefetch chain hasn't reached here yet, or reached and already folded it away
+        // (finalized-and-discarded, see loop()) -- either way this is a normal reopen; the
+        // lazy reload below hits the on-disk section cache the prefetch chain wrote, so it's
+        // still a fast reopen, just not a live in-memory handoff.
+        section.reset();
+        if (prefetchSpineIndex >= 0 && prefetchSpineIndex <= currentSpineIndex) {
+          // The reader has now reached or passed everything the chain had already accounted
+          // for -- that lookahead is spent. Let the tick re-measure and restart the chain.
+          prefetchSpineIndex = -1;
+          prefetchAheadPages = 0;
+        }
+      }
       lastPageTurnTime = millis();
       return true;
     } else {
@@ -1003,6 +1086,14 @@ bool EpubReaderActivity::pageTurn(bool isForwardTurn) {
       pendingPageJump = std::numeric_limits<uint16_t>::max();
       currentSpineIndex--;
       section.reset();
+      // Prefetch only ever looks forward from currentSpineIndex (see loop()), so its
+      // accounting is always stale after moving backward -- prefetchSpineIndex/
+      // prefetchAheadPages describe spines that were ahead of the *old*, higher
+      // currentSpineIndex. Drop the live build too rather than leave it tracking a
+      // now-distant target; the next tick restarts the chain fresh from here.
+      prefetchSection.reset();
+      prefetchSpineIndex = -1;
+      prefetchAheadPages = 0;
       lastPageTurnTime = millis();
       return true;
     }
@@ -1016,7 +1107,18 @@ bool EpubReaderActivity::skipPages(int amount) {
     RenderLock lock;
     nextPageNumber = 0;
     currentSpineIndex++;
-    section.reset();
+    // Same free-handoff opportunity as pageTurn()'s forward case -- see its comment.
+    if (prefetchSection && prefetchSpineIndex == currentSpineIndex) {
+      section = std::move(prefetchSection);
+      prefetchSpineIndex = -1;
+      prefetchAheadPages = 0;
+    } else {
+      section.reset();
+      if (prefetchSpineIndex >= 0 && prefetchSpineIndex <= currentSpineIndex) {
+        prefetchSpineIndex = -1;
+        prefetchAheadPages = 0;
+      }
+    }
     return true;
   } else {
     if (section->currentPage > 0) {
@@ -1027,6 +1129,10 @@ bool EpubReaderActivity::skipPages(int amount) {
       nextPageNumber = 0;
       currentSpineIndex--;
       section.reset();
+      // Prefetch only looks forward -- see pageTurn()'s backward case for why this resets.
+      prefetchSection.reset();
+      prefetchSpineIndex = -1;
+      prefetchAheadPages = 0;
       return true;
     }
   }
