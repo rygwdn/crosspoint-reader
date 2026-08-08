@@ -11,6 +11,7 @@
 #include "Epub/css/CssParser.h"
 
 class ZipFile;
+struct ZipStreamContext;
 
 class Epub {
   // the ncx file (EPUB 2)
@@ -61,6 +62,12 @@ class Epub {
                                    bool trailingNullByte = false) const;
   bool readItemContentsToStream(const std::string& itemHref, Print& out, size_t chunkSize,
                                 bool allowEarlyStop = false) const;
+  // Resumable counterpart to readItemContentsToStream(): resolves itemHref the same way,
+  // then hands off to ZipFile::beginStreamToFile(). Drive the returned context forward with
+  // ZipFile::continueStreamToFile(); returns nullptr on the same failures
+  // readItemContentsToStream() would fail on.
+  std::unique_ptr<ZipStreamContext> beginStreamItemToFile(const std::string& itemHref, const std::string& destPath,
+                                                           size_t chunkSize) const;
   // Extract an item to a file on SD. On failure the partial file is removed.
   bool extractItemToFile(const std::string& itemHref, const std::string& destPath) const;
   bool getItemSize(const std::string& itemHref, size_t* size) const;

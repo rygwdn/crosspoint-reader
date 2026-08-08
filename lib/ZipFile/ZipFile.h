@@ -171,11 +171,19 @@ class ZipFile {
 
 // Resumable state for one in-progress ZipFile::beginStreamToFile()/continueStreamToFile()
 // extraction, spanning as many continueStreamToFile() calls as needed. Owns the destination
-// file, the source zip's own file handle (via `zip`), and InflateStream's bookkeeping --
-// InflateStream's own ~43KB decompressor state lives separately (borrowed from the
-// framebuffer when available, see lib/Memory/BuildScratch.h; heap otherwise), not part of
-// this struct's own footprint. readBuf/outputBuf (chunkSize each) are the fixed cost this
-// struct carries directly: pass a small chunkSize for a background/interruptible caller,
+// file, the source zip's own file handle (via `zip`), and InflateStream's bookkeeping.
+//
+// For the DEFLATED case, InflateStream's own ~43KB decompressor state (borrowed from the
+// framebuffer via buildscratch when a FrameBufferLoan is active, heap otherwise -- see
+// lib/Memory/BuildScratch.h) is NOT held across continueStreamToFile() calls: each call
+// claims it fresh, restores whatever was spilled to stateFile by the previous call, does
+// bounded work, and spills it back before returning (unless the entry finished). This lets a
+// caller wrap each call in its own short-lived FrameBufferLoan (see
+// Section::buildSomeMore()) instead of holding the loan -- and the framebuffer it denies to
+// everything else -- for the entry's entire multi-tick extraction.
+//
+// readBuf/outputBuf (chunkSize each) and stateFile's ~43KB are the fixed cost this struct
+// carries directly: pass a small chunkSize for a background/interruptible caller,
 // readFileToStream()'s existing 8KB for a one-shot foreground one.
 //
 // Declared after ZipFile (not nested inside it): it holds a ZipFile member by value, which
@@ -188,6 +196,8 @@ struct ZipStreamContext {
 
   ZipFile zip;
   HalFile destFile;
+  HalFile stateFile;      // DEFLATED only: single-slot spill of InflateStream state between calls
+  std::string statePath;  // stateFile's path, removed by the destructor once no longer needed
   InflateStream inflate;
   std::unique_ptr<uint8_t[]> readBuf;
   std::unique_ptr<uint8_t[]> outputBuf;
@@ -196,5 +206,5 @@ struct ZipStreamContext {
   uint32_t inflatedSize = 0;   // expected total decompressed size
   uint32_t totalProduced = 0;  // decompressed bytes written to destFile so far
   bool storedMethod = false;   // true: ZIP_METHOD_STORED (raw copy, no inflate)
-  bool inflateInitialized = false;
+  bool hasSpilledState = false;  // true once a prior call has written stateFile
 };

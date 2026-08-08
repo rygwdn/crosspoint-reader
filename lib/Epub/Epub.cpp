@@ -792,6 +792,18 @@ bool Epub::readItemContentsToStream(const std::string& itemHref, Print& out, con
   return ZipFile(filepath).readFileToStream(path.c_str(), out, chunkSize, allowEarlyStop);
 }
 
+std::unique_ptr<ZipStreamContext> Epub::beginStreamItemToFile(const std::string& itemHref,
+                                                                const std::string& destPath,
+                                                                const size_t chunkSize) const {
+  if (itemHref.empty()) {
+    LOG_DBG("EBP", "Failed to begin stream, empty href");
+    return nullptr;
+  }
+
+  const std::string path = FsHelpers::normalisePath(itemHref);
+  return ZipFile::beginStreamToFile(filepath, path.c_str(), destPath, chunkSize);
+}
+
 bool Epub::extractItemToFile(const std::string& itemHref, const std::string& destPath) const {
   HalFile out;
   if (!Storage.openFileForWrite("EBP", destPath, out)) {

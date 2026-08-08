@@ -12,6 +12,7 @@ class Page;
 class GfxRenderer;
 class ChapterHtmlSlimParser;
 class CssParser;
+struct ZipStreamContext;
 
 class Section {
   std::shared_ptr<Epub> epub;
@@ -37,6 +38,16 @@ class Section {
   // live parser plus the strings it references (the parser stores them by reference)
   // and a bounded window of the most-recently-built page-offset entries.
   struct BuildContext {
+    // Non-null exactly while the HTML materialization phase is still in progress -- the
+    // build's HTML isn't cached yet, so it's being unzipped a bounded burst at a time (see
+    // Section::buildSomeMore). parser is null for the whole time htmlStream is non-null:
+    // ChapterHtmlSlimParser can't be constructed until parsePath names a complete file.
+    std::unique_ptr<ZipStreamContext> htmlStream;
+    // Stashed at startBuild() so beginParsingPhase() can construct the parser whenever HTML
+    // materialization actually finishes -- immediately (cache hit) or many ticks later
+    // (freshly unzipped).
+    ReaderRenderSpec spec;
+    std::function<void()> popupFn;
     std::unique_ptr<ChapterHtmlSlimParser> parser;
     // Sliding window of the LUT_RAM_WINDOW_PAGES most recently built entries (oldest
     // evicted from the front via recordBuiltPage) -- NOT indexed by absolute page number.
@@ -79,6 +90,11 @@ class Section {
   uint32_t partialBytesConsumed_ = 0;
   uint32_t partialTotalBytes_ = 0;
   bool finalizeBuild();
+  // Constructs the parser against build_->parsePath (already valid, cached or freshly
+  // unzipped) and calls beginParse(). Called once HTML materialization is known complete --
+  // either immediately in startBuild() (cache hit) or from buildSomeMore() once a background
+  // unzip finishes. build_ must already be set; on false the caller must abandonBuild().
+  bool beginParsingPhase();
   // Write the LUTs/anchor map (and, for a partial, the watermark trailer), patch the
   // header, stamp the version byte, and swap the tmp .bin over filePath.
   bool commitBuildFile(uint8_t version, uint32_t bytesConsumed, uint32_t totalBytes);

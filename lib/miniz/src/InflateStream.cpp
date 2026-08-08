@@ -1,6 +1,7 @@
 #include "InflateStream.h"
 
 #include <BuildScratch.h>
+#include <HalStorage.h>
 #include <Logging.h>
 
 #include <cstdlib>
@@ -13,6 +14,22 @@ namespace {
 constexpr size_t WINDOW_SIZE = TINFL_LZ_DICT_SIZE;
 // tinfl_decompressor holds mz_uint32 arrays; 8 keeps the window aligned too.
 constexpr size_t STATE_ALIGNED = (sizeof(tinfl_decompressor) + 7) & ~size_t{7};
+
+constexpr uint8_t STATE_FORMAT_VERSION = 1;
+
+// Fixed-layout header written/read as one raw block. Plain integers only (no pointers, no
+// size_t -- size_t's width isn't part of the on-disk contract even though this format never
+// leaves this device) so the block is unambiguous regardless of who reads it back.
+struct SavedHeader {
+  uint8_t version = STATE_FORMAT_VERSION;
+  uint8_t zlibWrapped = 0;
+  uint8_t finished = 0;
+  uint8_t inputExhausted = 0;
+  uint32_t windowPos = 0;
+  uint32_t pendingStart = 0;
+  uint32_t pendingLen = 0;
+  uint32_t pendingInputLen = 0;
+};
 }  // namespace
 
 InflateStream::~InflateStream() { deinit(); }
@@ -182,5 +199,56 @@ bool InflateStream::read(uint8_t* dest, const size_t len) {
     if (status == Status::Done) return total == len;
     if (produced == 0) return false;  // no progress safeguard
   }
+  return true;
+}
+
+bool InflateStream::saveState(HalFile& f, const uint8_t* pendingInput, const size_t pendingInputLen) const {
+  if (!state || !window) return false;  // streaming mode only; see header comment
+
+  SavedHeader header;
+  header.zlibWrapped = zlibWrapped ? 1 : 0;
+  header.finished = finished ? 1 : 0;
+  header.inputExhausted = inputExhausted ? 1 : 0;
+  header.windowPos = static_cast<uint32_t>(windowPos);
+  header.pendingStart = static_cast<uint32_t>(pendingStart);
+  header.pendingLen = static_cast<uint32_t>(pendingLen);
+  header.pendingInputLen = static_cast<uint32_t>(pendingInputLen);
+
+  if (f.write(&header, sizeof(header)) != sizeof(header)) return false;
+  if (f.write(state, sizeof(tinfl_decompressor)) != sizeof(tinfl_decompressor)) return false;
+  if (f.write(window, WINDOW_SIZE) != WINDOW_SIZE) return false;
+  if (pendingInputLen > 0 && f.write(pendingInput, pendingInputLen) != pendingInputLen) return false;
+  return true;
+}
+
+bool InflateStream::restoreState(HalFile& f, uint8_t* pendingInputBuf, const size_t pendingInputBufCap,
+                                  size_t* pendingInputLen) {
+  *pendingInputLen = 0;
+  if (!state || !window) return false;  // streaming mode only; see header comment
+
+  SavedHeader header;
+  if (f.read(&header, sizeof(header)) != static_cast<int>(sizeof(header))) return false;
+  if (header.version != STATE_FORMAT_VERSION) return false;
+  if (header.pendingInputLen > pendingInputBufCap) return false;  // corrupt/mismatched spill file
+
+  if (f.read(state, sizeof(tinfl_decompressor)) != static_cast<int>(sizeof(tinfl_decompressor))) return false;
+  if (f.read(window, WINDOW_SIZE) != static_cast<int>(WINDOW_SIZE)) return false;
+
+  windowPos = header.windowPos;
+  pendingStart = header.pendingStart;
+  pendingLen = header.pendingLen;
+  zlibWrapped = header.zlibWrapped != 0;
+  finished = header.finished != 0;
+  inputExhausted = header.inputExhausted != 0;
+
+  if (header.pendingInputLen > 0) {
+    if (f.read(pendingInputBuf, header.pendingInputLen) != static_cast<int>(header.pendingInputLen)) return false;
+    inPtr = pendingInputBuf;
+    inAvail = header.pendingInputLen;
+  } else {
+    inPtr = nullptr;
+    inAvail = 0;
+  }
+  *pendingInputLen = header.pendingInputLen;
   return true;
 }

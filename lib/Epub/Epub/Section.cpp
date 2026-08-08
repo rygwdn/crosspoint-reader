@@ -1,9 +1,11 @@
 #include "Section.h"
 
+#include <GfxRenderer.h>
 #include <HalStorage.h>
 #include <Logging.h>
 #include <Memory.h>
 #include <Serialization.h>
+#include <ZipFile.h>
 
 #include "Epub/css/CssParser.h"
 #include "Page.h"
@@ -84,6 +86,13 @@ constexpr size_t LUT_RAM_WINDOW_PAGES = 64;
 // buffer), so this must track the fields written/read in Section::recordBuiltPage /
 // Section::getLutEntry exactly.
 constexpr uint32_t LUT_SPILL_RECORD_SIZE = sizeof(uint32_t) + sizeof(uint16_t) + sizeof(uint16_t) + sizeof(uint32_t);
+
+// read/output buffer size for the resumable HTML unzip (ZipStreamContext::readBuf/outputBuf).
+// Smaller than readFileToStream()'s one-shot 8KB: this pair is held on the heap for the
+// entry's whole (possibly many-tick) extraction, on top of whatever else is live in the
+// background, so it stays modest. Doesn't affect the dominant per-tick cost (InflateStream's
+// ~43KB decompressor state + 32KB window, spilled to SD every tick regardless of chunk size).
+constexpr size_t HTML_STREAM_CHUNK_SIZE = 2048;
 }  // namespace
 
 // Out-of-line so the unique_ptr<ChapterHtmlSlimParser> in BuildContext can be
@@ -303,69 +312,37 @@ bool Section::startBuild(const ReaderRenderSpec& spec, const std::function<void(
   // Reuse the previously unzipped HTML if we already have it. The unzipped HTML is keyed only on the
   // book (it lives in the per-book cache dir), not on render settings, so it survives the invalidation
   // that wipes the layout (.bin) caches when font/margin/orientation change -- rebuilds then skip zip
-  // inflation entirely. It's promoted by an atomic rename as soon as the inflate succeeds (below), so
-  // even a window-only giant spine -- whose .bin never finalizes -- still caches its HTML, letting a
-  // reopen skip the multi-second inflate. If htmlPath exists it is known-complete.
+  // inflation entirely. It's promoted by an atomic rename as soon as the inflate succeeds, so even a
+  // window-only giant spine -- whose .bin never finalizes -- still caches its HTML, letting a reopen
+  // skip the multi-second inflate. If htmlPath exists it is known-complete.
   const bool reusedHtml = Storage.exists(htmlPath.c_str());
-  bool htmlCached = reusedHtml;
-  if (reusedHtml) {
-    LOG_DBG("SCT", "Reusing cached HTML %s", htmlPath.c_str());
-  } else {
-    Storage.mkdir(htmlDir.c_str());
 
-    // Retry logic for SD card timing issues
-    bool streamed = false;
-    uint32_t fileSize = 0;
-    for (int attempt = 0; attempt < 3 && !streamed; attempt++) {
+  // Not cached: kick off a resumable unzip instead of blocking here -- buildSomeMore() drives
+  // it forward a bounded burst at a time (see BuildContext::htmlStream) and only constructs
+  // the parser once it's done, whether that's later in this same call (maxDurationMs == 0,
+  // e.g. the blocking createSectionFile() path) or many ticks from now.
+  std::unique_ptr<ZipStreamContext> htmlStream;
+  if (!reusedHtml) {
+    Storage.mkdir(htmlDir.c_str());
+    if (Storage.exists(tmpHtmlPath.c_str())) {
+      Storage.remove(tmpHtmlPath.c_str());  // stale leftover from a crash-interrupted build
+    }
+    // Retry logic for SD card timing issues opening the destination file.
+    for (int attempt = 0; attempt < 3 && !htmlStream; attempt++) {
       if (attempt > 0) {
-        LOG_DBG("SCT", "Retrying stream (attempt %d)...", attempt + 1);
+        LOG_DBG("SCT", "Retrying HTML stream open (attempt %d)...", attempt + 1);
         delay(50);  // Brief delay before retry
       }
-
-      // Remove any incomplete file from previous attempt before retrying
-      if (Storage.exists(tmpHtmlPath.c_str())) {
-        Storage.remove(tmpHtmlPath.c_str());
-      }
-
-      HalFile tmpHtml;
-      if (!Storage.openFileForWrite("SCT", tmpHtmlPath, tmpHtml)) {
-        continue;
-      }
-      // Larger chunks mean far fewer SD writes inflating the HTML; a 1KB chunk turned a 584KB
-      // single-spine novel into ~570 tiny writes (multi-second). 8KB keeps the transient buffers
-      // small while cutting the write count 8x.
-      streamed = epub->readItemContentsToStream(localPath, tmpHtml, 8192);
-      fileSize = tmpHtml.size();
-      // Explicitly close() file before calling Storage.remove()
-      tmpHtml.close();
-
-      // If streaming failed, remove the incomplete file immediately
-      if (!streamed && Storage.exists(tmpHtmlPath.c_str())) {
-        Storage.remove(tmpHtmlPath.c_str());
-        LOG_DBG("SCT", "Removed incomplete temp file after failed attempt");
-      }
+      htmlStream = epub->beginStreamItemToFile(localPath, tmpHtmlPath, HTML_STREAM_CHUNK_SIZE);
     }
-
-    if (!streamed) {
-      LOG_ERR("SCT", "Failed to stream item contents to temp file after retries");
+    if (!htmlStream) {
+      LOG_ERR("SCT", "Failed to begin HTML stream after retries");
       return false;
-    }
-
-    LOG_DBG("SCT", "Streamed temp HTML to %s (%d bytes)", tmpHtmlPath.c_str(), fileSize);
-
-    // Promote to the persistent HTML cache immediately -- the inflate is complete and the bytes are
-    // valid regardless of whether the layout build finishes, so reopening (even a window-only spine
-    // that never finalizes its .bin) skips re-inflation. If the rename fails we just parse the temp.
-    if (Storage.rename(tmpHtmlPath.c_str(), htmlPath.c_str())) {
-      htmlCached = true;
-    } else {
-      LOG_DBG("SCT", "Failed to promote HTML cache; parsing from temp");
     }
   }
 
   if (!Storage.openFileForWrite("SCT", binTmpPath(), file)) {
-    if (!reusedHtml) Storage.remove(tmpHtmlPath.c_str());
-    return false;
+    return false;  // htmlStream (if any) destructs here, cleaning up its own tmp/state files
   }
   // Header is written with the incomplete-version sentinel; finalizeBuild() commits it.
   writeSectionFileHeader(spec);
@@ -375,7 +352,6 @@ bool Section::startBuild(const ReaderRenderSpec& spec, const std::function<void(
     LOG_ERR("SCT", "OOM: BuildContext");
     file.close();
     Storage.remove(binTmpPath().c_str());
-    if (!reusedHtml) Storage.remove(tmpHtmlPath.c_str());
     return false;
   }
   // Fixed-size window, reserved once: recordBuiltPage never lets it grow past this.
@@ -386,20 +362,15 @@ bool Section::startBuild(const ReaderRenderSpec& spec, const std::function<void(
     LOG_ERR("SCT", "Failed to open LUT spill file");
     file.close();
     Storage.remove(binTmpPath().c_str());
-    if (!reusedHtml) Storage.remove(tmpHtmlPath.c_str());
     return false;
   }
-  // htmlCached == "htmlPath is the live cache" (reused, or just promoted). finalizeBuild/abandonBuild
-  // then leave the cached HTML alone; only an un-promoted temp (rename failed) is theirs to clean up.
-  ctx->reusedHtml = htmlCached;
+
   ctx->htmlPath = htmlPath;
   ctx->tmpHtmlPath = tmpHtmlPath;
-  ctx->parsePath = htmlCached ? htmlPath : tmpHtmlPath;
-
-  // Derive the content base directory and image cache path prefix for the parser
-  const size_t lastSlash = localPath.find_last_of('/');
-  ctx->contentBase = (lastSlash != std::string::npos) ? localPath.substr(0, lastSlash + 1) : "";
-  ctx->imageBasePath = epub->getCachePath() + "/img_" + std::to_string(spineIndex) + "_";
+  // Stashed so beginParsingPhase() can construct the parser whenever HTML materialization
+  // actually finishes, which for a fresh unzip may be many buildSomeMore() calls from now.
+  ctx->spec = spec;
+  ctx->popupFn = popupFn;
 
   if (spec.embeddedStyle) {
     ctx->cssParser = epub->getCssParser();
@@ -407,6 +378,34 @@ bool Section::startBuild(const ReaderRenderSpec& spec, const std::function<void(
       LOG_ERR("SCT", "Failed to load CSS from cache");
     }
   }
+
+  if (reusedHtml) {
+    LOG_DBG("SCT", "Reusing cached HTML %s", htmlPath.c_str());
+    ctx->reusedHtml = true;
+    ctx->parsePath = htmlPath;
+    build_ = std::move(ctx);
+    if (!beginParsingPhase()) {
+      abandonBuild();
+      return false;
+    }
+    return true;
+  }
+
+  ctx->htmlStream = std::move(htmlStream);
+  ctx->reusedHtml = false;
+  // Not valid to read yet (htmlStream is still writing it), but set now so it's ready the
+  // instant buildSomeMore() sees the stream finish.
+  ctx->parsePath = tmpHtmlPath;
+  build_ = std::move(ctx);
+  return true;
+}
+
+bool Section::beginParsingPhase() {
+  const auto localPath = epub->getSpineItem(spineIndex).href;
+  // Derive the content base directory and image cache path prefix for the parser
+  const size_t lastSlash = localPath.find_last_of('/');
+  build_->contentBase = (lastSlash != std::string::npos) ? localPath.substr(0, lastSlash + 1) : "";
+  build_->imageBasePath = epub->getCachePath() + "/img_" + std::to_string(spineIndex) + "_";
 
   // Collect TOC anchors for this spine so the parser can insert page breaks at chapter boundaries
   std::vector<std::string> tocAnchors;
@@ -425,8 +424,9 @@ bool Section::startBuild(const ReaderRenderSpec& spec, const std::function<void(
   // live in the BuildContext (which outlives the parser). The page-complete callback
   // captures the BuildContext pointer to append to its in-RAM LUT; build_ owns the
   // context for the parser's whole lifetime.
-  BuildContext* ctxPtr = ctx.get();
-  ctx->parser = makeUniqueNoThrow<ChapterHtmlSlimParser>(
+  BuildContext* ctxPtr = build_.get();
+  const ReaderRenderSpec& spec = ctxPtr->spec;
+  ctxPtr->parser = makeUniqueNoThrow<ChapterHtmlSlimParser>(
       epub, ctxPtr->parsePath, renderer, spec.fontId, spec.lineCompression, spec.extraParagraphSpacing,
       spec.paragraphAlignment, spec.viewportWidth, spec.viewportHeight, spec.hyphenationEnabled,
       spec.focusReadingEnabled,
@@ -435,33 +435,59 @@ bool Section::startBuild(const ReaderRenderSpec& spec, const std::function<void(
         this->recordBuiltPage(this->onPageComplete(std::move(page)), paragraphIndex, listItemIndex, visibleTextOffset);
       },
       spec.embeddedStyle, ctxPtr->contentBase, ctxPtr->imageBasePath, spec.imageRendering, std::move(tocAnchors),
-      popupFn, ctxPtr->cssParser);
-  if (!ctx->parser) {
+      ctxPtr->popupFn, ctxPtr->cssParser);
+  if (!ctxPtr->parser) {
     LOG_ERR("SCT", "OOM: ChapterHtmlSlimParser");
-    if (ctx->cssParser) ctx->cssParser->clear();
-    file.close();
-    Storage.remove(binTmpPath().c_str());
-    if (!reusedHtml) Storage.remove(tmpHtmlPath.c_str());
+    if (ctxPtr->cssParser) ctxPtr->cssParser->clear();
     return false;
   }
 
   Hyphenator::setPreferredLanguage(epub->getLanguage());
-  build_ = std::move(ctx);
-
-  if (!build_->parser->beginParse()) {
+  if (!ctxPtr->parser->beginParse()) {
     LOG_ERR("SCT", "Failed to begin parse");
-    abandonBuild();
     return false;
   }
-  build_->totalBytes = build_->parser->parseTotalBytes();
+  ctxPtr->totalBytes = ctxPtr->parser->parseTotalBytes();
   return true;
 }
 
 bool Section::buildSomeMore(const int maxPages, const unsigned long maxDurationMs) {
-  if (!build_ || !build_->parser) {
+  if (!build_) {
     LOG_ERR("SCT", "buildSomeMore with no active build");
     return false;
   }
+
+  if (build_->htmlStream) {
+    // HTML materialization still in progress (see BuildContext::htmlStream): run one bounded
+    // burst of the resumable unzip. maxDurationMs == 0 (the blocking createSectionFile()/
+    // landing-page paths) runs it to completion here, same as the old blocking call did.
+    GfxRenderer::FrameBufferLoan loan(renderer);
+    const ZipFile::StreamStatus status = ZipFile::continueStreamToFile(*build_->htmlStream, maxDurationMs);
+    if (status == ZipFile::StreamStatus::Error) {
+      LOG_ERR("SCT", "Failed to stream HTML for spine %d", spineIndex);
+      abandonBuild();
+      return false;
+    }
+    if (status == ZipFile::StreamStatus::More) {
+      return true;  // yield; caller ticks again
+    }
+    // Done: nothing below touches the framebuffer, so release it before proceeding.
+    loan.end();
+    build_->htmlStream.reset();
+    if (Storage.rename(build_->tmpHtmlPath.c_str(), build_->htmlPath.c_str())) {
+      // Now the live cache; finalizeBuild()/abandonBuild() must leave it alone.
+      build_->reusedHtml = true;
+      build_->parsePath = build_->htmlPath;
+    } else {
+      LOG_DBG("SCT", "Failed to promote HTML cache; parsing from temp");
+    }
+    if (!beginParsingPhase()) {
+      abandonBuild();
+      return false;
+    }
+    // Fall through and spend whatever's left of this call's budget parsing.
+  }
+
   // Pace on pages laid out by THIS build, not pageCount: during a rebuild over a partial,
   // pageCount stays pinned at the partial's watermark until the build passes it, which
   // would otherwise turn one "small" chunk into a blocking rebuild of the whole watermark.
@@ -734,6 +760,9 @@ void Section::suspendBuild() {
     if (build_->lutSpillFile) build_->lutSpillFile.close();
     Storage.remove(lutSpillPath().c_str());
   }
+  // Drop the stream context first: its destFile is the tmp HTML file below, and removing a
+  // path out from under an open handle is unsafe. No-op once htmlStream already finished.
+  build_->htmlStream.reset();
   if (!build_->reusedHtml && Storage.exists(build_->tmpHtmlPath.c_str())) {
     Storage.remove(build_->tmpHtmlPath.c_str());
   }
@@ -759,6 +788,9 @@ void Section::abandonBuild() {
   if (Storage.exists(filePath.c_str())) {
     Storage.remove(filePath.c_str());
   }
+  // Drop the stream context first: its destFile is the tmp HTML file below, and removing a
+  // path out from under an open handle is unsafe. No-op once htmlStream already finished.
+  build_->htmlStream.reset();
   if (!build_->reusedHtml && Storage.exists(build_->tmpHtmlPath.c_str())) {
     Storage.remove(build_->tmpHtmlPath.c_str());
   }

@@ -567,6 +567,10 @@ ZipStreamContext::~ZipStreamContext() {
   // Explicit close() required before a caller might remove destFile's path (member
   // variable, O_RDWR/O_WRONLY handle) -- see CLAUDE.md's DESTRUCTOR_CLOSES_FILE notes.
   if (destFile) destFile.close();
+  // stateFile is pure scratch, worthless once this context goes away (finished, errored, or
+  // abandoned mid-extraction) -- always swept up here rather than at each call site.
+  if (stateFile) stateFile.close();
+  if (!statePath.empty()) Storage.remove(statePath.c_str());
 }
 
 size_t ZipFile::streamFillCallback(void* vctx, const uint8_t** data) {
@@ -635,13 +639,14 @@ std::unique_ptr<ZipStreamContext> ZipFile::beginStreamToFile(const std::string& 
       Storage.remove(destPath.c_str());
       return nullptr;
     }
-    if (!ctx->inflate.init(true)) {
-      LOG_ERR("ZIP", "Failed to init inflate stream for streaming");
+    // Opened once and reused (seek(0) each save/restore) as continueStreamToFile()'s
+    // single-slot spill for InflateStream's state between calls -- see the class comment.
+    ctx->statePath = destPath + ".state";
+    if (!Storage.openFileForWrite("ZIP", ctx->statePath, ctx->stateFile)) {
+      LOG_ERR("ZIP", "Failed to open state spill file for streaming: %s", ctx->statePath.c_str());
       Storage.remove(destPath.c_str());
       return nullptr;
     }
-    ctx->inflate.setFill(&ZipFile::streamFillCallback, ctx.get());
-    ctx->inflateInitialized = true;
   }
 
   return ctx;
@@ -671,6 +676,26 @@ ZipFile::StreamStatus ZipFile::continueStreamToFile(ZipStreamContext& ctx, const
     return StreamStatus::Done;
   }
 
+  // Claimed fresh every call (borrowing the framebuffer's bytes via buildscratch when the
+  // caller has a FrameBufferLoan active, heap otherwise) and released before returning --
+  // never held across a yield point, so a caller cycling a short-lived loan once per call
+  // (see Section::buildSomeMore()) never blocks the framebuffer for more than one call's
+  // worth of work. See the ZipStreamContext class comment.
+  if (!ctx.inflate.init(true)) {
+    LOG_ERR("ZIP", "Failed to init inflate stream for streaming");
+    return StreamStatus::Error;
+  }
+  ctx.inflate.setFill(&ZipFile::streamFillCallback, &ctx);
+  if (ctx.hasSpilledState) {
+    ctx.stateFile.seek(0);
+    size_t restoredLen = 0;
+    if (!ctx.inflate.restoreState(ctx.stateFile, ctx.readBuf.get(), ctx.chunkSize, &restoredLen)) {
+      LOG_ERR("ZIP", "Failed to restore inflate state while streaming");
+      ctx.inflate.deinit();
+      return StreamStatus::Error;
+    }
+  }
+
   for (;;) {
     size_t produced;
     const InflateStream::Status status = ctx.inflate.readAtMost(ctx.outputBuf.get(), ctx.chunkSize, &produced);
@@ -679,15 +704,18 @@ ZipFile::StreamStatus ZipFile::continueStreamToFile(ZipStreamContext& ctx, const
     if (ctx.totalProduced > ctx.inflatedSize) {
       LOG_ERR("ZIP", "Decompressed size exceeds expected while streaming (%u > %u)", ctx.totalProduced,
               ctx.inflatedSize);
+      ctx.inflate.deinit();
       return StreamStatus::Error;
     }
 
     if (produced > 0 && ctx.destFile.write(ctx.outputBuf.get(), produced) != produced) {
       LOG_ERR("ZIP", "Failed to write all output bytes while streaming");
+      ctx.inflate.deinit();
       return StreamStatus::Error;
     }
 
     if (status == InflateStream::Status::Done) {
+      ctx.inflate.deinit();
       if (ctx.totalProduced != ctx.inflatedSize) {
         LOG_ERR("ZIP", "Decompressed size mismatch while streaming (expected %u, got %u)", ctx.inflatedSize,
                 ctx.totalProduced);
@@ -697,10 +725,22 @@ ZipFile::StreamStatus ZipFile::continueStreamToFile(ZipStreamContext& ctx, const
     }
     if (status == InflateStream::Status::Error) {
       LOG_ERR("ZIP", "Decompression failed while streaming");
+      ctx.inflate.deinit();
       return StreamStatus::Error;
     }
     // Status::Ok: output buffer full, more remains -- yield once the time budget is spent.
     if (maxDurationMs > 0 && millis() - startTime >= maxDurationMs) {
+      const uint8_t* pendingPtr = nullptr;
+      size_t pendingLen = 0;
+      ctx.inflate.getPendingInput(&pendingPtr, &pendingLen);
+      ctx.stateFile.seek(0);
+      const bool saved = ctx.inflate.saveState(ctx.stateFile, pendingPtr, pendingLen);
+      ctx.inflate.deinit();
+      if (!saved) {
+        LOG_ERR("ZIP", "Failed to save inflate state while streaming");
+        return StreamStatus::Error;
+      }
+      ctx.hasSpilledState = true;
       return StreamStatus::More;
     }
   }

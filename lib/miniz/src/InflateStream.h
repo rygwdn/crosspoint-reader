@@ -7,6 +7,10 @@
 // decompressor state is heap-allocated in the .cpp where the type is complete.
 struct tinfl_decompressor_tag;
 
+// Forward declaration keeps HalStorage out of consumer translation units that don't need
+// save/restore (e.g. PNG decompression); only InflateStream.cpp needs the full type.
+class HalFile;
+
 // Streaming deflate decompressor wrapping miniz's tinfl.
 //
 // Replaces the uzlib-backed InflateReader on the throughput paths (EPUB zip
@@ -71,6 +75,37 @@ class InflateStream {
 
   // Decompress up to maxLen bytes into dest; *produced gets the byte count.
   Status readAtMost(uint8_t* dest, size_t maxLen, size_t* produced);
+
+  // Read-only view of the caller-provided fill-buffer bytes not yet consumed (the region
+  // [inPtr, inPtr+inAvail)). Lets a caller that wants to saveState() retrieve exactly what to
+  // pass as pendingInput/pendingInputLen without tracking its own copy of that bookkeeping.
+  void getPendingInput(const uint8_t** ptr, size_t* len) const {
+    *ptr = inPtr;
+    *len = inAvail;
+  }
+
+  // Save/restore support for a resumable stream -- e.g. a background HTML unzip that must
+  // give back its ~43KB decompressor state (borrowed from the framebuffer via
+  // buildscratch::claim()) the instant a render needs that buffer. Only supported in
+  // streaming mode (init(true)); the one-shot mode's output-buffer aliasing can't survive a
+  // suspend since the destination buffer itself doesn't persist across the interruption.
+  // Both write/read fixed-size raw blocks at f's current position -- not a portable format,
+  // just this stream's own bookkeeping round-tripped through a scratch file.
+
+  // Persists this stream's state to f. This object does not own the caller's fill-buffer, so
+  // any bytes already pulled from the last fill() call but not yet consumed (the region
+  // [inPtr, inPtr+inAvail)) must be passed in explicitly. Returns false on a write failure.
+  bool saveState(HalFile& f, const uint8_t* pendingInput, size_t pendingInputLen) const;
+
+  // Restores state written by saveState() into a stream already init(true)'d (init() resets
+  // fill/inputExhausted/etc, so this must run before any read and before a fresh
+  // setFill()/setSource() call, which it would otherwise overwrite). pendingInputBuf (at
+  // least pendingInputBufCap bytes) receives the restored pending-input bytes;
+  // *pendingInputLen receives the restored count. The caller must setFill() again afterward
+  // (init() cleared it) so the stream can fetch more once the restored bytes drain. Returns
+  // false -- leaving the stream unusable -- on a read failure or if the saved pending-input
+  // length exceeds pendingInputBufCap (corrupt/mismatched spill file).
+  bool restoreState(HalFile& f, uint8_t* pendingInputBuf, size_t pendingInputBufCap, size_t* pendingInputLen);
 
  private:
   tinfl_decompressor_tag* state = nullptr;  // ~11KB: heap, or inside the claimed build scratch

@@ -403,26 +403,21 @@ void EpubReaderActivity::loop() {
           const int nextIndex = (prefetchSpineIndex >= 0 ? prefetchSpineIndex : currentSpineIndex) + 1;
           if (nextIndex < epub->getSpineItemsCount()) {
             auto candidate = std::make_unique<Section>(epub, nextIndex, renderer);
-            // Gate: never trigger the multi-second HTML unzip in the background (see the
-            // revised Phase 2 plan) -- only chain into a spine whose HTML is already cached.
-            if (candidate->hasHtmlCache()) {
-              const ReaderRenderSpec buildSpec = SETTINGS.readerRenderSpec(buildViewportWidth, buildViewportHeight);
-              if (candidate->loadSectionFile(buildSpec) && !candidate->isPartial()) {
-                // Already fully built from a previous visit: nothing to prefetch here, just
-                // count it and let next tick's nextIndex computation continue the chain past it.
-                prefetchAheadPages += candidate->pageCount;
-                prefetchSpineIndex = nextIndex;
-              } else if (candidate->startBuild(buildSpec)) {
-                prefetchSection = std::move(candidate);
-                prefetchSpineIndex = nextIndex;
-              }
-              // else: startBuild failed -- leave prefetchSpineIndex where it was; next tick
-              // just retries hasHtmlCache()/loadSectionFile() from scratch.
+            const ReaderRenderSpec buildSpec = SETTINGS.readerRenderSpec(buildViewportWidth, buildViewportHeight);
+            if (candidate->loadSectionFile(buildSpec) && !candidate->isPartial()) {
+              // Already fully built from a previous visit: nothing to prefetch here, just
+              // count it and let next tick's nextIndex computation continue the chain past it.
+              prefetchAheadPages += candidate->pageCount;
+              prefetchSpineIndex = nextIndex;
+            } else if (candidate->startBuild(buildSpec)) {
+              // startBuild() no longer blocks on HTML unzip even for a never-before-seen
+              // spine -- it's driven forward a bounded burst at a time below, same as parsing
+              // already was (see Section::buildSomeMore()).
+              prefetchSection = std::move(candidate);
+              prefetchSpineIndex = nextIndex;
             }
-            // else: HTML not cached -- skip prefetching this spine. prefetchSpineIndex is
-            // deliberately left unadvanced so this remains the chain's target; if the reader
-            // later visits it via a normal foreground open (caching its HTML), the next
-            // prefetch tick picks the chain back up from here.
+            // else: startBuild failed -- leave prefetchSpineIndex where it was; next tick
+            // just retries loadSectionFile()/startBuild() from scratch.
           }
         }
         if (prefetchSection) {
@@ -1280,11 +1275,10 @@ void EpubReaderActivity::renderBook() {
           }
           buildPopupPending = !showPopup;
           const unsigned long buildStartMs = millis();
-          bool started;
-          {
-            GfxRenderer::FrameBufferLoan loan(renderer);
-            started = section->startBuild(renderSpec, [this] { showBuildPopup(renderer, pagesUntilFullRefresh); });
-          }
+          // startBuild() itself never touches the framebuffer -- HTML materialization (the
+          // one step that does, via InflateStream) happens inside buildSomeMore() below,
+          // which takes its own short-lived loan per call (see Section::buildSomeMore()).
+          const bool started = section->startBuild(renderSpec, [this] { showBuildPopup(renderer, pagesUntilFullRefresh); });
           if (!started) {
             LOG_ERR("ERS", "Failed to start section build");
             section.reset();
