@@ -3,6 +3,7 @@
 #include <HalStorage.h>
 #include <InflateStream.h>
 #include <Logging.h>
+#include <Memory.h>
 
 #include <algorithm>
 
@@ -560,4 +561,147 @@ bool ZipFile::readFileToStream(const char* filename, Print& out, const size_t ch
 
   LOG_ERR("ZIP", "Unsupported compression method");
   return false;
+}
+
+ZipStreamContext::~ZipStreamContext() {
+  // Explicit close() required before a caller might remove destFile's path (member
+  // variable, O_RDWR/O_WRONLY handle) -- see CLAUDE.md's DESTRUCTOR_CLOSES_FILE notes.
+  if (destFile) destFile.close();
+}
+
+size_t ZipFile::streamFillCallback(void* vctx, const uint8_t** data) {
+  auto* ctx = static_cast<ZipStreamContext*>(vctx);
+  if (ctx->fileRemaining == 0) return 0;
+
+  const size_t toRead = ctx->fileRemaining < ctx->chunkSize ? ctx->fileRemaining : ctx->chunkSize;
+  const size_t bytesRead = ctx->zip.file.read(ctx->readBuf.get(), toRead);
+  ctx->fileRemaining -= bytesRead;
+
+  *data = ctx->readBuf.get();
+  return bytesRead;
+}
+
+std::unique_ptr<ZipStreamContext> ZipFile::beginStreamToFile(const std::string& zipPath, const char* filename,
+                                                                    const std::string& destPath,
+                                                                    const size_t chunkSize) {
+  auto ctx = makeUniqueNoThrow<ZipStreamContext>(zipPath);
+  if (!ctx) {
+    LOG_ERR("ZIP", "OOM: ZipStreamContext");
+    return nullptr;
+  }
+
+  if (!ctx->zip.open()) {
+    LOG_ERR("ZIP", "Failed to open zip for streaming: %s", zipPath.c_str());
+    return nullptr;
+  }
+
+  FileStatSlim fileStat = {};
+  if (!ctx->zip.loadFileStatSlim(filename, &fileStat)) {
+    LOG_ERR("ZIP", "Entry not found for streaming: %s", filename);
+    return nullptr;
+  }
+  const long fileOffset = ctx->zip.getDataOffset(fileStat);
+  if (fileOffset < 0) {
+    LOG_ERR("ZIP", "Failed to locate data for streaming: %s", filename);
+    return nullptr;
+  }
+  ctx->zip.file.seek(fileOffset);
+
+  if (fileStat.method != ZIP_METHOD_STORED && fileStat.method != ZIP_METHOD_DEFLATED) {
+    LOG_ERR("ZIP", "Unsupported compression method for streaming: %s", filename);
+    return nullptr;
+  }
+  ctx->storedMethod = fileStat.method == ZIP_METHOD_STORED;
+  ctx->fileRemaining = fileStat.compressedSize;
+  ctx->inflatedSize = fileStat.uncompressedSize;
+  ctx->chunkSize = chunkSize;
+
+  if (!Storage.openFileForWrite("ZIP", destPath, ctx->destFile)) {
+    LOG_ERR("ZIP", "Failed to open destination for streaming: %s", destPath.c_str());
+    return nullptr;
+  }
+
+  ctx->readBuf = makeUniqueNoThrow<uint8_t[]>(chunkSize);
+  if (!ctx->readBuf) {
+    LOG_ERR("ZIP", "OOM: %zu byte stream read buffer", chunkSize);
+    Storage.remove(destPath.c_str());
+    return nullptr;
+  }
+
+  if (!ctx->storedMethod) {
+    ctx->outputBuf = makeUniqueNoThrow<uint8_t[]>(chunkSize);
+    if (!ctx->outputBuf) {
+      LOG_ERR("ZIP", "OOM: %zu byte stream output buffer", chunkSize);
+      Storage.remove(destPath.c_str());
+      return nullptr;
+    }
+    if (!ctx->inflate.init(true)) {
+      LOG_ERR("ZIP", "Failed to init inflate stream for streaming");
+      Storage.remove(destPath.c_str());
+      return nullptr;
+    }
+    ctx->inflate.setFill(&ZipFile::streamFillCallback, ctx.get());
+    ctx->inflateInitialized = true;
+  }
+
+  return ctx;
+}
+
+ZipFile::StreamStatus ZipFile::continueStreamToFile(ZipStreamContext& ctx, const unsigned long maxDurationMs) {
+  const unsigned long startTime = millis();
+
+  if (ctx.storedMethod) {
+    while (ctx.fileRemaining > 0) {
+      const size_t toRead = ctx.fileRemaining < ctx.chunkSize ? ctx.fileRemaining : ctx.chunkSize;
+      const size_t dataRead = ctx.zip.file.read(ctx.readBuf.get(), toRead);
+      if (dataRead == 0) {
+        LOG_ERR("ZIP", "Could not read more bytes while streaming");
+        return StreamStatus::Error;
+      }
+      if (ctx.destFile.write(ctx.readBuf.get(), dataRead) != dataRead) {
+        LOG_ERR("ZIP", "Failed to write all output bytes while streaming");
+        return StreamStatus::Error;
+      }
+      ctx.fileRemaining -= dataRead;
+      ctx.totalProduced += dataRead;
+      if (maxDurationMs > 0 && millis() - startTime >= maxDurationMs) {
+        return ctx.fileRemaining == 0 ? StreamStatus::Done : StreamStatus::More;
+      }
+    }
+    return StreamStatus::Done;
+  }
+
+  for (;;) {
+    size_t produced;
+    const InflateStream::Status status = ctx.inflate.readAtMost(ctx.outputBuf.get(), ctx.chunkSize, &produced);
+
+    ctx.totalProduced += produced;
+    if (ctx.totalProduced > ctx.inflatedSize) {
+      LOG_ERR("ZIP", "Decompressed size exceeds expected while streaming (%u > %u)", ctx.totalProduced,
+              ctx.inflatedSize);
+      return StreamStatus::Error;
+    }
+
+    if (produced > 0 && ctx.destFile.write(ctx.outputBuf.get(), produced) != produced) {
+      LOG_ERR("ZIP", "Failed to write all output bytes while streaming");
+      return StreamStatus::Error;
+    }
+
+    if (status == InflateStream::Status::Done) {
+      if (ctx.totalProduced != ctx.inflatedSize) {
+        LOG_ERR("ZIP", "Decompressed size mismatch while streaming (expected %u, got %u)", ctx.inflatedSize,
+                ctx.totalProduced);
+        return StreamStatus::Error;
+      }
+      return StreamStatus::Done;
+    }
+    if (status == InflateStream::Status::Error) {
+      LOG_ERR("ZIP", "Decompression failed while streaming");
+      return StreamStatus::Error;
+    }
+    // Status::Ok: output buffer full, more remains -- yield once the time budget is spent.
+    if (maxDurationMs > 0 && millis() - startTime >= maxDurationMs) {
+      return StreamStatus::More;
+    }
+  }
 }

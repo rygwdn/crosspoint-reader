@@ -1,10 +1,17 @@
 #pragma once
 #include <HalStorage.h>
+#include <InflateStream.h>
 
 #include <deque>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+
+// Defined below, after class ZipFile: it holds a ZipFile member by value, which needs
+// ZipFile to be a complete type. Forward-declared here only so ZipFile's own
+// beginStreamToFile()/continueStreamToFile() declarations can reference it.
+struct ZipStreamContext;
 
 class ZipFile {
  public:
@@ -51,6 +58,10 @@ class ZipFile {
   bool loadFileStatSlim(const char* filename, FileStatSlim* fileStat);
   long getDataOffset(const FileStatSlim& fileStat);
   bool loadZipDetails();
+  // Fill callback for beginStreamToFile()/continueStreamToFile()'s InflateStream (see
+  // ZipStreamContext below); a static member so it can reach ctx->zip.file (another
+  // ZipFile instance's own private member -- access control is per-class, not per-instance).
+  static size_t streamFillCallback(void* vctx, const uint8_t** data);
 
  public:
   explicit ZipFile(const std::string& filePath) : filePath(filePath) {}
@@ -73,6 +84,21 @@ class ZipFile {
   // stop (returns true) instead of a write failure — used by header probes
   // that only need the first bytes of an entry.
   bool readFileToStream(const char* filename, Print& out, size_t chunkSize, bool allowEarlyStop = false);
+
+  enum class StreamStatus { More, Done, Error };
+
+  // Opens destPath for writing and locates `filename` within the zip at zipPath, but does
+  // NOT read or decompress anything yet -- that's continueStreamToFile()'s job, called
+  // repeatedly afterward. Returns nullptr on failure (bad entry, can't open destPath, OOM);
+  // any partially-opened destPath is removed.
+  static std::unique_ptr<ZipStreamContext> beginStreamToFile(const std::string& zipPath, const char* filename,
+                                                              const std::string& destPath, size_t chunkSize);
+  // Continue a stream started by beginStreamToFile(), stopping after roughly maxDurationMs
+  // of wall-clock time (0 = run to completion, for a foreground/blocking caller) or sooner
+  // if the entry finishes or errors. Safe to call repeatedly; each call resumes exactly
+  // where the previous one left off. On Error, ctx's destination file is left as-is for the
+  // caller to remove (mirrors abandonBuild()-style cleanup elsewhere in this codebase).
+  static StreamStatus continueStreamToFile(ZipStreamContext& ctx, unsigned long maxDurationMs);
 
   template <typename F>
   bool enumerateFilePaths(F&& callback) {
@@ -141,4 +167,34 @@ class ZipFile {
     }
     return true;
   }
+};
+
+// Resumable state for one in-progress ZipFile::beginStreamToFile()/continueStreamToFile()
+// extraction, spanning as many continueStreamToFile() calls as needed. Owns the destination
+// file, the source zip's own file handle (via `zip`), and InflateStream's bookkeeping --
+// InflateStream's own ~43KB decompressor state lives separately (borrowed from the
+// framebuffer when available, see lib/Memory/BuildScratch.h; heap otherwise), not part of
+// this struct's own footprint. readBuf/outputBuf (chunkSize each) are the fixed cost this
+// struct carries directly: pass a small chunkSize for a background/interruptible caller,
+// readFileToStream()'s existing 8KB for a one-shot foreground one.
+//
+// Declared after ZipFile (not nested inside it): it holds a ZipFile member by value, which
+// needs ZipFile to already be a complete type.
+struct ZipStreamContext {
+  explicit ZipStreamContext(const std::string& zipPath) : zip(zipPath) {}
+  ~ZipStreamContext();
+  ZipStreamContext(const ZipStreamContext&) = delete;
+  ZipStreamContext& operator=(const ZipStreamContext&) = delete;
+
+  ZipFile zip;
+  HalFile destFile;
+  InflateStream inflate;
+  std::unique_ptr<uint8_t[]> readBuf;
+  std::unique_ptr<uint8_t[]> outputBuf;
+  size_t chunkSize = 0;
+  uint32_t fileRemaining = 0;  // compressed bytes not yet read from the zip entry
+  uint32_t inflatedSize = 0;   // expected total decompressed size
+  uint32_t totalProduced = 0;  // decompressed bytes written to destFile so far
+  bool storedMethod = false;   // true: ZIP_METHOD_STORED (raw copy, no inflate)
+  bool inflateInitialized = false;
 };

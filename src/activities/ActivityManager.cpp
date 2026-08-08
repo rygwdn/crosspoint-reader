@@ -367,12 +367,37 @@ void ActivityManager::requestUpdateAndWait() {
 
 // RenderLock
 
+namespace {
+// See RenderLock::setContentionCallback's doc comment (RenderLock.h). Plain function
+// pointer + context, not std::function: avoids the heap-allocating closure and per-
+// signature binary bloat CLAUDE.md flags for library/render-path code.
+void (*contentionCallbackFn)(void*) = nullptr;
+void* contentionCallbackCtx = nullptr;
+}  // namespace
+
 RenderLock::RenderLock() {
+  // Fast, non-blocking probe first: uncontended is the overwhelmingly common case across
+  // this codebase's many RenderLock call sites, so this costs nothing extra when nobody's
+  // fighting over the lock. Only on an actual miss do we pay for the callback + real wait.
+  if (xSemaphoreTake(activityManager.renderingMutex, 0) == pdTRUE) {
+    isLocked = true;
+    return;
+  }
+  if (contentionCallbackFn) {
+    contentionCallbackFn(contentionCallbackCtx);
+  }
   xSemaphoreTake(activityManager.renderingMutex, portMAX_DELAY);
   isLocked = true;
 }
 
 RenderLock::RenderLock([[maybe_unused]] Activity&) {
+  if (xSemaphoreTake(activityManager.renderingMutex, 0) == pdTRUE) {
+    isLocked = true;
+    return;
+  }
+  if (contentionCallbackFn) {
+    contentionCallbackFn(contentionCallbackCtx);
+  }
   xSemaphoreTake(activityManager.renderingMutex, portMAX_DELAY);
   isLocked = true;
 }
@@ -399,3 +424,13 @@ void RenderLock::unlock() {
  *
  */
 bool RenderLock::peek() { return xQueuePeek(activityManager.renderingMutex, NULL, 0) != pdTRUE; };
+
+void RenderLock::setContentionCallback(void (*fn)(void*), void* ctx) {
+  contentionCallbackFn = fn;
+  contentionCallbackCtx = ctx;
+}
+
+void RenderLock::clearContentionCallback() {
+  contentionCallbackFn = nullptr;
+  contentionCallbackCtx = nullptr;
+}
