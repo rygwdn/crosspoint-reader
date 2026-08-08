@@ -1642,6 +1642,19 @@
               </label>
             </div>
           </div>
+          <!-- Simplify CSS to Classes -->
+          <div class="advanced-setting-row">
+            <div class="setting-label">
+              <div class="setting-title">🔤 Simplify CSS Styling</div>
+              <div class="setting-desc">Resolve the book's CSS cascade and bake it directly into each chapter as inline styles, fixing selectors CrossPoint's on-device engine can't parse and removing now-dead stylesheet files</div>
+            </div>
+            <div class="setting-controls">
+              <label class="toggle-switch">
+                <input type="checkbox" id="cssSquashToggle" onchange="updateQualitySettings()">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+          </div>
           <!-- Target Device -->
           <div class="advanced-setting-row" id="deviceSettingRow">
             <div class="setting-title">📱 Target Device</div>
@@ -2285,6 +2298,7 @@
   function updateQualitySettings() {
     const quality = document.getElementById('qualitySlider').value;
     const autoCropToggle = document.getElementById('autoCropToggle');
+    const cssSquashToggle = document.getElementById('cssSquashToggle');
 
     // Update displays (if element exists)
     const qualityDisplay = document.getElementById('qualityDisplaySimple');
@@ -2296,6 +2310,7 @@
     JPEG_QUALITY = parseInt(quality, 10);
     ENABLE_GRAYSCALE = true; // Always grayscale for e-ink
     ENABLE_AUTO_CROP = autoCropToggle ? autoCropToggle.checked : false;
+    ENABLE_CSS_SQUASH = cssSquashToggle ? cssSquashToggle.checked : false;
     if (isImagePickerVisible()) {
       renderImageGrid();
     }
@@ -3297,6 +3312,7 @@ const DEFAULT_MAX_HEIGHT = DEVICE_PROFILES[DEFAULT_DEVICE].height;
 const DEFAULT_JPEG_QUALITY = 85;
 const DEFAULT_ENABLE_GRAYSCALE = true;
 const DEFAULT_ENABLE_AUTO_CROP = false;
+const DEFAULT_ENABLE_CSS_SQUASH = false;
 // Auto-crop is opt-in because sparse title/logo pages can be zoomed aggressively.
 const CROP_WHITE_THRESHOLD = 245;
 const CROP_BACKGROUND_TOLERANCE = 28;
@@ -3317,6 +3333,7 @@ let MAX_HEIGHT = DEFAULT_MAX_HEIGHT;
 let JPEG_QUALITY = DEFAULT_JPEG_QUALITY;
 let ENABLE_GRAYSCALE = DEFAULT_ENABLE_GRAYSCALE;
 let ENABLE_AUTO_CROP = DEFAULT_ENABLE_AUTO_CROP;
+let ENABLE_CSS_SQUASH = DEFAULT_ENABLE_CSS_SQUASH;
 let HANDEDNESS = 'right'; // 'right' = clockwise (right-handed), 'left' = counter-clockwise (left-handed)
 let OVERLAP_PERCENT = 5; // Minimum overlap percentage for splits (5%, 10%, 15%)
 const UPLOAD_SETTINGS_STORAGE_KEY = 'crosspoint.files.uploadSettings.v1';
@@ -3325,6 +3342,7 @@ const DEFAULT_UPLOAD_SETTINGS = Object.freeze({
   renameFromMetadata: false,
   quality: DEFAULT_JPEG_QUALITY,
   autoCrop: DEFAULT_ENABLE_AUTO_CROP,
+  cssSquash: DEFAULT_ENABLE_CSS_SQUASH,
   deviceTarget: 'auto',
   handedness: 'right',
   overlap: 5,
@@ -3338,6 +3356,7 @@ function getCurrentUploadSettings() {
     renameFromMetadata: !!document.getElementById('renameFromMetadataToggle')?.checked,
     quality: parseInt(document.getElementById('qualitySlider')?.value || JPEG_QUALITY, 10),
     autoCrop: !!document.getElementById('autoCropToggle')?.checked,
+    cssSquash: !!document.getElementById('cssSquashToggle')?.checked,
     deviceTarget: DEVICE_TARGET,
     handedness: HANDEDNESS,
     overlap: OVERLAP_PERCENT,
@@ -3352,6 +3371,7 @@ function applyUploadSettings(settings = {}) {
     document.getElementById('convertBeforeUpload').checked = !!merged.convertBeforeUpload;
     document.getElementById('renameFromMetadataToggle').checked = !!merged.renameFromMetadata;
     document.getElementById('autoCropToggle').checked = !!merged.autoCrop;
+    document.getElementById('cssSquashToggle').checked = !!merged.cssSquash;
     document.getElementById('export-log-checkbox').checked = !!merged.exportLog;
     document.getElementById('rememberUploadSettings').checked = !!settings.rememberSettings;
 
@@ -4065,6 +4085,22 @@ function safeSerialize(doc, originalContent) {
   result = result.replace(/ xmlns:ns\d+="[^"]*"/g, '');
   result = result.replace(/ ns\d+:/g, ' ');
 
+  // An element re-parsed via the HTML parser (e.g. srcdoc, used by
+  // squashCssToClasses) treats a source `xmlns="..."` attribute as an
+  // ordinary attribute rather than a namespace declaration, so
+  // XMLSerializer adds its own `xmlns="..."` on top - producing a
+  // duplicate attribute, which is a fatal XML well-formedness error.
+  // Collapse exact-duplicate xmlns/xmlns:* declarations within one tag.
+  result = result.replace(/<[a-zA-Z][^>]*>/g, tag => {
+    const seen = new Set();
+    return tag.replace(/\s+(xmlns(?::[\w-]+)?)="([^"]*)"/g, (m, name, val) => {
+      const key = name + '=' + val;
+      if (seen.has(key)) return '';
+      seen.add(key);
+      return m;
+    });
+  });
+
   return result;
 }
 
@@ -4196,7 +4232,7 @@ function stripFontEncryptionEntries(xmlText, fontPaths) {
  * update split image manifest entries, remove stripped font
  * entries, ensure cover meta. DOMParser with regex fallback.
  */
-function fixOPF(opfText, opfOriginal, opfDir, splitImages = {}, fontPaths = null) {
+function fixOPF(opfText, opfOriginal, opfDir, splitImages = {}, fontPaths = null, dropCssItems = false) {
   let t = opfText;
 
   try {
@@ -4204,9 +4240,17 @@ function fixOPF(opfText, opfOriginal, opfDir, splitImages = {}, fontPaths = null
     const doc = parser.parseFromString(t, 'application/xml');
     if (doc.querySelector('parsererror')) throw new Error('OPF parse failed');
 
+    // CSS is now baked into each chapter's own style="" attributes (see
+    // squashCssToClasses) — the stylesheet files are gone, so their
+    // manifest entries would otherwise dangle.
+    if (dropCssItems) {
+      for (const item of [...doc.getElementsByTagNameNS('*', 'item')]) {
+        if ((item.getAttribute('media-type') || '') === 'text/css') item.remove();
+      }
+    }
+
     const items = [...doc.getElementsByTagNameNS('*', 'item')];
     const manifestEl = doc.getElementsByTagNameNS('*', 'manifest')[0];
-
     // Fix media-types for converted images
     for (const item of items) {
       const href = item.getAttribute('href') || '';
@@ -4267,6 +4311,7 @@ function fixOPF(opfText, opfOriginal, opfDir, splitImages = {}, fontPaths = null
     t = safeSerialize(doc, opfOriginal);
   } catch (e) {
     // Regex fallback
+    if (dropCssItems) t = t.replace(/<(?:\w+:)?item\b[^>]*media-type="text\/css"[^>]*\/>\s*/g, '');
     t = t.replace(/(<(?:\w+:)?item\b[^>]*href="[^"]+\.jpg"[^>]*)media-type="image\/(png|gif|webp|bmp)"/g, '$1media-type="image/jpeg"');
     t = t.replace(/(<(?:\w+:)?item\b[^>]*)media-type="image\/(png|gif|webp|bmp)"([^>]*href="[^"]+\.jpg")/g, '$1media-type="image/jpeg"$3');
     t = t.replace(/\s+svg(?=["'\s>])/g, '');
@@ -5036,6 +5081,345 @@ async function processImage(data, imageState = 0, imagePath = '') {
   });
 }
 
+// ============================================================================
+// CSS-to-inline-style squashing (optional "Simplify CSS Styling" advanced option)
+// ============================================================================
+//
+// Precomputes the real CSS cascade in a hidden iframe (via getComputedStyle,
+// which correctly resolves specificity/inheritance/!important) and bakes the
+// result of every property CrossPoint's on-device engine actually understands
+// directly onto each element as a `style="..."` attribute, then drops the
+// book's original CSS entirely (external <link>s, inline <style> blocks, and
+// the stylesheet files themselves — see convertEpubFile). This is necessary,
+// not just an optimization:
+//
+// 1. lib/Epub/Epub/css/CssParser.cpp only matches simple `tag`, `.class`, or
+//    `tag.class` selectors — any selector with a combinator (space, >, ~,
+//    etc.) is silently skipped during parsing, so descendant-selector
+//    overrides (e.g. ".section .exception{font-weight:normal}") are
+//    otherwise silently ignored on-device and render wrong.
+// 2. lib/Epub/Epub/parsers/ContentOpfParser.cpp:231-234 / Epub.cpp:252-358
+//    only ever load CSS rules from files registered in the OPF manifest as
+//    media-type="text/css". A `<style>` block embedded inside a chapter's
+//    own XHTML is never read by the device at all — only `style="..."`
+//    attributes are (ChapterHtmlSlimParser.cpp:465-469, parseInlineStyle),
+//    which is why this pass targets attributes, not a generated stylesheet.
+//
+// Property values are read via getComputedStyle (bold/italic/underline
+// thresholds mirror the firmware's own semantics exactly — CssParser.cpp:
+// interpretFontWeight/interpretFontStyle/interpretDecoration), except for
+// margin/padding/text-indent, which are re-expressed relative to the
+// element's own computed font-size (matching CrossPoint's own em resolution
+// at render time — ChapterHtmlSlimParser.cpp:954, getFontAscenderSize) so
+// spacing continues to scale correctly when the user changes font size
+// on-device, instead of baking in a fixed pixel/viewport snapshot.
+//
+// Which properties are relevant, and which are forced/ignored by the tag
+// itself, mirrors ChapterHtmlSlimParser.cpp's own dispatch exactly:
+//   - display:none (any element, checked first) hides the whole subtree
+//     on-device (line 491-496) — nothing else about a hidden element matters.
+//   - <a href="..."> to a relative/in-book target ignores ALL of its own CSS
+//     and is force-underlined by the parser (lines 910-951) — skipped
+//     entirely. External links (http/https/mailto/ftp/tel) and anchors
+//     without an href fall through to generic inline handling instead.
+//   - table/tr/td/th get a fully hardcoded synthetic cell style and never
+//     consult CSS for themselves (lines 499-562, early `return`s) — skipped.
+//   - sup/sub are forced without consulting CSS at all (lines 1081-1096) —
+//     skipped.
+//   - h1-h6 are always rendered bold regardless of CSS (line 988,
+//     boldUntilDepth) — font-weight is dropped from their facet set.
+//   - b/strong force bold, i/em force italic, u/ins force the underline
+//     decoration bit, del/s/strike force the line-through bit (lines
+//     1027-1130) — those specific forced properties/bits are excluded from
+//     what gets baked in, since the tag itself already guarantees them.
+//   - img/image are skipped for width/height: the upload pipeline already
+//     strips their width/height *attributes* for the same reason (dimensions
+//     may have changed after re-encoding — see the img pass in
+//     convertEpubFile), so baking CSS-declared dimensions back in via style
+//     would reintroduce exactly that bug.
+//
+// Elements are modified in place — class attributes are dropped everywhere
+// (the device never resolves a class against removed CSS), but the DOM
+// structure, ids, and every other attribute are left untouched.
+
+function isBoldWeight(computedFontWeight) {
+  const n = parseInt(computedFontWeight, 10);
+  if (!Number.isNaN(n)) return n >= 700; // matches CssParser.cpp: numericWeight >= 700
+  return /^(bold|bolder)$/i.test(computedFontWeight);
+}
+
+function isItalicStyle(computedFontStyle) {
+  return /^(italic|oblique)/i.test(computedFontStyle); // matches CssParser.cpp
+}
+
+// NOTE: appendChild() alone triggers an implicit navigation to about:blank,
+// which fires its own 'load' event. Attaching onload before appendChild (or
+// before setting srcdoc) races against that empty-document load and can
+// resolve the promise with an empty iframe. Always: append first, then
+// attach the handler, then set srcdoc.
+function loadXhtmlIntoHiddenIframe(xhtmlString) {
+  return new Promise((resolve, reject) => {
+    const iframe = document.createElement('iframe');
+    iframe.style.cssText = 'position:absolute;width:0;height:0;border:0;visibility:hidden;';
+    document.body.appendChild(iframe);
+    iframe.onload = () => resolve(iframe);
+    iframe.onerror = () => reject(new Error('iframe failed to load'));
+    iframe.srcdoc = xhtmlString;
+  });
+}
+
+const DECORATION_PROPS = ['text-decoration', 'text-decoration-line'];
+
+function elementHasOwnDeclaration(doc, el, propNames) {
+  if (el.style) {
+    for (const p of propNames) {
+      if (el.style.getPropertyValue(p)) return true;
+    }
+  }
+  for (const sheet of doc.styleSheets) {
+    let rules;
+    try { rules = sheet.cssRules; } catch (e) { continue; } // cross-origin sheet, inaccessible
+    for (const rule of rules) {
+      if (!rule.selectorText || !rule.style) continue;
+      let matches = false;
+      try { matches = el.matches(rule.selectorText); } catch (e) { continue; } // unsupported selector syntax
+      if (!matches) continue;
+      for (const p of propNames) {
+        if (rule.style.getPropertyValue(p)) return true;
+      }
+    }
+  }
+  return false;
+}
+
+// Tag classification, mirroring ChapterHtmlSlimParser.cpp's HEADER_TAGS/
+// BLOCK_TAGS/BOLD_TAGS/ITALIC_TAGS/UNDERLINE_TAGS/LINETHROUGH_TAGS arrays
+// (lines 39-52) and isHeaderOrBlock/isTableStructuralTag.
+const HEADER_TAGS = new Set(['h1', 'h2', 'h3', 'h4', 'h5', 'h6']);
+const BLOCK_TAGS = new Set(['p', 'div', 'li', 'blockquote']);
+const BOLD_TAGS = new Set(['b', 'strong']);
+const ITALIC_TAGS = new Set(['i', 'em']);
+const UNDERLINE_TAGS = new Set(['u', 'ins']);
+const LINETHROUGH_TAGS = new Set(['del', 's', 'strike']);
+// Tags the parser never consults CSS for on their own element (structural
+// wrappers, table cells with a hardcoded synthetic style, void/media tags).
+const SKIP_TAGS = new Set([
+  'html', 'head', 'body', 'title', 'meta', 'link', 'style', 'script', 'base',
+  'table', 'tr', 'td', 'th', 'noscript', 'br', 'img', 'image', 'hr',
+  'area', 'col', 'colgroup', 'object', 'embed', 'iframe', 'video', 'audio', 'source', 'track',
+]);
+const LENGTH_PROPS = [
+  'margin-top', 'margin-bottom', 'margin-left', 'margin-right',
+  'padding-top', 'padding-bottom', 'padding-left', 'padding-right',
+  'text-indent',
+];
+
+// Mirrors ChapterHtmlSlimParser.cpp:isInternalEpubLink — any non-empty href
+// that isn't an absolute external scheme is treated as an in-book link.
+function isInternalEpubLink(href) {
+  if (!href) return false;
+  return !/^(https?:|mailto:|ftp:|tel:|javascript:)/i.test(href);
+}
+
+// Which style facets are worth checking for a given element, and which
+// text-decoration bits that tag already forces (so they're excluded from
+// what gets baked in as redundant with the tag's own guaranteed styling).
+function relevantFacetsForElement(el, tag) {
+  if (tag === 'a' && isInternalEpubLink(el.getAttribute('href'))) return null;
+  if (SKIP_TAGS.has(tag) || tag === 'sup' || tag === 'sub') return null;
+  if (HEADER_TAGS.has(tag)) {
+    return { textAlign: true, fontStyle: true, textDecoration: true, direction: true, box: true };
+  }
+  if (BLOCK_TAGS.has(tag)) {
+    return { textAlign: true, fontWeight: true, fontStyle: true, textDecoration: true, direction: true, box: true };
+  }
+  if (BOLD_TAGS.has(tag)) {
+    return { fontStyle: true, textDecoration: true, direction: true, verticalAlign: true };
+  }
+  if (ITALIC_TAGS.has(tag)) {
+    return { fontWeight: true, textDecoration: true, direction: true, verticalAlign: true };
+  }
+  if (UNDERLINE_TAGS.has(tag)) {
+    return { fontWeight: true, fontStyle: true, direction: true, verticalAlign: true, textDecoration: true, decorationMask: ['underline'] };
+  }
+  if (LINETHROUGH_TAGS.has(tag)) {
+    return { fontWeight: true, fontStyle: true, direction: true, verticalAlign: true, textDecoration: true, decorationMask: ['line-through'] };
+  }
+  // Generic inline element (span, dt, dd, external/anchorless <a>, etc.) —
+  // matches the parser's final `span || !isHeaderOrBlock` branch.
+  return { fontWeight: true, fontStyle: true, textDecoration: true, direction: true, verticalAlign: true };
+}
+
+function camelizeCssProp(prop) {
+  return prop.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+}
+
+// Re-expresses a computed length as an em value relative to the element's
+// own font-size, so it scales the same way on-device (emSize-relative) as
+// it would have from an em-authored rule, instead of baking in a fixed
+// pixel/viewport-width snapshot taken from the conversion-time iframe.
+function lengthAsEm(cs, prop) {
+  const px = parseFloat(cs[camelizeCssProp(prop)]);
+  const fontPx = parseFloat(cs.fontSize);
+  if (!Number.isFinite(px) || !Number.isFinite(fontPx) || fontPx <= 0) return null;
+  const em = Math.round((px / fontPx) * 10000) / 10000;
+  return `${em}em`;
+}
+
+// Computes the minimal `prop:value` declaration list CrossPoint understands
+// for one element, using only properties the element has its own matching
+// CSS declaration for (elementHasOwnDeclaration) — purely-inherited values
+// are left alone since the device's own cascade already produces them.
+function computeElementDeclarations(doc, cs, el, facets) {
+  const decls = [];
+
+  if (facets.textAlign && elementHasOwnDeclaration(doc, el, ['text-align'])) {
+    const v = cs.textAlign;
+    const norm = (v === 'right' || v === 'end') ? 'right' : v === 'center' ? 'center' : v === 'justify' ? 'justify' : 'left';
+    decls.push(`text-align:${norm}`);
+  }
+  if (facets.fontWeight && elementHasOwnDeclaration(doc, el, ['font-weight'])) {
+    decls.push(`font-weight:${isBoldWeight(cs.fontWeight) ? 'bold' : 'normal'}`);
+  }
+  if (facets.fontStyle && elementHasOwnDeclaration(doc, el, ['font-style'])) {
+    decls.push(`font-style:${isItalicStyle(cs.fontStyle) ? 'italic' : 'normal'}`);
+  }
+  if (facets.textDecoration && elementHasOwnDeclaration(doc, el, DECORATION_PROPS)) {
+    const mask = new Set(facets.decorationMask || []);
+    const lines = (cs.textDecorationLine || 'none').split(/\s+/)
+      .filter(l => (l === 'underline' || l === 'line-through') && !mask.has(l));
+    if (lines.length) decls.push(`text-decoration:${lines.join(' ')}`);
+  }
+  if (facets.direction && elementHasOwnDeclaration(doc, el, ['direction'])) {
+    decls.push(`direction:${cs.direction === 'rtl' ? 'rtl' : 'ltr'}`);
+  }
+  if (facets.verticalAlign && elementHasOwnDeclaration(doc, el, ['vertical-align'])) {
+    if (cs.verticalAlign === 'super') decls.push('vertical-align:super');
+    else if (cs.verticalAlign === 'sub') decls.push('vertical-align:sub');
+  }
+  if (facets.box) {
+    for (const prop of LENGTH_PROPS) {
+      if (!elementHasOwnDeclaration(doc, el, [prop])) continue;
+      const em = lengthAsEm(cs, prop);
+      if (!em) continue;
+      // BlockStyle.h has no marginDefined/paddingDefined flag - margin/padding of 0 is
+      // already the on-device default, and getCombinedBlockStyle's max()/addition combine
+      // can't tell "explicitly 0" from "unset" either way, so a 0 declaration here changes
+      // nothing on-device. text-indent (and text-align, handled above) DO have a Defined
+      // flag that blocks ancestor inheritance even at 0, so those must always be baked.
+      if (prop !== 'text-indent' && parseFloat(em) === 0) continue;
+      decls.push(`${prop}:${em}`);
+    }
+  }
+
+  return decls;
+}
+
+// Resolves the chapter's own external/inline CSS (via the <link>/<style>
+// tags in its <head>) into one combined CSS text, so it can be injected into
+// the hidden iframe before computing styles — the iframe's srcdoc runs at
+// about:srcdoc, so a relative <link href="../stylesheet.css"> can never
+// resolve to the in-memory ZIP contents on its own.
+function collectChapterCss(doc, chapterPath, cssTextByPath) {
+  let combined = '';
+  if (!doc.head) return combined;
+  for (const link of doc.head.querySelectorAll('link[rel="stylesheet"]')) {
+    const href = link.getAttribute('href');
+    if (!href) continue;
+    const resolved = resolvePath(chapterPath, decodeHref(href));
+    const css = cssTextByPath[resolved];
+    if (css) combined += css + '\n';
+  }
+  for (const styleEl of doc.head.querySelectorAll('style')) {
+    combined += (styleEl.textContent || '') + '\n';
+  }
+  return combined;
+}
+
+/**
+ * Bakes the resolved CSS cascade for `xhtmlString` (a chapter at
+ * `chapterPath`, referencing stylesheets from `cssTextByPath`) directly onto
+ * each element as a `style="..."` attribute, and strips the original CSS
+ * references. Returns the transformed markup, or the original string
+ * unchanged if anything about the document couldn't be parsed/processed
+ * (fail open — this is an optional optimization, never worth blocking an
+ * upload over).
+ */
+async function squashCssToClasses(xhtmlString, chapterPath, cssTextByPath) {
+  let iframe;
+  try {
+    iframe = await loadXhtmlIntoHiddenIframe(xhtmlString);
+  } catch (e) {
+    console.warn('CSS squash: iframe load failed', e);
+    return xhtmlString;
+  }
+
+  try {
+    const doc = iframe.contentDocument;
+    const win = iframe.contentWindow;
+    if (!doc || !doc.body || !doc.head) return xhtmlString;
+
+    const combinedCss = collectChapterCss(doc, chapterPath, cssTextByPath);
+    let injectedStyle = null;
+    if (combinedCss) {
+      injectedStyle = doc.createElement('style');
+      injectedStyle.textContent = combinedCss;
+      doc.head.appendChild(injectedStyle);
+    }
+
+    let changed = false;
+    // Two passes: reading computed style for one element must see every
+    // OTHER element's class attribute untouched too, since a descendant
+    // selector's ancestor half (".section .exception") or a later sibling's
+    // own rule can still depend on it. Stripping classes as we go would
+    // corrupt the cascade for anything not yet visited.
+    const elements = [...doc.body.querySelectorAll('*')];
+    for (const el of elements) {
+      const tag = el.tagName.toLowerCase();
+      const cs = win.getComputedStyle(el);
+
+      let newStyle;
+      if (elementHasOwnDeclaration(doc, el, ['display']) && cs.display === 'none') {
+        newStyle = 'display:none';
+      } else {
+        const facets = relevantFacetsForElement(el, tag);
+        newStyle = facets ? computeElementDeclarations(doc, cs, el, facets).join(';') : '';
+      }
+
+      const oldStyle = el.getAttribute('style') || '';
+      if (newStyle !== oldStyle) {
+        if (newStyle) el.setAttribute('style', newStyle); else el.removeAttribute('style');
+        changed = true;
+      }
+    }
+    for (const el of elements) {
+      if (el.hasAttribute('class')) { el.removeAttribute('class'); changed = true; }
+    }
+
+    // Styling is now fully baked into style="" attributes — the only
+    // per-element CSS the device actually parses (see the block comment
+    // above). The original references are now dead weight; drop them.
+    if (injectedStyle) injectedStyle.remove();
+    for (const link of [...doc.head.querySelectorAll('link[rel="stylesheet"]')]) { link.remove(); changed = true; }
+    for (const styleEl of [...doc.head.querySelectorAll('style')]) { styleEl.remove(); changed = true; }
+
+    if (!changed) return xhtmlString;
+
+    // srcdoc always parses as HTML, so a leading <?xml?> declaration gets
+    // turned into a bogus-comment DOM node rather than being recognized —
+    // safeSerialize() restores a real declaration from the original source
+    // (same helper used for the OPF/img-fix passes above), then strip the
+    // leftover mangled comment safeSerialize doesn't know to remove.
+    return safeSerialize(doc, xhtmlString).replace(/^(<\?xml[^>]*\?>\s*)<!--\?xml[^>]*\?-->/, '$1');
+  } catch (e) {
+    console.warn('CSS squash: transform failed, using original', e);
+    return xhtmlString;
+  } finally {
+    iframe.remove();
+  }
+}
+
+
 // Convert EPUB file - returns converted blob
 async function convertEpubFile(file, progressCallback) {
   const startTime = Date.now();
@@ -5045,7 +5429,7 @@ async function convertEpubFile(file, progressCallback) {
   clearLog();
   showLog();
   log(`<strong>${file.name}</strong> <span class="log-detail">(${formatBytes(originalSize)})</span>`, '', 'INFO');
-  log(`Quality: ${JPEG_QUALITY}% | Overlap: ${OVERLAP_PERCENT}% | Rotation: ${HANDEDNESS === 'right' ? 'CW' : 'CCW'} | Grayscale: ${ENABLE_GRAYSCALE ? 'ON' : 'OFF'} | Auto-crop: ${ENABLE_AUTO_CROP ? 'ON' : 'OFF'}`, '', 'INFO');
+  log(`Quality: ${JPEG_QUALITY}% | Overlap: ${OVERLAP_PERCENT}% | Rotation: ${HANDEDNESS === 'right' ? 'CW' : 'CCW'} | Grayscale: ${ENABLE_GRAYSCALE ? 'ON' : 'OFF'} | Auto-crop: ${ENABLE_AUTO_CROP ? 'ON' : 'OFF'} | Simplify CSS: ${ENABLE_CSS_SQUASH ? 'ON' : 'OFF'}`, '', 'INFO');
 
   const zip = await JSZip.loadAsync(file);
   const renamed = {};
@@ -5060,6 +5444,7 @@ async function convertEpubFile(file, progressCallback) {
   const entries = Object.entries(zip.files);
   const splitImages = {};
   const xhtmlFiles = {};
+  const cssTextByPath = {}; // populated below only when ENABLE_CSS_SQUASH, keyed by zip path
   let opfPath = null, opfContent = null;
   let mainIdentifier = null;
 
@@ -5153,6 +5538,10 @@ async function convertEpubFile(file, progressCallback) {
       }
     } else if (low.match(/\.(xhtml|html|htm)$/)) {
       xhtmlFiles[path] = await safeReadText(fileObj);
+    } else if (low.endsWith('.css')) {
+      // Only needed to inject the real cascade into the squash iframe below —
+      // skip the read entirely when the option is off.
+      if (ENABLE_CSS_SQUASH) cssTextByPath[path] = await safeReadText(fileObj);
     } else if (low.endsWith('.opf')) {
       opfPath = path;
       opfContent = await safeReadText(fileObj);
@@ -5338,6 +5727,15 @@ async function convertEpubFile(file, progressCallback) {
       logFix('@font-face', `${ff.count} rule(s) removed from ${escapeHtml(xhtmlPath.split('/').pop())}`);
       return open + ff.css + close;
     });
+    // Optional: bake the resolved CSS cascade directly onto elements as
+    // style="" attributes and drop the book's original CSS (see
+    // squashCssToClasses above for why). Fails open — falls back to the
+    // untouched markup on any parse/transform error.
+    if (ENABLE_CSS_SQUASH) {
+      const beforeSquash = t;
+      t = await squashCssToClasses(t, xhtmlPath, cssTextByPath);
+      if (t !== beforeSquash) logFix('CSS simplified', xhtmlPath.split('/').pop());
+    }
 
     // Inject universal image constraint — prevents overflow on e-ink displays
     if (t.includes('</head>')) {
@@ -5359,7 +5757,7 @@ async function convertEpubFile(file, progressCallback) {
       t = t.split(o.split('/').pop()).join(n.split('/').pop());
     }
     const opfDir = opfPath.includes('/') ? opfPath.substring(0, opfPath.lastIndexOf('/')) : '';
-    t = fixOPF(t, opfContent, opfDir, splitImages, fontPaths);
+    t = fixOPF(t, opfContent, opfDir, splitImages, fontPaths, ENABLE_CSS_SQUASH);
     if (t !== opfContent) logFix('OPF', 'manifest updated');
     out.file(opfPath, t, { compression: 'DEFLATE', compressionOptions: { level: 8 }, createFolders: false });
   }
@@ -5370,6 +5768,7 @@ async function convertEpubFile(file, progressCallback) {
     if (fileObj.dir || path === 'mimetype') continue;
     const low = path.toLowerCase();
     if (low.match(/\.(png|gif|webp|bmp|jpg|jpeg)$/) || low.match(/\.(xhtml|html|htm)$/) || low.endsWith('.opf')) continue;
+    if (ENABLE_CSS_SQUASH && low.endsWith('.css')) continue; // baked into style="" attrs; drop the now-dead file
 
     if (fontPaths.has(path)) {
       const fontData = await fileObj.async('arraybuffer');
