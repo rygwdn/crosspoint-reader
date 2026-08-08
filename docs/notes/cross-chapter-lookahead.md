@@ -685,3 +685,109 @@ reopen rather than a literal in-memory `std::move`. Both paths achieve the
 user-visible goal (no stall entering a prefetched chapter); the live-handoff
 path specifically would need a large-enough next chapter (build still in
 progress when the reader catches up) to exercise directly.
+
+## Phase 4: interruptible HTML unzip (`area-resumable-html-unzip`)
+
+Phase 2's `hasHtmlCache()` gate meant prefetch never touched a
+never-before-seen chapter's zip entry at all — the multi-second-scale
+inflate for a giant spine stayed strictly foreground/blocking. This phase
+removes that gate by making the inflate itself interruptible, so prefetch
+can now warm a chapter nobody has opened yet.
+
+**Building blocks** (`lib/miniz/src/InflateStream.{h,cpp}`,
+`lib/ZipFile/ZipFile.{h,cpp}`, `lib/Epub/Epub.{h,cpp}`):
+- `InflateStream::saveState()`/`restoreState()`: serializes the ~43KB
+  decompressor state (11KB `tinfl_decompressor`, pure POD — confirmed no
+  pointers — plus the 32KB window) and the caller's own unconsumed
+  fill-buffer bytes to/from a `HalFile`, via a new `getPendingInput()`
+  getter so the caller doesn't need to track `inPtr`/`inAvail` itself.
+- `ZipFile::beginStreamToFile()`/`continueStreamToFile()`: a resumable
+  counterpart to the existing blocking `readFileToStream()`.
+  `continueStreamToFile()` claims a fresh `InflateStream` *every call*
+  (`init(true)`), restores whatever a prior call spilled to
+  `ZipStreamContext::stateFile` (a single-slot side file next to the
+  destination, e.g. `.tmp_3.html.state`), decompresses up to
+  `maxDurationMs`, and — if not finished — spills state back out and
+  `deinit()`s before returning `More`. `maxDurationMs == 0` degenerates to
+  the old fully-blocking behavior with zero save/restore overhead (never
+  hits the `More` branch).
+- `Epub::beginStreamItemToFile()`: resolves an item href the same way
+  `readItemContentsToStream()` does, then hands off to the above.
+
+**Design pivot, documented for anyone revisiting this**: the original plan
+(this doc's earlier drafts, and see the session transcript) was a
+`RenderLock` contention callback — the background unzip would hold a
+`GfxRenderer::FrameBufferLoan` across *many* ticks (avoiding the cost of
+repeatedly losing the framebuffer's contents) and only release+spill when a
+waiting render actually signaled contention. That was built (commit
+`a96c1cf8` on this branch, later reverted) before checking
+`GfxRenderer::releaseFrameBufferForBuild()`/`restoreFrameBufferAfterBuild()`
+(`lib/GfxRenderer/GfxRenderer.cpp:132-152`) directly: both are pure
+in-memory pointer swaps into `buildscratch`'s registry — **no hardware
+refresh happens in the loan cycle itself**. "Restore returns the buffer
+white" only means the *next* real draw must be a full (not partial) redraw;
+it doesn't cost anything until something actually draws. That collapses the
+whole problem: cycling the loan every ~15ms background tick is cheap, so
+`Section::buildSomeMore()` just takes a short-lived
+`GfxRenderer::FrameBufferLoan` for each `continueStreamToFile()` call,
+exactly mirroring the RenderLock cycling the parser tick already did. A
+waiting render blocks at most one tick either way — no new synchronization
+primitive needed. The contention-callback code was ripped back out
+(`git checkout 861ee4e3 -- src/activities/RenderLock.h
+src/activities/ActivityManager.cpp`) rather than shipped unused.
+
+**`Section` state machine** (`lib/Epub/Epub/Section.{h,cpp}`):
+`BuildContext` gained `htmlStream` (non-null exactly while HTML
+materialization is still in progress — parser is null the whole time),
+plus a stashed `spec`/`popupFn` so the parser can be constructed whenever
+materialization actually finishes, which for a fresh unzip is however many
+ticks later. `startBuild()` no longer blocks on the inflate: cache hit ⇒
+`beginParsingPhase()` runs immediately (unchanged fast path); cache miss ⇒
+kicks off `epub->beginStreamItemToFile()` and returns. `buildSomeMore()`
+gained an `if (build_->htmlStream)` branch at the top: one bounded
+`continueStreamToFile()` burst (own `FrameBufferLoan`), `Error` ⇒
+`abandonBuild()`, `More` ⇒ return (yield to caller), `Done` ⇒ promote the
+tmp HTML the same way the old blocking code did, then
+`beginParsingPhase()`, then fall through to spend whatever budget is left
+parsing. `suspendBuild()`/`abandonBuild()` both needed a fix to `reset()`
+`htmlStream` *before* attempting to remove the tmp HTML path — its
+`destFile` is that same path, open; removing a path out from under an open
+SdFat handle is unsafe.
+
+**Wiring**: `EpubReaderActivity`'s foreground landing-page path no longer
+wraps `startBuild()` in an external `FrameBufferLoan` (dead weight now —
+`startBuild()` itself never touches the framebuffer; `buildSomeMore()`
+manages its own loan per burst). The prefetch tick's `hasHtmlCache()` gate
+is gone entirely: prefetch now calls `startBuild()` unconditionally and
+lets the ticked `htmlStream` burst do the work, same as parsing already
+did.
+
+**Validated in the wasm simulator** (rebuilt against this worktree,
+`-DCROSSPOINT_FIRMWARE_DIR=.../area-resumable-html-unzip`; the harness
+needed `Module.FS` exported — see `crosspoint-simulator`'s
+`wasm/CMakeLists.txt` — to inject the test book at runtime without a
+rebuild). Two driven runs, both zero `[ERR]` lines and flat heap
+(~3.4MB used throughout, no growth):
+1. Fresh read from the very start (nothing cached anywhere) through
+   titlepage → preface → chapter1 → chapter2 (the synthetic book's giant,
+   never-before-opened 400-paragraph/124KB spine). Both the chapter1 and
+   chapter2 transitions show *no* `Loading file:`/`Cache not found,
+   building...` log (that log only fires on the fresh-load path, not
+   prefetch promotion — see `EpubReaderActivity.cpp:1259` vs. the
+   `section = std::move(prefetchSection)` sites), i.e. both transitions
+   were silent prefetch-promotion hits, including into the giant chapter
+   that Phase 2's gate would have skipped entirely. Chapter2 content
+   rendered correctly (`Chapter 2: The Long Middle ~5/189`, page text
+   intact) with consistent ~27-30ms page-render times throughout, no
+   stalls.
+2. Rapid forward/backward paging near the start (no idle gaps, deliberately
+   racing a backward-nav prefetch reset against an in-flight `htmlStream`
+   burst) to exercise the `suspendBuild()`/`abandonBuild()` ordering fix.
+   No crash; log shows `Reusing cached HTML .../html/3.html` +
+   `Deserialization succeeded: 2 pages (partial)` on a later revisit to
+   chapter2 — confirming a promoted HTML cache survives an abandoned
+   in-progress build (only the *parse*, not the already-inflated HTML, is
+   thrown away on backward-nav reset).
+
+Not yet done: on-device testing (real SD card I/O timing, real button
+latency during a burst).
