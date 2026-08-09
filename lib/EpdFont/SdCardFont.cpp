@@ -10,6 +10,7 @@
 #include <memory>
 
 #include "EpdFontFamily.h"
+#include "SdFontFlashCache.h"
 
 static_assert(sizeof(EpdGlyph) == 16, "EpdGlyph must be 16 bytes to match .cpfont file layout");
 static_assert(sizeof(EpdUnicodeInterval) == 12, "EpdUnicodeInterval must be 12 bytes to match .cpfont file layout");
@@ -180,6 +181,12 @@ void SdCardFont::freeStyleAll(PerStyle& s) {
   s.bmpIntervals = nullptr;
   s.intervalsAreBmp16 = false;
   freeStyleKernLigatureData(s);
+  // flashData only ever points into the flash cache singleton's mapped region --
+  // never something this instance owns -- so there's nothing to free, just the
+  // pointers/flag to reset before this PerStyle can be reused by a fresh load().
+  memset(&s.flashData, 0, sizeof(s.flashData));
+  s.flashResident = false;
+  s.epdFont.data = &s.stubData;
   s.present = false;
 }
 
@@ -728,6 +735,96 @@ bool SdCardFont::load(const char* path) {
   return true;
 }
 
+// --- Flash residency ---
+
+bool SdCardFont::activateFlashCache(const char* familyName, uint8_t pointSize) {
+  if (!loaded_) {
+    LOG_ERR("SDCF", "activateFlashCache: font not loaded");
+    return false;
+  }
+
+  HalFile file;
+  if (!Storage.openFileForRead("SDCF", filePath_, file)) {
+    LOG_ERR("SDCF", "activateFlashCache: failed to reopen %s -- staying on SD paging", filePath_);
+    return false;
+  }
+  const size_t fileSize = file.fileSize();
+
+  auto& cache = SdFontFlashCache::instance();
+  const uint8_t* base = cache.tryLoad(familyName, pointSize, contentHash_, fileSize);
+  if (!base) {
+    LOG_DBG("SDCF", "flash-cache miss for %s@%u (hash=0x%08x, %u bytes) -- copying from SD", familyName, pointSize,
+            contentHash_, static_cast<unsigned>(fileSize));
+    base = cache.store(familyName, pointSize, contentHash_, file, fileSize);
+    if (!base) {
+      LOG_ERR("SDCF", "flash-cache store failed for %s@%u -- staying on SD paging", familyName, pointSize);
+      return false;
+    }
+  } else {
+    LOG_DBG("SDCF", "flash-cache hit for %s@%u (hash=0x%08x) -- reusing resident copy", familyName, pointSize,
+            contentHash_);
+  }
+
+  // Point every present style directly at the flash-resident payload. No
+  // glyphMissHandler/coverageHandler: the interval table below is the complete
+  // one (not a page subset), so EpdFont::getGlyph()/hasCodepoint() never need to
+  // fall through to SD I/O for this font again.
+  for (uint8_t i = 0; i < MAX_STYLES; i++) {
+    auto& s = styles_[i];
+    if (!s.present) continue;
+
+    // Drop any legacy on-demand state this style accumulated before promotion --
+    // flash residency replaces the mini/overflow/kern-ligature machinery, it
+    // doesn't sit alongside it.
+    freeStyleMiniData(s);
+    freeStyleKernLigatureData(s);
+    // The RAM-resident coverage index (findGlobalGlyphIndex's fullIntervals /
+    // bmpIntervals, loaded by load() for every font regardless of flash
+    // residency) is now redundant: flashData.intervals below is the same data,
+    // resident in flash, and every caller that used to consult it
+    // (prewarmStyle, fetchAdvancesForCodepoints, onGlyphMiss/onCoverageQuery via
+    // the now-nullptr glyphMissHandler/coverageHandler) is guarded off for
+    // flash-resident styles. Freeing it here is real RAM back to the heap, not
+    // just dead weight avoidance.
+    delete[] s.fullIntervals;
+    s.fullIntervals = nullptr;
+    delete[] s.bmpIntervals;
+    s.bmpIntervals = nullptr;
+    s.intervalsAreBmp16 = false;
+
+    memset(&s.flashData, 0, sizeof(s.flashData));
+    s.flashData.advanceY = s.header.advanceY;
+    s.flashData.ascender = s.header.ascender;
+    s.flashData.descender = s.header.descender;
+    s.flashData.is2Bit = s.header.is2Bit;
+    s.flashData.intervals = reinterpret_cast<const EpdUnicodeInterval*>(base + s.intervalsFileOffset);
+    s.flashData.intervalCount = s.header.intervalCount;
+    s.flashData.glyph = reinterpret_cast<const EpdGlyph*>(base + s.glyphsFileOffset);
+    s.flashData.bitmap = base + s.bitmapFileOffset;
+
+    if (s.header.kernLeftEntryCount > 0 && s.header.kernRightEntryCount > 0) {
+      s.flashData.kernLeftClasses = reinterpret_cast<const EpdKernClassEntry*>(base + s.kernLeftFileOffset);
+      s.flashData.kernRightClasses = reinterpret_cast<const EpdKernClassEntry*>(base + s.kernRightFileOffset);
+      s.flashData.kernMatrix = reinterpret_cast<const int8_t*>(base + s.kernMatrixFileOffset);
+      s.flashData.kernLeftEntryCount = s.header.kernLeftEntryCount;
+      s.flashData.kernRightEntryCount = s.header.kernRightEntryCount;
+      s.flashData.kernLeftClassCount = s.header.kernLeftClassCount;
+      s.flashData.kernRightClassCount = s.header.kernRightClassCount;
+    }
+    if (s.header.ligaturePairCount > 0) {
+      s.flashData.ligaturePairs = reinterpret_cast<const EpdLigaturePair*>(base + s.ligatureFileOffset);
+      s.flashData.ligaturePairCount = s.header.ligaturePairCount;
+    }
+
+    s.flashResident = true;
+    s.epdFont.data = &s.flashData;
+  }
+
+  LOG_INF("SDCF", "%s@%u is now flash-resident (%u style(s)) -- SD paging bypassed", familyName, pointSize,
+          styleCount_);
+  return true;
+}
+
 // --- Codepoint lookup ---
 
 int32_t SdCardFont::findGlobalGlyphIndex(const PerStyle& s, uint32_t codepoint) const {
@@ -764,6 +861,10 @@ int SdCardFont::prewarm(TextGetter getter, const void* ctx, uint32_t textCount, 
   if (!loaded_ || getter == nullptr) return -1;
   styleMask = resolveStyleMask(styleMask);
   if (styleMask == 0) return 0;
+  // Flash-resident styles need no prewarm -- EpdFont::getGlyph() already reads
+  // their full interval/glyph/bitmap tables straight from flash, so there's
+  // nothing here to load and no SD I/O to amortize.
+  if (!anyLegacyStyle(styleMask)) return 0;
 
   unsigned long startMs = millis();
 
@@ -907,6 +1008,12 @@ int SdCardFont::prewarm(TextGetter getter, const void* ctx, uint32_t textCount, 
 int SdCardFont::prewarmStyle(uint8_t styleIdx, const uint32_t* codepoints, uint32_t cpCount, bool metadataOnly,
                              bool loadKernLig) {
   auto& s = styles_[styleIdx];
+
+  // Flash-resident: fullIntervals/bmpIntervals were freed at activation (see
+  // activateFlashCache) since findGlobalGlyphIndex is never needed again for this
+  // style, so nothing below is safe to run. Nothing missed -- the flash-resident
+  // interval table is already the complete one.
+  if (s.flashResident) return 0;
 
   // Idle-prewarm hit: mini data persists across PrewarmScopes (resetStyleMiniData
   // keeps it), so when the previous scope -- typically the idle prewarm of this
@@ -1249,7 +1356,12 @@ void SdCardFont::clearCache() {
   // layout passes so repeated section indexing amortizes SD reads. Use
   // clearPersistentCache() to wipe it.
   for (uint8_t i = 0; i < MAX_STYLES; i++) {
-    if (!styles_[i].present) continue;
+    // Flash-resident styles have no mini data to reset and must keep
+    // glyphMissHandler/coverageHandler nullptr (re-applying the legacy callback
+    // here would silently reintroduce SD fallback for a style that no longer
+    // needs it, without ever restoring the freed fullIntervals/bmpIntervals it
+    // would rely on).
+    if (!styles_[i].present || styles_[i].flashResident) continue;
     resetStyleMiniData(styles_[i]);
     applyGlyphMissCallback(i);
   }
@@ -1352,7 +1464,11 @@ uint16_t SdCardFont::getAdvance(uint32_t codepoint, uint8_t style) const {
 int SdCardFont::fetchAdvancesForCodepoints(uint32_t* codepoints, uint32_t cpCount, uint8_t styleMask) {
   int totalMissed = 0;
   for (uint8_t si = 0; si < MAX_STYLES; si++) {
-    if (!(styleMask & (1 << si)) || !styles_[si].present) continue;
+    // Flash-resident styles never populate an advance table (getTextAdvanceX()'s
+    // hasAdvanceTable() check then naturally falls through to plain glyph-based
+    // measurement for them, same as a builtin font) -- and findGlobalGlyphIndex
+    // below would be reading freed fullIntervals/bmpIntervals for these anyway.
+    if (!(styleMask & (1 << si)) || !styles_[si].present || styles_[si].flashResident) continue;
     const auto& s = styles_[si];
 
     // Stop fetching once the cache is full — further inserts would be dropped
@@ -1457,6 +1573,10 @@ int SdCardFont::buildAdvanceTableRange(Iter begin, Iter end, bool includeSpace, 
   if (!loaded_) return -1;
   styleMask = resolveStyleMask(styleMask);
   if (styleMask == 0) return 0;
+  // Flash-resident styles measure straight off the resident glyph table (see
+  // fetchAdvancesForCodepoints) -- skip the whole codepoint scan when there's no
+  // legacy style left to build a table for.
+  if (!anyLegacyStyle(styleMask)) return 0;
 
   unsigned long startMs = millis();
 
@@ -1548,6 +1668,13 @@ uint8_t SdCardFont::resolveStyleMask(uint8_t styleMask) const {
     }
   }
   return resolvedMask;
+}
+
+bool SdCardFont::anyLegacyStyle(uint8_t styleMask) const {
+  for (uint8_t si = 0; si < MAX_STYLES; si++) {
+    if ((styleMask & (1 << si)) && styles_[si].present && !styles_[si].flashResident) return true;
+  }
+  return false;
 }
 
 // --- On-demand glyph loading (overflow buffer) ---

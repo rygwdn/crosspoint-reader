@@ -28,7 +28,8 @@ int SdCardFontManager::computeFontId(uint32_t contentHash, const char* familyNam
   return id != 0 ? id : 1;  // 0 is reserved as "not found" sentinel
 }
 
-int SdCardFontManager::loadFile(const SdCardFontFileInfo& file, const char* familyName, GfxRenderer& renderer) {
+int SdCardFontManager::loadFile(const SdCardFontFileInfo& file, const char* familyName, GfxRenderer& renderer,
+                                bool tryFlashCache) {
   auto* font = new (std::nothrow) SdCardFont();
   if (!font) {
     LOG_ERR("SDMGR", "Failed to allocate SdCardFont for %s", file.path.c_str());
@@ -39,6 +40,13 @@ int SdCardFontManager::loadFile(const SdCardFontFileInfo& file, const char* fami
     LOG_ERR("SDMGR", "Failed to load %s", file.path.c_str());
     delete font;
     return 0;
+  }
+
+  // Best-effort: on any failure the font stays exactly as load() left it (SD
+  // paging via the mini/overflow cache), which is already fully functional --
+  // this is a pure acceleration attempt, never a requirement.
+  if (tryFlashCache) {
+    font->activateFlashCache(familyName, file.pointSize);
   }
 
   int fontId = computeFontId(font->contentHash(), familyName, file.pointSize);
@@ -71,7 +79,11 @@ bool SdCardFontManager::loadFamily(const SdCardFontFamilyInfo& family, GfxRender
     return false;
   }
 
-  if (loadFile(*selected, family.name.c_str(), renderer) == 0) {
+  // The reader-size font is the dominant render/measure workload (nearly all
+  // body text), so it's the one worth promoting to flash residency. UI
+  // fallback sizes (loadFamilyExtraSize) stay on SD paging for now -- they're
+  // small, occasional-use CJK glyphs, not worth a second flash-cache slot yet.
+  if (loadFile(*selected, family.name.c_str(), renderer, /*tryFlashCache=*/true) == 0) {
     return false;
   }
 
@@ -91,7 +103,7 @@ int SdCardFontManager::loadFamilyExtraSize(const SdCardFontFamilyInfo& family, G
     if (lf.size == pointSize) return lf.fontId;
   }
 
-  return loadFile(*file, family.name.c_str(), renderer);
+  return loadFile(*file, family.name.c_str(), renderer, /*tryFlashCache=*/false);
 }
 
 void SdCardFontManager::unloadAll(GfxRenderer& renderer) {

@@ -138,6 +138,20 @@ class SdCardFont {
   // Used to generate deterministic font IDs for section cache invalidation.
   uint32_t contentHash() const { return contentHash_; }
 
+  // Attempt to promote this already-`load()`-ed font to a flash-resident copy
+  // (see SdFontFlashCache): the whole .cpfont file gets copied once into the
+  // reserved flash partition and memory-mapped, after which every present style's
+  // EpdFont reads full glyph/interval/kern/ligature data directly from flash --
+  // zero further SD I/O, same cost shape as a builtin font.
+  //
+  // Fails soft: on any failure (partition unavailable, too small, copy/verify
+  // error) this logs why and returns false, leaving every style exactly as
+  // load() left it -- the existing SD-paging path (mini cache, overflow ring,
+  // advance table) keeps working unmodified. Safe to call even if a previous
+  // call already activated the cache (idempotent: re-checks the resident
+  // content hash before re-copying).
+  bool activateFlashCache(const char* familyName, uint8_t pointSize);
+
  private:
   // Per-style metadata (parsed from file header/TOC)
   struct CpFontHeader {
@@ -250,6 +264,16 @@ class SdCardFont {
     uint16_t miniKernRightCapacity = 0;
     uint32_t miniKernMatrixCapacity = 0;
 
+    // Set by activateFlashCache() when the entire .cpfont for this font is resident
+    // in the flash cache (see SdFontFlashCache). flashData then holds full
+    // intervals/glyph/bitmap/kern/ligature pointers straight into mapped flash --
+    // no glyphMissHandler, no mini/overflow buffers, no advance table -- exactly the
+    // shape of a builtin font's EpdFontData. Left default-initialized (all nullptr)
+    // whenever activation didn't happen or failed, so the legacy stub/mini path
+    // above is what's actually in effect.
+    EpdFontData flashData{};
+    bool flashResident = false;
+
     // The EpdFont whose data pointer we manage
     EpdFont epdFont{&stubData};
 
@@ -301,6 +325,13 @@ class SdCardFont {
   Stats stats_;
   uint32_t contentHash_ = 0;
   bool loaded_ = false;
+
+  // True if at least one present style in styleMask still needs the legacy
+  // SD-paging path (i.e. is not flash-resident). Guards the mini-cache/advance-
+  // table machinery so a flash-resident font's per-page maintenance calls become
+  // free no-ops instead of touching (null, for flash-resident styles)
+  // fullIntervals/bmpIntervals or re-reading already-flash-resident data from SD.
+  bool anyLegacyStyle(uint8_t styleMask) const;
 
   // Per-style helpers
   void freeStyleMiniData(PerStyle& s);
