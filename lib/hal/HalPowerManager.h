@@ -33,6 +33,13 @@ class HalPowerManager {
   static constexpr unsigned long IDLE_POWER_SAVING_MS = 3000;  // ms
   static constexpr unsigned long BATTERY_POLL_MS = 1500;       // ms
 
+  // Gauge-backed boards (X3) report SoC straight from a single I2C register read with
+  // no smoothing (unlike the ADC path below, which applies an EMA). A single flaky
+  // read showing up as a sudden, unexplained drop is a reported symptom (e.g. 80% ->
+  // 7%); log any poll-to-poll change at or above this threshold at ERR level (always
+  // compiled in, flushed to the on-disk log) so the jump is diagnosable after the fact.
+  static constexpr int BATTERY_JUMP_LOG_THRESHOLD = 15;  // percentage points
+
   void begin();
 
   // Control CPU frequency for power saving

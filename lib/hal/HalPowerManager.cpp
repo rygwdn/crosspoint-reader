@@ -4,6 +4,7 @@
 #include <Logging.h>
 #include <PowerManager.h>
 #include <WiFi.h>
+
 #include <esp_sleep.h>
 #include <soc/soc_caps.h>
 
@@ -21,6 +22,22 @@ HalPowerManager powerManager;  // Singleton instance
 // Xteink boards. Other boards use it for unrelated signals, including the
 // X4 Pro display chip select.
 static constexpr gpio_num_t XTEINK_C3_GPIO13 = GPIO_NUM_13;
+
+namespace {
+// Distinguishes "RTC memory holds a real prior reading" from "undefined garbage after a
+// true power-on/brownout" -- RTC_NOINIT_ATTR survives ESP.restart() (a software reset)
+// but its content is unspecified after power actually drops, so the sentinel is what
+// makes it safe to trust on the very first poll after boot. See its use in
+// HalPowerManager::getBatteryPercentage() below.
+constexpr uint32_t BATTERY_PERCENT_RTC_MAGIC = 0xba77e4f0;
+}  // namespace
+
+// Last known battery percent, carried across ESP.restart() only (see
+// BATTERY_PERCENT_RTC_MAGIC above). Not a HalPowerManager member: RTC_NOINIT_ATTR
+// requires static/global storage placed in the RTC_NOINIT linker section, which a class
+// member's storage duration doesn't guarantee.
+RTC_NOINIT_ATTR uint32_t rtcBatteryPercentMagic;
+RTC_NOINIT_ATTR uint16_t rtcBatteryPercent;
 
 void HalPowerManager::begin() {
   if (BoardConfig::ACTIVE.batteryAdc >= 0) {
@@ -120,12 +137,99 @@ uint16_t HalPowerManager::getBatteryPercentage() const {
       return _batteryCachedPercent;
     }
 
+    const bool firstPoll = (_batteryLastPollMs == 0);
     _batteryLastPollMs = now;
-    uint16_t percent = 0;
-    if (!battery.readPercentageChecked(percent)) {
+
+    if (_batteryVoltageEstimateQuery && _batteryVoltageEstimateQuery()) {
+      // Bypasses the SoC register (and the jump-debounce below) entirely: some
+      // CEDV profiles hard-correct SoC in a single abrupt step at an EDV2
+      // threshold crossing (see the jump-debounce comment further down), which
+      // no amount of debouncing can fully hide without also delaying every real
+      // change. Voltage declines smoothly under load, so it doesn't have that
+      // failure mode -- at the cost of the flatter mid-discharge resolution
+      // LIION_NOTCH_MV already documents. Opt-in via SETTINGS.batteryUseVoltageEstimate.
+      const BatteryMonitor::Status status = battery.readStatus();
+      if (!status.millivoltsKnown) {
+        LOG_ERR("PWR", "Battery voltage read failed, keeping cached %d%%", _batteryCachedPercent);
+        return _batteryCachedPercent;
+      }
+      // 101 (>100) on the first poll opts out of percentageFromMillivolts's
+      // hysteresis, matching the SoC path's own no-baseline-yet handling above.
+      const uint16_t previousPercent = firstPoll ? 101 : static_cast<uint16_t>(_batteryCachedPercent);
+      _batteryCachedPercent = BatteryMonitor::percentageFromMillivolts(status.millivolts, previousPercent);
       return _batteryCachedPercent;
     }
+
+    uint16_t percent = 0;
+    if (!battery.readPercentageChecked(percent)) {
+      LOG_ERR("PWR", "Battery gauge SoC read failed, keeping cached %d%%", _batteryCachedPercent);
+      return _batteryCachedPercent;
+    }
+
+    // _batteryCachedPercent/_batteryLastPollMs are runtime members that reset to 0 on
+    // every reboot, so a plain "!firstPoll" gate skips jump detection entirely on the
+    // first poll after EVERY reboot -- including main.cpp's silentRestart()/
+    // silentRestartToReader(), an intentional ESP.restart() that WiFi/web-server
+    // activities trigger in onExit() to defrag heap. That's exactly the boundary where
+    // the reported 80%->7% misread was seen in the field: heap had fragmented down to
+    // under 1KB free during a slow WebDAV session, the activity exited (triggering
+    // silentRestart()), and the first post-reboot poll (7%) was trusted outright with no
+    // comparison against the pre-reboot 80% at all -- the ERR log below never fired for
+    // the one case it was added to catch. rtcBatteryPercent survives ESP.restart() (see
+    // BATTERY_PERCENT_RTC_MAGIC above), so it stands in as the baseline specifically for
+    // that first post-reboot poll; a true power-on/brownout leaves the magic unset, so
+    // this correctly stays disabled after actual power loss (where the gauge itself
+    // needs to re-settle anyway).
+    int baseline = _batteryCachedPercent;
+    bool haveBaseline = !firstPoll;
+    if (firstPoll && rtcBatteryPercentMagic == BATTERY_PERCENT_RTC_MAGIC) {
+      baseline = rtcBatteryPercent;
+      haveBaseline = true;
+    }
+
+    const int delta = static_cast<int>(percent) - baseline;
+    const int absDelta = delta < 0 ? -delta : delta;
+    if (haveBaseline && absDelta >= BATTERY_JUMP_LOG_THRESHOLD) {
+      // Fetch mV/charging/EDV2 only on an anomalous jump, not every poll, to avoid
+      // extra I2C traffic on the common path. edv2Below+smoothingActive test the
+      // leading hypothesis for X3's reported 80%->7% jumps: the BQ27220's CEDV
+      // algorithm hard-corrects RM/SoC to a configured "Battery Low %" the instant
+      // compensated cell voltage crosses the EDV2 threshold (TI TRM SLUUBD4A section
+      // 1.1.4), rather than declining gradually -- unless CEDV Smoothing is enabled
+      // (section 1.1.13). If edv2Below is true here, that confirms this mechanism.
+      const BatteryMonitor::Status status = battery.readStatus();
+      bool edv2Below = false;
+      bool smoothingActive = false;
+      const bool edv2Known = battery.readGaugeEdv2Status(edv2Below, smoothingActive);
+      LOG_ERR("PWR", "Battery gauge SoC jumped %d%% -> %d%% (mV=%u, charging=%s, edv2=%s, smoothing=%s)%s", baseline,
+              percent, status.millivoltsKnown ? status.millivolts : 0,
+              !status.chargingKnown ? "unknown" : (status.charging ? "yes" : "no"),
+              !edv2Known ? "unknown" : (edv2Below ? "below" : "above"),
+              !edv2Known ? "unknown" : (smoothingActive ? "active" : "inactive"), firstPoll ? " [across reboot]" : "");
+
+      // A jump this large is more often a one-shot glitch (see comment above) than a
+      // real instantaneous capacity change, so a single sample isn't trusted: hold it
+      // back and keep reporting the last trusted value until the very next poll
+      // independently lands on the same percentage, confirming it's real. This is
+      // what actually keeps the glitch off the on-screen battery indicator --
+      // BaseTheme.cpp reads getBatteryPercentage() directly, so without this the
+      // logged "jumped" value was still adopted and displayed immediately.
+      if (_batteryPendingPercent == static_cast<int>(percent)) {
+        LOG_DBG("PWR", "Battery gauge SoC jump confirmed by follow-up poll, adopting %d%%", percent);
+        _batteryPendingPercent = -1;
+      } else {
+        LOG_DBG("PWR", "Battery gauge SoC jump not yet confirmed, holding at cached %d%%", _batteryCachedPercent);
+        _batteryPendingPercent = static_cast<int>(percent);
+        return _batteryCachedPercent;
+      }
+    } else {
+      _batteryPendingPercent = -1;
+      LOG_DBG("PWR", "Battery gauge SoC poll: %d%%", percent);
+    }
+
     _batteryCachedPercent = percent;
+    rtcBatteryPercent = percent;
+    rtcBatteryPercentMagic = BATTERY_PERCENT_RTC_MAGIC;
     return _batteryCachedPercent;
   }
 
