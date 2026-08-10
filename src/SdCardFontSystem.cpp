@@ -159,11 +159,21 @@ void SdCardFontSystem::setupUiFallbacks(GfxRenderer& renderer) {
     LOG_DBG("SDFS", "%s has no CJK coverage - skipping UI fallback sizes", familyName.c_str());
     return;
   }
+  // Every size loaded below goes through loadFamilyExtraSize(tryFlashCache=false)
+  // (SdCardFontManager.cpp) -- it stays on the legacy SD-paging path (mini/
+  // overflow cache, kern/ligature tables, advance table) for as long as it's
+  // loaded, unlike the reader-size font. Log the trigger so a heap-pressure
+  // repro can tell whether this path fired at all.
+  LOG_INF("SDFS", "%s probed positive for CJK coverage - loading UI fallback sizes on SD paging (never flash-cached)",
+          familyName.c_str());
 
   for (const auto& ui : kUiFontSizes) {
+    const uint32_t heapBefore = ESP.getFreeHeap();
     const int sdFontId = manager_.loadFamilyExtraSize(*family, renderer, ui.pointSize);
     if (sdFontId != 0) {
       renderer.setFallbackFont(ui.fontId, sdFontId);
+      LOG_INF("SDFS", "  %u pt UI fallback loaded (id=%d), free heap=%u (was %u)", ui.pointSize, sdFontId,
+              ESP.getFreeHeap(), heapBefore);
     } else {
       LOG_DBG("SDFS", "No %u pt SD glyphs for UI fallback in %s", ui.pointSize, familyName.c_str());
     }

@@ -46,7 +46,20 @@ int SdCardFontManager::loadFile(const SdCardFontFileInfo& file, const char* fami
   // paging via the mini/overflow cache), which is already fully functional --
   // this is a pure acceleration attempt, never a requirement.
   if (tryFlashCache) {
-    font->activateFlashCache(familyName, file.pointSize);
+    const uint32_t heapBefore = ESP.getFreeHeap();
+    const bool flashResident = font->activateFlashCache(familyName, file.pointSize);
+    const uint32_t heapAfter = ESP.getFreeHeap();
+    LOG_INF("SDMGR", "%s@%u flash residency %s: heap %u -> %u (%+d bytes)", familyName, file.pointSize,
+            flashResident ? "activated" : "FAILED (staying on SD paging)", heapBefore, heapAfter,
+            static_cast<int32_t>(heapAfter) - static_cast<int32_t>(heapBefore));
+  } else {
+    // Fonts loaded this way (see loadFamilyExtraSize) never attempt flash
+    // residency and keep the full legacy SD-paging machinery (mini/overflow
+    // cache, kern/ligature tables, advance table) resident for as long as
+    // they stay loaded -- log this so the RAM cost is visible on a
+    // heap-pressure repro, not just inferred after the fact.
+    LOG_INF("SDMGR", "%s@%u loaded on SD paging (no flash-cache attempt for this load), free heap=%u", familyName,
+            file.pointSize, ESP.getFreeHeap());
   }
 
   int fontId = computeFontId(font->contentHash(), familyName, file.pointSize);
