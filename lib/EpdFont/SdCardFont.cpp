@@ -1020,7 +1020,19 @@ int SdCardFont::prewarmStyle(uint8_t styleIdx, const uint32_t* codepoints, uint3
   // exact page -- already loaded every requested codepoint the font covers, this
   // page needs zero SD reads. A mini built metadata-only cannot serve a full
   // request (no bitmaps). Any uncovered codepoint falls through to the rebuild.
-  if (s.miniGlyphCount > 0 && !(s.miniMetadataOnly && !metadataOnly)) {
+  const bool staleMetadataOnlyMini = s.miniMetadataOnly && !metadataOnly;
+  if (staleMetadataOnlyMini) {
+    // DEBUG: instrumentation added while investigating a custom-SD-font-only
+    // bug report (missing bold at start of page / repeated or jumped page
+    // content) -- this is the exact transition where a layout-time
+    // (metadata-only) prewarm gets superseded by a render-time (full bitmap)
+    // request for the same style on the same page. Remove once root-caused.
+    LOG_DBG("SDCF",
+            "prewarmStyle: style %u resident mini is metadata-only (glyphs=%u) -- forcing full "
+            "rebuild for render request (cpCount=%u)",
+            styleIdx, s.miniGlyphCount, cpCount);
+  }
+  if (s.miniGlyphCount > 0 && !staleMetadataOnlyMini) {
     bool covered = true;
     int missedInMini = 0;
     for (uint32_t i = 0; i < cpCount && covered; i++) {

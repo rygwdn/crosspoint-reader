@@ -128,7 +128,7 @@ families:
   - name: Bitter
     description: "Slab serif designed for e-ink (Latin, Cyrillic)"
     scripts: [latin, cyrillic]
-    intervals: latin-ext,cyrillic,ipa-chars
+    intervals: latin-ext,cyrillic,ipa-chars,builtin,reading,(0x2100-0x214F)
     sizes: [12, 14, 16, 18]
     styles:
       regular:    {url: "https://raw.githubusercontent.com/google/fonts/main/ofl/bitter/Bitter%5Bwght%5D.ttf", variable: {wght: 500}}
