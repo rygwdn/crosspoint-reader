@@ -132,6 +132,65 @@ TEST(ReleaseJsonParser, RealisticPrettyPrinted) {
   EXPECT_STREQ(p.getFirmwareUrl(),
                "https://github.com/crosspoint-reader/crosspoint-reader/releases/download/v2.4.1/firmware.bin");
   EXPECT_EQ(p.getFirmwareSize(), 1572864u);
+  // Real GitHub releases never carry a "sha256" field on the asset object.
+  EXPECT_FALSE(p.foundSha256());
+  EXPECT_STREQ(p.getSha256(), "");
+}
+
+TEST(ReleaseJsonParser, SelfHostedManifestWithSha256) {
+  const char* json = R"({
+      "tag_name": "v1.6.0",
+      "assets": [{
+        "name": "firmware.bin",
+        "browser_download_url": "http://192.168.1.50:8091/firmware.bin",
+        "size": 1234567,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85"
+      }]
+    })";
+
+  ReleaseJsonParser p;
+  p.feed(json, strlen(json));
+
+  EXPECT_TRUE(p.foundTag());
+  EXPECT_TRUE(p.foundFirmware());
+  EXPECT_TRUE(p.foundSha256());
+  EXPECT_STREQ(p.getSha256(), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85");
+}
+
+TEST(ReleaseJsonParser, Sha256IgnoredOnNonFirmwareAsset) {
+  const char* json = R"({
+      "tag_name": "v1.6.0",
+      "assets": [
+        {"name": "checksums.txt", "browser_download_url": "https://x/c.txt", "size": 10,
+         "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+        {"name": "firmware.bin", "browser_download_url": "https://x/fw.bin", "size": 20}
+      ]
+    })";
+
+  ReleaseJsonParser p;
+  p.feed(json, strlen(json));
+
+  EXPECT_TRUE(p.foundFirmware());
+  EXPECT_FALSE(p.foundSha256());
+  EXPECT_STREQ(p.getSha256(), "");
+}
+
+TEST(ReleaseJsonParser, Sha256FieldOrderBeforeName) {
+  const char* json = R"({
+      "tag_name": "v1.6.1",
+      "assets": [{
+        "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+        "name": "firmware.bin",
+        "browser_download_url": "https://x/fw.bin",
+        "size": 30
+      }]
+    })";
+
+  ReleaseJsonParser p;
+  p.feed(json, strlen(json));
+
+  EXPECT_TRUE(p.foundFirmware());
+  EXPECT_TRUE(p.foundSha256());
 }
 
 TEST(ReleaseJsonParser, RealisticMinified) {

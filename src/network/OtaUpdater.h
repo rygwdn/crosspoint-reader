@@ -6,6 +6,7 @@ class OtaUpdater {
   bool updateAvailable = false;
   std::string latestVersion;
   std::string otaUrl;
+  std::string expectedSha256;  // lowercase hex, empty if manifest didn't supply one
   size_t otaSize = 0;
   size_t processedSize = 0;
   size_t totalSize = 0;
@@ -22,6 +23,7 @@ class OtaUpdater {
     INTERNAL_UPDATE_ERROR,
     OOM_ERROR,
     WRONG_DEVICE_ERROR,
+    CHECKSUM_ERROR,
   };
 
   size_t getOtaSize() const { return otaSize; }

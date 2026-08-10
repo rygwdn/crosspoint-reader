@@ -33,30 +33,40 @@ void ReleaseJsonParser::reset() {
   tagName[0] = '\0';
   firmwareUrl[0] = '\0';
   firmwareSize = 0;
+  sha256[0] = '\0';
   tagFound = false;
   firmwareFound = false;
+  sha256Found = false;
   currentAssetName[0] = '\0';
   currentAssetUrl[0] = '\0';
   currentAssetSize = 0;
+  currentAssetSha256[0] = '\0';
 }
 
 void ReleaseJsonParser::feed(const char* data, size_t len) { parser.feed(data, len); }
 
 bool ReleaseJsonParser::foundTag() const { return tagFound; }
 bool ReleaseJsonParser::foundFirmware() const { return firmwareFound; }
+bool ReleaseJsonParser::foundSha256() const { return sha256Found; }
 const char* ReleaseJsonParser::getTagName() const { return tagName; }
 const char* ReleaseJsonParser::getFirmwareUrl() const { return firmwareUrl; }
 size_t ReleaseJsonParser::getFirmwareSize() const { return firmwareSize; }
+const char* ReleaseJsonParser::getSha256() const { return sha256; }
 
 void ReleaseJsonParser::commitAsset() {
   if (strcmp(currentAssetName, firmwareAssetName) == 0) {
     memcpy(firmwareUrl, currentAssetUrl, sizeof(firmwareUrl));
     firmwareSize = currentAssetSize;
     firmwareFound = true;
+    if (currentAssetSha256[0] != '\0') {
+      memcpy(sha256, currentAssetSha256, sizeof(sha256));
+      sha256Found = true;
+    }
   }
   currentAssetName[0] = '\0';
   currentAssetUrl[0] = '\0';
   currentAssetSize = 0;
+  currentAssetSha256[0] = '\0';
 }
 
 // -- SAX callbacks (static trampolines) -------------------------------------
@@ -83,6 +93,11 @@ void ReleaseJsonParser::sOnKey(void* ctx, const char* key, size_t len) {
           self->lastKey = LastKey::ASSET_URL;
         else if (len == 4 && memcmp(key, "size", 4) == 0)
           self->lastKey = LastKey::ASSET_SIZE;
+        else if (len == 6 && memcmp(key, "sha256", 6) == 0)
+          // Not a GitHub Releases API field -- a self-hosted manifest extension
+          // (see OtaUpdater's checksum verification) that upstream GitHub release
+          // JSON simply won't have, so this is a no-op against real releases.
+          self->lastKey = LastKey::ASSET_SHA256;
         else
           self->lastKey = LastKey::NONE;
       }
@@ -109,6 +124,10 @@ void ReleaseJsonParser::sOnString(void* ctx, const char* value, size_t len) {
     case LastKey::ASSET_URL:
       if (self->position == Position::IN_ASSET_OBJECT && self->assetDepth == 1)
         safeCopy(self->currentAssetUrl, sizeof(self->currentAssetUrl), value, len);
+      break;
+    case LastKey::ASSET_SHA256:
+      if (self->position == Position::IN_ASSET_OBJECT && self->assetDepth == 1)
+        safeCopy(self->currentAssetSha256, sizeof(self->currentAssetSha256), value, len);
       break;
     default:
       break;
@@ -145,6 +164,7 @@ void ReleaseJsonParser::sOnObjectStart(void* ctx) {
       self->currentAssetName[0] = '\0';
       self->currentAssetUrl[0] = '\0';
       self->currentAssetSize = 0;
+      self->currentAssetSha256[0] = '\0';
       self->lastKey = LastKey::NONE;
       break;
     case Position::IN_ASSET_OBJECT:

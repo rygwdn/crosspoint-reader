@@ -22,9 +22,11 @@ class ReleaseJsonParser {
 
   bool foundTag() const;
   bool foundFirmware() const;
+  bool foundSha256() const;
   const char* getTagName() const;
   const char* getFirmwareUrl() const;
   size_t getFirmwareSize() const;
+  const char* getSha256() const;
 
  private:
   enum class Position : uint8_t {
@@ -40,6 +42,7 @@ class ReleaseJsonParser {
     ASSET_NAME,
     ASSET_URL,
     ASSET_SIZE,
+    ASSET_SHA256,
   };
 
   static void sOnKey(void* ctx, const char* key, size_t len);
@@ -64,12 +67,15 @@ class ReleaseJsonParser {
   char tagName[32];
   char firmwareUrl[512];
   size_t firmwareSize;
+  char sha256[65];  // 64 hex chars + NUL
   bool tagFound;
   bool firmwareFound;
+  bool sha256Found;
 
   char currentAssetName[32];
   char currentAssetUrl[512];
   size_t currentAssetSize;
+  char currentAssetSha256[65];
 
   char firmwareAssetName[32];
 };

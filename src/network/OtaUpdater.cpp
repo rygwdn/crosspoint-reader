@@ -11,6 +11,8 @@
 #include <esp_wifi.h>
 // clang-format on
 
+#include <mbedtls/sha256.h>
+
 #include <algorithm>
 #include <cstring>
 #include <string>
@@ -19,8 +21,36 @@
 #include "FirmwareFlasher.h"
 
 namespace {
-constexpr char latestReleaseUrl[] = "https://api.github.com/repos/crosspoint-reader/crosspoint-reader/releases/latest";
+// Override via a build flag (e.g. in a gitignored platformio.local.ini) to point
+// OTA checks at a self-hosted manifest server instead of upstream GitHub releases:
+//   -DOTA_MANIFEST_URL=\"http://192.168.1.50:8091/latest.json\"
+#define CROSSPOINT_GITHUB_RELEASES_URL \
+  "https://api.github.com/repos/crosspoint-reader/crosspoint-reader/releases/latest"
+#ifndef OTA_MANIFEST_URL
+#define OTA_MANIFEST_URL CROSSPOINT_GITHUB_RELEASES_URL
+#endif
+constexpr char latestReleaseUrl[] = OTA_MANIFEST_URL;
+constexpr char kDefaultManifestUrl[] = CROSSPOINT_GITHUB_RELEASES_URL;
+
+void toHex(const uint8_t* bytes, size_t len, char* out) {
+  static constexpr char kHexDigits[] = "0123456789abcdef";
+  for (size_t i = 0; i < len; i++) {
+    out[i * 2] = kHexDigits[bytes[i] >> 4];
+    out[i * 2 + 1] = kHexDigits[bytes[i] & 0x0F];
+  }
+  out[len * 2] = '\0';
+}
 }  // namespace
+
+bool OtaUpdater::usesCustomManifestServer() { return std::strcmp(latestReleaseUrl, kDefaultManifestUrl) != 0; }
+
+std::string OtaUpdater::manifestServerHost() {
+  const std::string url = latestReleaseUrl;
+  const auto schemeEnd = url.find("://");
+  const size_t hostStart = schemeEnd == std::string::npos ? 0 : schemeEnd + 3;
+  const auto pathStart = url.find('/', hostStart);
+  return url.substr(hostStart, pathStart == std::string::npos ? std::string::npos : pathStart - hostStart);
+}
 
 OtaUpdater::OtaUpdaterError OtaUpdater::checkForUpdate() {
   LOG_DBG("OTA", "Checking for update (current: %s)", CROSSPOINT_VERSION);
@@ -66,6 +96,9 @@ OtaUpdater::OtaUpdaterError OtaUpdater::checkForUpdate() {
   otaUrl = releaseParser.getFirmwareUrl();
   otaSize = releaseParser.getFirmwareSize();
   totalSize = otaSize;
+  // Not a GitHub Releases API field -- only a self-hosted manifest sets this.
+  // Real GitHub releases leave it unset, so installUpdate() skips verification.
+  expectedSha256 = releaseParser.foundSha256() ? releaseParser.getSha256() : "";
   updateAvailable = true;
 
   LOG_DBG("OTA", "Found update: tag=%s size=%zu", latestVersion.c_str(), otaSize);
@@ -159,7 +192,19 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
   // the inactive OTA slot, but esp_ota_abort() below means it never becomes
   // the boot target.
   board_tag::Scanner tagScanner;
+
+  // esp_ota_end() below already checks the image's own embedded SHA256/checksum
+  // trailer, which catches transport corruption. This is a separate check that
+  // the bytes we actually received match what the manifest promised -- only
+  // populated for self-hosted manifests (see checkForUpdate), so it's a no-op
+  // against upstream GitHub releases, which don't advertise a checksum.
+  const bool verifyChecksum = !expectedSha256.empty();
+  mbedtls_sha256_context shaCtx;
+  mbedtls_sha256_init(&shaCtx);
+  mbedtls_sha256_starts(&shaCtx, /*is224=*/0);
+
   const bool fetchOk = HttpDownloader::fetchUrl(otaUrl, [&](const uint8_t* data, size_t len) {
+    if (verifyChecksum) mbedtls_sha256_update(&shaCtx, data, len);
     if (hdrLen < sizeof(hdr)) {
       const size_t take = std::min(len, sizeof(hdr) - hdrLen);
       std::memcpy(hdr + hdrLen, data, take);
@@ -202,6 +247,10 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
   /* Return back to default power saving for WiFi in case of failing */
   esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
 
+  uint8_t digest[32];
+  mbedtls_sha256_finish(&shaCtx, digest);
+  mbedtls_sha256_free(&shaCtx);
+
   if (wrongChip || tagScanner.mismatch()) {
     LOG_ERR("OTA", "Firmware install aborted: wrong device");
     esp_ota_abort(otaHandle);
@@ -212,6 +261,16 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
     LOG_ERR("OTA", "Firmware install failed (%s)", flashOk ? "download" : "flash write");
     esp_ota_abort(otaHandle);
     return flashOk ? HTTP_ERROR : INTERNAL_UPDATE_ERROR;
+  }
+
+  if (verifyChecksum) {
+    char digestHex[65];
+    toHex(digest, sizeof(digest), digestHex);
+    if (strcasecmp(digestHex, expectedSha256.c_str()) != 0) {
+      LOG_ERR("OTA", "checksum mismatch: got=%s expected=%s", digestHex, expectedSha256.c_str());
+      esp_ota_abort(otaHandle);
+      return CHECKSUM_ERROR;
+    }
   }
 
   esp_err = esp_ota_end(otaHandle);  // verifies the written image
