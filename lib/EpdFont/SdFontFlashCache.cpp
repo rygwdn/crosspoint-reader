@@ -19,6 +19,14 @@ constexpr size_t kEraseChunk = 65536;                     // 64 KiB block-erase 
 constexpr size_t kIoChunk = 4096;
 constexpr uint32_t kFnvOffsetBasis = 2166136261u;
 constexpr uint32_t kFnvPrime = 16777619u;
+// Diagnostic-only expectation, must match the `spiffs` line in partitions.csv. A
+// mismatch doesn't change behavior (the actual esp_partition_t size from the
+// device's burned partition table is always authoritative), but is worth
+// flagging loudly: the partition table is only rewritten by a full/USB flash,
+// never by an app-only OTA update, so a device that was last full-flashed
+// before partitions.csv's `spiffs` entry reached its current size will keep
+// mapping a smaller partition than this build assumes indefinitely.
+constexpr size_t kExpectedPartitionSize = 0x360000;
 
 // On-flash header, written at partition offset 0. `valid` is only ever set as part
 // of the LAST write of an activation (see commitHeader) so a crash mid-copy is
@@ -82,6 +90,15 @@ bool SdFontFlashCache::ensurePartitionMapped() {
   mappedSize_ = partition_->size;
   LOG_DBG("SDFC", "mapped partition '%s' (%u bytes) at %p", partition_->label, static_cast<unsigned>(mappedSize_),
           static_cast<const void*>(mappedBase_));
+  if (mappedSize_ != kExpectedPartitionSize) {
+    LOG_ERR("SDFC",
+            "partition '%s' is %u bytes but this build's partitions.csv declares %u -- device's burned "
+            "partition table is stale (needs a full/USB reflash, not OTA) or its physical flash (%u bytes "
+            "total) is smaller than this build assumes; large .cpfont files will keep failing to promote "
+            "until this is resolved",
+            partition_->label, static_cast<unsigned>(mappedSize_), static_cast<unsigned>(kExpectedPartitionSize),
+            static_cast<unsigned>(ESP.getFlashChipSize()));
+  }
   return true;
 }
 
