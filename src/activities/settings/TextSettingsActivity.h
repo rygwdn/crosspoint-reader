@@ -60,6 +60,9 @@ class TextSettingsActivity final : public UiTabListActivity {
   const char* confirmLabelText() const;
   // True when the focused list row is a setting the preview cannot reflect.
   bool focusedRowHasNoPreview() const;
+  // True when the active tab's list (Family or Size) has at least one row
+  // marked with the flash-cache "*" -- gates the legend caption below the list.
+  bool listHasFlashCacheMarker() const;
   void switchTab(int direction = 1);
 
   // Row storage for the active tab: rowItems_ (label/actionValue) is
@@ -69,6 +72,9 @@ class TextSettingsActivity final : public UiTabListActivity {
   // into the existing strings (no vector growth), so steady-state rendering
   // never allocates/frees row storage.
   std::vector<std::string> rowValues_;
+  // Backing storage for rowItems_[i].label -- owns the text (incl. any
+  // flash-cache "*" suffix) since ListItem only holds a raw pointer.
+  std::vector<std::string> rowLabels_;
   std::vector<freeink::ui::ListItem> rowItems_;
   void rebuildRowItems();
 
@@ -76,12 +82,29 @@ class TextSettingsActivity final : public UiTabListActivity {
     std::string name;
     bool isBuiltin;
     uint8_t settingIndex;
+    // False if the file that would actually load for this family (at the
+    // current point size, via findNearestSize) is too large for the SD-font
+    // flash-cache partition -- see wouldFitFlashCache(). Always true for
+    // builtin fonts (compiled into flash already, no SD file involved).
+    bool flashFits = true;
   };
 
   struct SizeEntry {
     std::string name;  // the point size, rendered for display ("14 pt")
     uint8_t pointSize;
+    // False if this exact size's file is too large for the flash-cache
+    // partition. Always true for builtin-font point sizes.
+    bool flashFits = true;
   };
+
+  // Best-effort prediction of whether `file` would successfully promote to
+  // flash residency, without touching the flash-cache partition itself:
+  // stats the .cpfont's size on SD and compares it to
+  // SdFontFlashCache::payloadCapacity(). Defaults to true (no "*" marker)
+  // whenever the answer can't be determined (null file, unreadable partition,
+  // unstatable file) -- the indicator should only ever claim a size won't
+  // fit when there's positive evidence of that, never guess.
+  bool wouldFitFlashCache(const SdCardFontFileInfo* file) const;
 
   const SdCardFontRegistry* registry_;
   OptionPopup optionPopup_;

@@ -1,7 +1,9 @@
 #include "TextSettingsActivity.h"
 
 #include <GfxRenderer.h>
+#include <HalStorage.h>
 #include <I18n.h>
+#include <SdFontFlashCache.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -72,7 +74,11 @@ void TextSettingsActivity::onEnter() {
   if (registry_) {
     const auto& families = registry_->getFamilies();
     for (int i = 0; i < static_cast<int>(families.size()); i++) {
-      fonts_.push_back({families[i].name, false, static_cast<uint8_t>(CrossPointSettings::BUILTIN_FONT_COUNT + i)});
+      // Mirrors what SdCardFontManager::loadFamily() would actually load if
+      // this family were selected right now (see applyFamily()).
+      const bool fits = wouldFitFlashCache(families[i].findNearestSize(SETTINGS.fontPointSize));
+      fonts_.push_back(
+          {families[i].name, false, static_cast<uint8_t>(CrossPointSettings::BUILTIN_FONT_COUNT + i), fits});
     }
   }
 
@@ -96,29 +102,44 @@ void TextSettingsActivity::onEnter() {
 void TextSettingsActivity::rebuildRowItems() {
   const int count = listCount();
   rowValues_.assign(count, std::string());
+  rowLabels_.assign(count, std::string());
   rowItems_.clear();
   rowItems_.reserve(count);
   for (int i = 0; i < count; i++) {
     fui::ListItem item;
     switch (tab_) {
       case Tab::Family:
-        item.label = fonts_[i].name.c_str();
+        // Trailing "*" flags a family whose file at the current size won't fit
+        // the flash cache (see STR_SD_FONT_TOO_LARGE caption in render()).
+        rowLabels_[i] = fonts_[i].flashFits ? fonts_[i].name : fonts_[i].name + " *";
         break;
       case Tab::Size:
-        item.label = sizes_[i].name.c_str();
+        rowLabels_[i] = sizes_[i].flashFits ? sizes_[i].name : sizes_[i].name + " *";
         break;
       case Tab::Layout:
-        item.label = I18N.get(LAYOUT_ROW_NAME_IDS[i]);
+        rowLabels_[i] = I18N.get(LAYOUT_ROW_NAME_IDS[i]);
         break;
       case Tab::Style:
-        item.label = I18N.get(STYLE_ROW_NAME_IDS[i]);
+        rowLabels_[i] = I18N.get(STYLE_ROW_NAME_IDS[i]);
         break;
       default:
         break;
     }
+    item.label = rowLabels_[i].c_str();
     item.actionValue = static_cast<int16_t>(i);
     rowItems_.push_back(item);
   }
+}
+
+bool TextSettingsActivity::wouldFitFlashCache(const SdCardFontFileInfo* file) const {
+  if (!file) return true;  // nothing to judge — don't guess
+
+  const size_t capacity = SdFontFlashCache::instance().payloadCapacity();
+  if (capacity == 0) return true;  // partition unavailable this boot — don't claim it won't fit
+
+  HalFile sd;
+  if (!Storage.openFileForRead("TXTSET", file->path, sd)) return true;  // couldn't stat — don't guess
+  return sd.fileSize() <= capacity;
 }
 
 // The selectable sizes belong to the active family, so this runs on entry and
@@ -127,6 +148,8 @@ void TextSettingsActivity::rebuildRowItems() {
 // not, so the highlight is resolved by snapping rather than by exact match.
 void TextSettingsActivity::rebuildSizeList() {
   const std::vector<uint8_t> points = readerFontPointSizes(registry_, SETTINGS.sdFontFamilyName);
+  const SdCardFontFamilyInfo* activeFamily =
+      (registry_ && SETTINGS.sdFontFamilyName[0] != '\0') ? registry_->findFamily(SETTINGS.sdFontFamilyName) : nullptr;
 
   // The stored size can still sit outside this family's set — e.g. the family
   // was deleted while selected, or the card was swapped. Highlight the size the
@@ -142,7 +165,8 @@ void TextSettingsActivity::rebuildSizeList() {
     char label[12];
     snprintf(label, sizeof(label), "%u pt", pt);
     if (pt == selectedPt) currentSizeIndex_ = static_cast<int>(sizes_.size());
-    sizes_.push_back({label, pt});
+    const bool fits = activeFamily ? wouldFitFlashCache(activeFamily->findFile(pt)) : true;
+    sizes_.push_back({label, pt, fits});
   }
 }
 
@@ -282,6 +306,10 @@ void TextSettingsActivity::render(RenderLock&&) {
     const int captionHeight = renderer.getTextHeight(UI_10_FONT_ID) + metrics_.verticalSpacing;
     const int capY = afterHeader + usableHeight - captionHeight + metrics_.verticalSpacing;
     renderer.drawText(UI_10_FONT_ID, metrics_.previewPadding, capY, tr(STR_NOT_IN_PREVIEW));
+  } else if (listHasFlashCacheMarker()) {
+    const int captionHeight = renderer.getTextHeight(UI_10_FONT_ID) + metrics_.verticalSpacing;
+    const int capY = afterHeader + usableHeight - captionHeight + metrics_.verticalSpacing;
+    renderer.drawText(UI_10_FONT_ID, metrics_.previewPadding, capY, tr(STR_SD_FONT_TOO_LARGE));
   }
 
   const auto labels = mappedInput.mapLabels(tr(STR_BACK), confirmLabelText(), tr(STR_DIR_UP), tr(STR_DIR_DOWN));
@@ -483,6 +511,16 @@ void TextSettingsActivity::switchTab(const int direction) {
   if (onTabBar) n.selected = 0;
   n.followOnBuild = true;  // pull the new tab's viewport to its remembered selection
   requestUpdate();
+}
+
+bool TextSettingsActivity::listHasFlashCacheMarker() const {
+  if (tab_ == Tab::Family) {
+    return std::any_of(fonts_.begin(), fonts_.end(), [](const FontEntry& f) { return !f.flashFits; });
+  }
+  if (tab_ == Tab::Size) {
+    return std::any_of(sizes_.begin(), sizes_.end(), [](const SizeEntry& s) { return !s.flashFits; });
+  }
+  return false;
 }
 
 int TextSettingsActivity::listCount() const {

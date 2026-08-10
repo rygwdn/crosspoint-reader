@@ -147,6 +147,11 @@ const uint8_t* SdFontFlashCache::tryLoad(const char* familyName, uint8_t pointSi
   return payload;
 }
 
+size_t SdFontFlashCache::payloadCapacity() {
+  if (!ensurePartitionMapped()) return 0;
+  return mappedSize_ - kHeaderSectorSize;
+}
+
 bool SdFontFlashCache::invalidateHeader() {
   if (esp_partition_erase_range(partition_, 0, kHeaderSectorSize) != ESP_OK) {
     LOG_ERR("SDFC", "failed to erase header sector (invalidate)");

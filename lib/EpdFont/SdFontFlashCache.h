@@ -46,6 +46,14 @@ class SdFontFlashCache {
   // fall back to SD paging.
   const uint8_t* store(const char* familyName, uint8_t pointSize, uint32_t contentHash, HalFile& source, size_t size);
 
+  // Usable payload capacity of the flash-cache partition (its total size minus
+  // the header sector), or 0 if the partition isn't mappable at all (missing,
+  // too small, mmap failure). Triggers ensurePartitionMapped() if this is the
+  // first call this boot -- safe to call before any font has been loaded.
+  // Intended for UI code (e.g. the font settings list) to predict whether a
+  // given .cpfont file will fit, without attempting a real store().
+  size_t payloadCapacity();
+
  private:
   SdFontFlashCache() = default;
 
