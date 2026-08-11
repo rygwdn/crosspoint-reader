@@ -174,6 +174,11 @@ class ChapterHtmlSlimParser {
   void updateEffectiveInlineStyle();
   void startNewTextBlock(const BlockStyle& blockStyle);
   void flushPendingAnchor();
+  // Heap-visibility hook: anchorData (below) is capped at MAX_ANCHORS_PER_CHAPTER but
+  // never spilled to disk (unlike the LUT), so it's the parser's least-bounded RAM
+  // owner. Logs sparsely (every 100 entries, plus first/cap) to trace growth without
+  // spamming the log for the common few-anchor case.
+  void logAnchorDataGrowth() const;
   void flushPartWordBuffer();
   void fallbackTableRowToStacked();
   void closeTableCell();

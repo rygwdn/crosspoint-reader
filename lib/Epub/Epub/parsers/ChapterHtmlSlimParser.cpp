@@ -306,6 +306,18 @@ void ChapterHtmlSlimParser::flushPendingAnchor() {
   // Record deferred anchor after previous block is flushed (and any TOC page break)
   anchorData.push_back({std::move(pendingAnchorId), static_cast<uint16_t>(completedPageCount)});
   pendingAnchorId.clear();
+  logAnchorDataGrowth();
+}
+
+void ChapterHtmlSlimParser::logAnchorDataGrowth() const {
+  const size_t count = anchorData.size();
+  if (count != 1 && count % 100 != 0 && count != MAX_ANCHORS_PER_CHAPTER) return;
+  // Lower bound only: sizeof(pair<string,uint16_t>) covers the fixed per-entry cost;
+  // any anchor id long enough to defeat std::string's small-string optimization also
+  // heap-allocates its own backing bytes, not counted here.
+  const size_t structBytes = count * sizeof(std::pair<std::string, uint16_t>);
+  LOG_DBG("EHP", "anchorData: count=%u minBytes=%u free=%u maxAlloc=%u", static_cast<unsigned>(count),
+          static_cast<unsigned>(structBytes), ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 }
 
 void ChapterHtmlSlimParser::setCurrentPageVisibleOffset(const uint32_t offset) {
@@ -466,6 +478,7 @@ void ChapterHtmlSlimParser::emitHorizontalRule(const BlockStyle& blockStyle) {
   if (!pendingAnchorId.empty()) {
     anchorData.push_back({std::move(pendingAnchorId), static_cast<uint16_t>(completedPageCount)});
     pendingAnchorId.clear();
+    logAnchorDataGrowth();
   }
 }
 
@@ -2119,6 +2132,7 @@ bool ChapterHtmlSlimParser::finishParse() {
     if (!pendingAnchorId.empty()) {
       anchorData.push_back({std::move(pendingAnchorId), static_cast<uint16_t>(completedPageCount)});
       pendingAnchorId.clear();
+      logAnchorDataGrowth();
     }
     // End of chapter: no further paragraphs can rescue a widow from this page, so flush
     // it (and any still-deferred page from the widow check) unconditionally -- except when

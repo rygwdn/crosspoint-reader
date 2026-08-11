@@ -209,6 +209,39 @@ bool Section::loadSectionFile(const ReaderRenderSpec& spec) {
         spec.imageRendering != fileImageRendering || spec.focusReadingEnabled != fileFocusReadingEnabled) {
       file.close();
       LOG_ERR("SCT", "Deserialization failed: Parameters do not match");
+      // Field-by-field diff so a mismatch is diagnosable from the device log alone,
+      // instead of just knowing *that* something changed. Only mismatching fields log.
+      if (spec.fontId != fileFontId) LOG_ERR("SCT", "  fontId: cached=%d current=%d", fileFontId, spec.fontId);
+      if (spec.lineCompression != fileLineCompression) {
+        LOG_ERR("SCT", "  lineCompression: cached=%.3f current=%.3f", static_cast<double>(fileLineCompression),
+                static_cast<double>(spec.lineCompression));
+      }
+      if (spec.extraParagraphSpacing != fileExtraParagraphSpacing) {
+        LOG_ERR("SCT", "  extraParagraphSpacing: cached=%d current=%d", fileExtraParagraphSpacing,
+                spec.extraParagraphSpacing);
+      }
+      if (spec.paragraphAlignment != fileParagraphAlignment) {
+        LOG_ERR("SCT", "  paragraphAlignment: cached=%u current=%u", fileParagraphAlignment,
+                spec.paragraphAlignment);
+      }
+      if (spec.viewportWidth != fileViewportWidth || spec.viewportHeight != fileViewportHeight) {
+        LOG_ERR("SCT", "  viewport: cached=%ux%u current=%ux%u", fileViewportWidth, fileViewportHeight,
+                spec.viewportWidth, spec.viewportHeight);
+      }
+      if (spec.hyphenationEnabled != fileHyphenationEnabled) {
+        LOG_ERR("SCT", "  hyphenationEnabled: cached=%d current=%d", fileHyphenationEnabled,
+                spec.hyphenationEnabled);
+      }
+      if (spec.embeddedStyle != fileEmbeddedStyle) {
+        LOG_ERR("SCT", "  embeddedStyle: cached=%d current=%d", fileEmbeddedStyle, spec.embeddedStyle);
+      }
+      if (spec.imageRendering != fileImageRendering) {
+        LOG_ERR("SCT", "  imageRendering: cached=%u current=%u", fileImageRendering, spec.imageRendering);
+      }
+      if (spec.focusReadingEnabled != fileFocusReadingEnabled) {
+        LOG_ERR("SCT", "  focusReadingEnabled: cached=%d current=%d", fileFocusReadingEnabled,
+                spec.focusReadingEnabled);
+      }
       clearCache();
       return false;
     }
@@ -284,6 +317,7 @@ bool Section::startBuild(const ReaderRenderSpec& spec, const std::function<void(
     LOG_ERR("SCT", "startBuild called while a build is already active");
     return false;
   }
+  LOG_DBG("SCT", "startBuild: free=%u maxAlloc=%u", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
   buildComplete_ = false;
   builtPageCount_ = 0;
   // Pages from a loaded partial stay readable (from filePath) while this build writes
@@ -377,6 +411,10 @@ bool Section::startBuild(const ReaderRenderSpec& spec, const std::function<void(
     if (ctx->cssParser && !ctx->cssParser->loadFromCache()) {
       LOG_ERR("SCT", "Failed to load CSS from cache");
     }
+    if (ctx->cssParser) {
+      LOG_DBG("SCT", "CSS rules loaded: count=%u free=%u maxAlloc=%u",
+              static_cast<unsigned>(ctx->cssParser->ruleCount()), ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    }
   }
 
   if (reusedHtml) {
@@ -441,6 +479,7 @@ bool Section::beginParsingPhase() {
     if (ctxPtr->cssParser) ctxPtr->cssParser->clear();
     return false;
   }
+  LOG_DBG("SCT", "Parser created: free=%u maxAlloc=%u", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 
   Hyphenator::setPreferredLanguage(epub->getLanguage());
   if (!ctxPtr->parser->beginParse()) {
@@ -448,6 +487,8 @@ bool Section::beginParsingPhase() {
     return false;
   }
   ctxPtr->totalBytes = ctxPtr->parser->parseTotalBytes();
+  LOG_DBG("SCT", "beginParsingPhase complete: totalBytes=%u free=%u maxAlloc=%u", ctxPtr->totalBytes,
+          ESP.getFreeHeap(), ESP.getMaxAllocHeap());
   return true;
 }
 
@@ -705,8 +746,16 @@ bool Section::finalizeBuild() {
   }
 
   const bool committed = commitBuildFile(SECTION_FILE_VERSION, 0, 0);
+  // Capture before build_.reset() destroys the parser (and its anchorData) and the LUT
+  // window. builtPageCount_ is the true total (persists past reset); build_->lut.size()
+  // is just the bounded RAM window (<=LUT_RAM_WINDOW_PAGES), not the page count.
+  const size_t windowPages = build_->lut.size();
+  const size_t finalAnchors = build_->parser ? build_->parser->getAnchors().size() : 0;
   if (build_->cssParser) build_->cssParser->clear();
   build_.reset();
+  LOG_DBG("SCT", "finalizeBuild teardown: pages=%u anchors=%u windowBytes=%u free=%u maxAlloc=%u",
+          static_cast<unsigned>(builtPageCount_), static_cast<unsigned>(finalAnchors),
+          static_cast<unsigned>(windowPages * sizeof(PageLutEntry)), ESP.getFreeHeap(), ESP.getMaxAllocHeap());
   if (!committed) {
     // commitBuildFile removed filePath before the failed swap, so nothing valid remains.
     partial_ = false;
@@ -766,7 +815,15 @@ void Section::suspendBuild() {
   if (!build_->reusedHtml && Storage.exists(build_->tmpHtmlPath.c_str())) {
     Storage.remove(build_->tmpHtmlPath.c_str());
   }
-  build_.reset();
+  {
+    const size_t windowPages = build_->lut.size();
+    const size_t finalAnchors = build_->parser ? build_->parser->getAnchors().size() : 0;
+    const uint16_t finalPageCount = builtPageCount_;
+    build_.reset();
+    LOG_DBG("SCT", "suspendBuild teardown: pages=%u anchors=%u windowBytes=%u free=%u maxAlloc=%u",
+            static_cast<unsigned>(finalPageCount), static_cast<unsigned>(finalAnchors),
+            static_cast<unsigned>(windowPages * sizeof(PageLutEntry)), ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+  }
   buildComplete_ = false;
   pageCount = partial_ ? partialPageCount_ : 0;
   builtPageCount_ = 0;
@@ -794,7 +851,15 @@ void Section::abandonBuild() {
   if (!build_->reusedHtml && Storage.exists(build_->tmpHtmlPath.c_str())) {
     Storage.remove(build_->tmpHtmlPath.c_str());
   }
-  build_.reset();
+  {
+    const size_t windowPages = build_->lut.size();
+    const size_t finalAnchors = build_->parser ? build_->parser->getAnchors().size() : 0;
+    const uint16_t finalPageCount = builtPageCount_;
+    build_.reset();
+    LOG_DBG("SCT", "abandonBuild teardown: pages=%u anchors=%u windowBytes=%u free=%u maxAlloc=%u",
+            static_cast<unsigned>(finalPageCount), static_cast<unsigned>(finalAnchors),
+            static_cast<unsigned>(windowPages * sizeof(PageLutEntry)), ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+  }
   buildComplete_ = false;
   partial_ = false;
   partialPageCount_ = 0;
@@ -821,6 +886,14 @@ void Section::recordBuiltPage(const uint32_t fileOffset, const uint16_t paragrap
   if (build_->lut.size() > LUT_RAM_WINDOW_PAGES) {
     // O(window size), not O(pages built) -- the window is a small fixed constant.
     build_->lut.erase(build_->lut.begin());
+  }
+  // build_->lut is capped at LUT_RAM_WINDOW_PAGES (spilled to disk above), so this is
+  // mainly a heap-vs-progress trace, not a growth warning -- log sparsely (every 10
+  // pages) so a long/stalled build is traceable without a line per page.
+  if (builtPageCount_ == 1 || builtPageCount_ % 10 == 0) {
+    LOG_DBG("SCT", "build progress: pages=%u windowPages=%u free=%u maxAlloc=%u",
+            static_cast<unsigned>(builtPageCount_), static_cast<unsigned>(build_->lut.size()), ESP.getFreeHeap(),
+            ESP.getMaxAllocHeap());
   }
 }
 
