@@ -17,7 +17,15 @@
 // lib/EpdFont/scripts/cpfont_version.py. This firmware-side copy must be
 // bumped manually when the firmware is updated to support a new format.
 // Reader enforcement: SdCardFont::load().
-#define CPFONT_VERSION 4
+//
+// v5: glyph bitmaps are content-deduplicated into a single pool shared by all
+// styles in the file (see bitmapPoolFileOffset_ below), instead of each style
+// carrying its own private, independently-rasterized bitmap section. Every
+// style's fallback glyphs (rasterized from the same unstyled source face when
+// the font itself lacks a codepoint -- see fontconvert_sdcard.py's
+// --fallback-* flags) are byte-identical across styles, so this recovers real
+// space with no coverage or rendering change.
+#define CPFONT_VERSION 5
 
 class SdCardFont {
  public:
@@ -325,6 +333,12 @@ class SdCardFont {
   Stats stats_;
   uint32_t contentHash_ = 0;
   bool loaded_ = false;
+  // File offset of the single glyph-bitmap pool shared by every style in this
+  // file (v5+; see CPFONT_VERSION comment). Parsed once from the header in
+  // load() and fanned out to every style's PerStyle::bitmapFileOffset in
+  // computeStyleFileOffsets() -- all styles read bitmaps from the same place,
+  // distinguished only by each glyph's own dataOffset within the pool.
+  uint32_t bitmapPoolFileOffset_ = 0;
 
   // True if at least one present style in styleMask still needs the legacy
   // SD-paging path (i.e. is not flash-resident). Guards the mini-cache/advance-
@@ -356,7 +370,7 @@ class SdCardFont {
   // Global helpers
   void freeAll();
   void clearOverflow();
-  static void computeStyleFileOffsets(PerStyle& s, uint32_t baseOffset);
+  static void computeStyleFileOffsets(PerStyle& s, uint32_t baseOffset, uint32_t bitmapPoolFileOffset);
 
   // Static callback for EpdFontData::glyphMissHandler (per-style via OverflowContext)
   static const EpdGlyph* onGlyphMiss(void* ctx, uint32_t codepoint);

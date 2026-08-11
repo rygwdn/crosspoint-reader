@@ -9,7 +9,10 @@
 # support a new version.
 
 # .cpfont binary format version. Bump when the on-disk struct layout changes.
-CPFONT_VERSION = 4
+# v5: glyph bitmaps are content-deduplicated into one pool shared by all
+# styles in the file, instead of each style carrying its own private bitmap
+# section (see the CPFONT_VERSION comment in lib/EpdFont/SdCardFont.h).
+CPFONT_VERSION = 5
 
 # JSON manifest schema version. Bump when the manifest shape changes.
 FONTS_MANIFEST_VERSION = 1

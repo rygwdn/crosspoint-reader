@@ -211,6 +211,7 @@ void SdCardFont::freeAll() {
   }
   styleCount_ = 0;
   contentHash_ = 0;
+  bitmapPoolFileOffset_ = 0;
   loaded_ = false;
 }
 
@@ -507,7 +508,7 @@ bool SdCardFont::onCoverageQuery(void* ctx, const uint32_t codepoint) {
 
 // --- Compute per-style file offsets from a base data offset ---
 
-void SdCardFont::computeStyleFileOffsets(PerStyle& s, uint32_t baseOffset) {
+void SdCardFont::computeStyleFileOffsets(PerStyle& s, uint32_t baseOffset, uint32_t bitmapPoolFileOffset) {
   s.intervalsFileOffset = baseOffset;
   s.glyphsFileOffset = s.intervalsFileOffset + s.header.intervalCount * sizeof(EpdUnicodeInterval);
   s.kernLeftFileOffset = s.glyphsFileOffset + s.header.glyphCount * sizeof(EpdGlyph);
@@ -515,7 +516,10 @@ void SdCardFont::computeStyleFileOffsets(PerStyle& s, uint32_t baseOffset) {
   s.kernMatrixFileOffset = s.kernRightFileOffset + s.header.kernRightEntryCount * sizeof(EpdKernClassEntry);
   s.ligatureFileOffset =
       s.kernMatrixFileOffset + static_cast<uint32_t>(s.header.kernLeftClassCount) * s.header.kernRightClassCount;
-  s.bitmapFileOffset = s.ligatureFileOffset + s.header.ligaturePairCount * sizeof(EpdLigaturePair);
+  // v5+: bitmaps live in one pool shared by every style (see
+  // bitmapPoolFileOffset_ comment in SdCardFont.h) -- every style reads from
+  // the same base, not from a section trailing its own ligature data.
+  s.bitmapFileOffset = bitmapPoolFileOffset;
 }
 
 // --- Load ---
@@ -557,6 +561,10 @@ bool SdCardFont::load(const char* path) {
   uint32_t hash = fnv1a(headerBuf, HEADER_SIZE);
 
   bool is2Bit = (readU16(headerBuf + 10) & 1) != 0;
+
+  // v5+: shared bitmap pool offset, written right after styleCount (see
+  // fontconvert_sdcard.py's HEADER_FMT and the CPFONT_VERSION comment above).
+  bitmapPoolFileOffset_ = readU32(headerBuf + 13);
 
   uint8_t styleCount = headerBuf[12];
   if (styleCount == 0 || styleCount > MAX_STYLES) {
@@ -614,7 +622,7 @@ bool SdCardFont::load(const char* path) {
     }
 
     uint32_t dataOffset = readU32(tocBuf + 24);
-    computeStyleFileOffsets(s, dataOffset);
+    computeStyleFileOffsets(s, dataOffset, bitmapPoolFileOffset_);
   }
 
   styleCount_ = styleCount;

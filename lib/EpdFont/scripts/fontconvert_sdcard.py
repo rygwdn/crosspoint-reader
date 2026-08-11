@@ -30,6 +30,7 @@ import os
 import re
 import math
 import argparse
+import hashlib
 from collections import namedtuple
 
 from cpfont_version import CPFONT_VERSION
@@ -778,9 +779,56 @@ GLYPH_STRUCT_FORMAT = "<BBHhhH2xI"
 assert struct.calcsize(GLYPH_STRUCT_FORMAT) == 16
 
 
-def pack_style_sections(sd):
-    """Pack one StyleRasterData into binary section bytearrays.
-    Returns (intervals_data, glyphs_data, kern_left, kern_right, kern_matrix, ligatures, bitmaps)."""
+def dedupe_bitmaps_into_pool(raster_data):
+    """Content-address every style's rasterized glyph bitmaps into one shared pool.
+
+    Every style falls back to the same unstyled source face (see
+    --fallback-regular/-bold/-italic/-bolditalic) for codepoints its own font
+    lacks, so a large fraction of "different styles'" glyphs are byte-identical
+    across styles in practice -- not just within one style. Hashing across all
+    styles at once (rather than per-style) is what recovers that.
+
+    Mutates nothing in `raster_data`; returns (pool_bytes, glyphs_by_style) where
+    glyphs_by_style[style_id] is a list of (GlyphProps, packed_bytes) with
+    data_offset rewritten to this shared pool instead of a per-style bitmap
+    section. Also prints a dedup summary to stderr.
+    """
+    pool = bytearray()
+    hash_to_offset = {}
+    glyphs_by_style = {}
+    total_glyphs = 0
+    total_bytes_before = 0
+
+    for style_id in sorted(raster_data.keys()):
+        sd = raster_data[style_id]
+        new_glyphs = []
+        for glyph, packed in sd.all_glyphs:
+            total_glyphs += 1
+            total_bytes_before += len(packed)
+            digest = hashlib.sha1(bytes(packed)).digest()
+            offset = hash_to_offset.get(digest)
+            if offset is None:
+                offset = len(pool)
+                pool += packed
+                hash_to_offset[digest] = offset
+            new_glyphs.append((glyph._replace(data_offset=offset), packed))
+        glyphs_by_style[style_id] = new_glyphs
+
+    saved = total_bytes_before - len(pool)
+    print(f"  Bitmap pool: {len(hash_to_offset)} unique / {total_glyphs} glyphs, "
+          f"{len(pool)} bytes ({saved} bytes saved by dedup, "
+          f"{100 * saved / total_bytes_before:.1f}%)" if total_bytes_before else "  Bitmap pool: empty",
+          file=sys.stderr)
+    return bytes(pool), glyphs_by_style
+
+
+def pack_style_sections(sd, glyphs):
+    """Pack one StyleRasterData's non-bitmap sections into binary bytearrays.
+
+    `glyphs` is this style's (GlyphProps, packed_bytes) list with data_offset
+    already rewritten to the shared bitmap pool by dedupe_bitmaps_into_pool() --
+    bitmaps themselves are written once, separately, not per style.
+    Returns (intervals_data, glyphs_data, kern_left, kern_right, kern_matrix, ligatures)."""
     intervals_data = bytearray()
     offset = 0
     for i_start, i_end in sd.intervals:
@@ -788,7 +836,7 @@ def pack_style_sections(sd):
         offset += i_end - i_start + 1
 
     glyphs_data = bytearray()
-    for glyph, packed in sd.all_glyphs:
+    for glyph, packed in glyphs:
         glyphs_data += struct.pack(GLYPH_STRUCT_FORMAT,
                                    glyph.width, glyph.height, glyph.advance_x,
                                    glyph.left, glyph.top,
@@ -810,13 +858,8 @@ def pack_style_sections(sd):
     for packed_pair, lig_cp in sd.ligature_pairs:
         ligature_data += struct.pack("<II", packed_pair, lig_cp)
 
-    bitmap_data = bytearray()
-    for glyph, packed in sd.all_glyphs:
-        bitmap_data += packed
-    assert len(bitmap_data) == sd.total_bitmap_size
-
     return (intervals_data, glyphs_data, kern_left_data, kern_right_data,
-            kern_matrix_data, ligature_data, bitmap_data)
+            kern_matrix_data, ligature_data)
 
 
 def style_sections_total_size(sections):
@@ -851,10 +894,15 @@ def generate_cpfont_multistyle(style_fonts, size, intervals, output_path,
             force_autohint=force_autohint,
             fallback_fontfile=fallback_fontfile)
 
-    # Pack binary sections for each style
+    # Content-dedupe bitmaps across all styles into one shared pool before
+    # packing anything else -- every style's glyphs_data bakes in data_offset,
+    # so this has to happen first.
+    bitmap_pool, glyphs_by_style = dedupe_bitmaps_into_pool(raster_data)
+
+    # Pack each style's non-bitmap sections
     packed_sections = {}  # style_id -> tuple of section bytearrays
     for style_id, sd in raster_data.items():
-        packed_sections[style_id] = pack_style_sections(sd)
+        packed_sections[style_id] = pack_style_sections(sd, glyphs_by_style[style_id])
 
     # Calculate data offsets (after header + TOC)
     data_start = HEADER_SIZE + style_count * STYLE_TOC_ENTRY_SIZE
@@ -865,9 +913,14 @@ def generate_cpfont_multistyle(style_fonts, size, intervals, output_path,
         style_offsets[style_id] = current_offset
         current_offset += style_sections_total_size(packed_sections[style_id])
 
+    # The shared bitmap pool is written once, after every style's own
+    # (non-bitmap) sections -- current_offset is now exactly that point.
+    bitmap_pool_offset = current_offset
+
     # Build global header
-    # V4 header: magic(8) + version(2) + flags(2) + styleCount(1) + reserved(19) = 32
-    header = struct.pack("<8sHHB19s", MAGIC, CPFONT_VERSION, flags, style_count, bytes(19))
+    # V5 header: magic(8) + version(2) + flags(2) + styleCount(1) +
+    #   bitmapPoolOffset(4) + reserved(15) = 32
+    header = struct.pack("<8sHHBI15s", MAGIC, CPFONT_VERSION, flags, style_count, bitmap_pool_offset, bytes(15))
     assert len(header) == HEADER_SIZE
 
     # Build style TOC entries
@@ -895,7 +948,8 @@ def generate_cpfont_multistyle(style_fonts, size, intervals, output_path,
                                 len(sd.ligature_pairs),
                                 style_offsets[style_id])
 
-    # Write output
+    # Write output: header, TOC, each style's own (non-bitmap) sections, then
+    # the shared bitmap pool exactly once at bitmap_pool_offset.
     os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else ".", exist_ok=True)
     total_file_size = 0
     with open(output_path, "wb") as f:
@@ -904,10 +958,12 @@ def generate_cpfont_multistyle(style_fonts, size, intervals, output_path,
         for style_id in sorted(packed_sections.keys()):
             for section in packed_sections[style_id]:
                 f.write(section)
+        assert f.tell() == bitmap_pool_offset
+        f.write(bitmap_pool)
         total_file_size = f.tell()
 
     # Print summary
-    print(f"  Output: {output_path} (v4, {style_count} styles)", file=sys.stderr)
+    print(f"  Output: {output_path} (v{CPFONT_VERSION}, {style_count} styles)", file=sys.stderr)
     print(f"    Header+TOC: {HEADER_SIZE + len(toc_data)} bytes", file=sys.stderr)
     for style_id in sorted(raster_data.keys()):
         sd = raster_data[style_id]
@@ -916,7 +972,8 @@ def generate_cpfont_multistyle(style_fonts, size, intervals, output_path,
         sname = style_names.get(style_id, str(style_id))
         ssize = style_sections_total_size(secs)
         print(f"    {sname}: {len(sd.all_glyphs)} glyphs, {len(sd.intervals)} intervals, "
-              f"{ssize} bytes", file=sys.stderr)
+              f"{ssize} bytes (excl. shared bitmap pool)", file=sys.stderr)
+    print(f"    Shared bitmap pool: {len(bitmap_pool)} bytes", file=sys.stderr)
     print(f"    Total: {total_file_size} bytes ({total_file_size / 1024 / 1024:.2f} MB)", file=sys.stderr)
     return total_file_size
 
