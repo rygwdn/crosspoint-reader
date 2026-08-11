@@ -10,6 +10,7 @@
 #include <I18n.h>
 #include <Logging.h>
 #include <Memory.h>
+#include <MemoryManager.h>
 #include <esp_system.h>
 
 #include <algorithm>
@@ -141,6 +142,7 @@ void moveFinishedBookToReadFolder(const std::string& srcPath, const std::string&
 
 EpubReaderActivity::~EpubReaderActivity() {
   ImageBlock::setExtractor(nullptr, nullptr);
+  freeink::MemoryManager::instance().unregisterSink("EpubCssRules");
 
   if (footnoteDepth > 0 && epub) {
     const SavedPosition& origin = savedPositions[0];
@@ -183,6 +185,22 @@ bool EpubReaderActivity::loadBook() {
     return false;
   }
   epub = std::move(loadedEpub);
+
+  // The parsed CSS rule set is rebuildable from the on-SD .crosspoint cache
+  // (CssParser::loadFromCache(), reloaded by the next Section::startBuild()),
+  // so it's a safe target for eviction under memory pressure.
+  if (CssParser* css = epub->getCssParser()) {
+    freeink::MemoryManager::instance().registerSink({
+        .name = "EpubCssRules",
+        .priority = 40,  // rebuildable and cheap to reload; evict well before essential state
+        .evict = [css](size_t) -> size_t {
+          const size_t rules = css->ruleCount();
+          css->clear();
+          LOG_DBG("ERS", "Evicted %zu CSS rule(s) under memory pressure", rules);
+          return 0;  // exact bytes freed unknown; a best-effort estimate is fine per CacheSink::evict
+        },
+    });
+  }
 
   ImageBlock::clearSessionRenderFailures();
   ImageBlock::setExtractor(epub.get(), [](void* ctx, const char* src, const char* dest) {
@@ -258,8 +276,32 @@ void EpubReaderActivity::openReaderMenu() {
 }
 
 bool EpubReaderActivity::buildTickHeapGate() {
-  const size_t freeHeap = ESP.getFreeHeap();
-  const size_t maxBlock = ESP.getMaxAllocHeap();
+  size_t freeHeap = ESP.getFreeHeap();
+  size_t maxBlock = ESP.getMaxAllocHeap();
+  // Below the floors: the tick is deferrable in principle -- page-turn transients
+  // free up between turns and the tick retries every loop pass -- but the build's
+  // OWN retained state (parser, CSS rule cache, in-RAM LUT window) can pin heap
+  // just below these floors indefinitely, since nothing else in a background
+  // build is going to free memory on its own. Observed on device: free heap
+  // sitting at 13-38KB (below the 32KB floor) for ~280s straight while a
+  // background build silently paused itself tick after tick, waiting for
+  // headroom that page-turns/renders never produced because nothing was
+  // actually running in the foreground. Try evicting rebuildable caches
+  // (see MemoryManager sinks, e.g. EpubCssRules registered in loadBook() --
+  // reloaded from the on-SD CSS cache by the next Section::startBuild(),
+  // same degraded-styling fallback CssParser already uses under its own
+  // low-heap gate) once before conceding the tick.
+  if (freeHeap < BACKGROUND_BUILD_MIN_FREE_HEAP || maxBlock < BACKGROUND_BUILD_MIN_MAX_ALLOC) {
+    // deficit == 0 (maxBlock-only shortfall, e.g. fragmentation with freeHeap already
+    // above its floor) asks clearCaches() to free everything -- appropriate here since
+    // a partial free wouldn't specifically address a largest-free-block shortfall anyway.
+    const size_t deficit = freeHeap < BACKGROUND_BUILD_MIN_FREE_HEAP ? BACKGROUND_BUILD_MIN_FREE_HEAP - freeHeap : 0;
+    freeink::MemoryManager::instance().clearCaches(deficit);
+    freeHeap = ESP.getFreeHeap();
+    maxBlock = ESP.getMaxAllocHeap();
+  }
+  // Track the paused state so skipLoopDelay() stops pinning the CPU at full
+  // speed while no build work is actually happening.
   buildHeapPaused = freeHeap < BACKGROUND_BUILD_MIN_FREE_HEAP || maxBlock < BACKGROUND_BUILD_MIN_MAX_ALLOC;
   return !buildHeapPaused;
 }
@@ -1752,6 +1794,14 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
     }
   } else {
     if (needsAnyGrayscale) {
+      if (!renderer.storeBwBuffer()) {
+        // A long reading session can fragment the heap enough that storeBwBuffer()'s
+        // ~8KB chunk allocations fail even with tens of KB free in aggregate (seen on
+        // device: "Failed to allocate BW buffer chunk" with ~64KB free but a much
+        // smaller largest contiguous block). Evict rebuildable caches (CSS rules,
+        // etc.) and retry once before giving up on grayscale for this page.
+        freeink::MemoryManager::instance().clearCaches();
+      }
       if (!renderer.storeBwBuffer()) {
         LOG_ERR("ERS", "Failed to store BW buffer for grayscale render; skipping grayscale this page");
         return;
