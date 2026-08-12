@@ -38,6 +38,10 @@ static void (*diskLogCallback)(const char*) = nullptr;
 
 void setDiskLogCallback(void (*cb)(const char*)) { diskLogCallback = cb; }
 
+static bool (*logTimestampProvider)(char*, size_t) = nullptr;
+
+void setLogTimestampProvider(bool (*fn)(char*, size_t)) { logTimestampProvider = fn; }
+
 // Since logging can take a large amount of flash, we want to make the format string as short as possible.
 // This logPrintf prepend the timestamp, level and origin to the user-provided message, so that the user only needs to
 // provide the format string for the message itself.
@@ -49,7 +53,15 @@ void logPrintf(const char* level, const char* origin, const char* format, ...) {
   // add timestamp, level and origin
   {
     unsigned long ms = millis();
-    int len = snprintf(c, sizeof(buf), "[%lu] [%s] [%s] ", ms, level, origin);
+    // 24 bytes covers formatTimestamp()'s >=21-byte ISO-8601 requirement; well under
+    // the <256-byte stack-local guidance for a function called from every task.
+    char ts[24];
+    int len;
+    if (logTimestampProvider && logTimestampProvider(ts, sizeof(ts))) {
+      len = snprintf(c, sizeof(buf), "[%lu] [%s] [%s] [%s] ", ms, ts, level, origin);
+    } else {
+      len = snprintf(c, sizeof(buf), "[%lu] [%s] [%s] ", ms, level, origin);
+    }
     // error while writing => return
     if (len < 0) {
       va_end(args);

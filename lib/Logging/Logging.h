@@ -107,6 +107,14 @@ void clearBootLogSnapshot();
 // Pass nullptr to unregister. Not thread-safe; call once at boot before tasks start.
 void setDiskLogCallback(void (*cb)(const char*));
 
+// Register a callback that formats the current wall-clock time into buf (>=24 bytes
+// provided) and returns true, or returns false if no wall-clock time is available yet
+// (e.g. before the RTC has been read for the first time this boot). When registered
+// and returning true, logPrintf() includes the formatted timestamp in each line's
+// prefix; otherwise lines keep the millis()-only prefix. Pass nullptr to unregister.
+// Not thread-safe; call once at boot before tasks start.
+void setLogTimestampProvider(bool (*fn)(char* buf, size_t bufSize));
+
 class MySerialImpl : public Print {
  public:
   void begin(unsigned long baud) { logSerial.begin(baud); }
