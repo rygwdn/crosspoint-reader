@@ -400,6 +400,14 @@ void setup() {
   // DiskLogger::begin() above) have run; release the transient heap copy.
   clearBootLogSnapshot();
 
+  // Single combined line (not several): the RTC ring buffer only holds 16 lines total,
+  // so multiple boot-info lines here would crowd out genuine crash context. LOG_INF (not
+  // LOG_DBG) so this survives in gh_release/gh_release_rc builds (LOG_LEVEL=1). Placed
+  // after DiskLogger::begin() so it flows into the live disk-log path for this boot.
+  LOG_INF("BOOT", "CrossPoint %s | %s | heap free=%u/%u min=%u maxAlloc=%u", CROSSPOINT_VERSION,
+          gpio.deviceIsX3() ? "X3" : "X4", ESP.getFreeHeap(), ESP.getHeapSize(), ESP.getMinFreeHeap(),
+          ESP.getMaxAllocHeap());
+
   // Reconcile the persisted "clock has been synced" flag with the RTC's actual
   // state: if it lost backup power since the last sync, halClock.getTime() now
   // fails (see Rtc.cpp OSF check), so the flag would otherwise keep claiming

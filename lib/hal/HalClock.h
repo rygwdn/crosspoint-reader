@@ -9,12 +9,15 @@ extern HalClock halClock;  // Singleton
 class HalClock {
   bool _available = false;
   mutable Rtc _sdkRtc;
-  mutable uint8_t _cachedHour = 0;
-  mutable uint8_t _cachedMinute = 0;
+  mutable Rtc::DateTime _cachedDateTime;
   mutable bool _hasCachedTime = false;
   mutable unsigned long _lastPollMs = 0;
 
   static constexpr unsigned long CLOCK_POLL_MS = 10000;  // 10 seconds
+
+  // Refreshes _cachedDateTime from the RTC, throttled to once per CLOCK_POLL_MS.
+  // Returns false if the RTC is unavailable and nothing has ever been cached.
+  bool refreshCache() const;
 
  public:
   // Call after BoardConfig has selected the active device.
@@ -33,6 +36,12 @@ class HalClock {
   // use12Hour: when true, format as 12-hour clock with AM/PM suffix.
   // Returns false if RTC is not available.
   bool formatTime(char* buf, size_t bufSize, uint8_t utcOffsetQuarterHoursBiased = 48, bool use12Hour = false) const;
+
+  // Format the cached wall-clock time as an ISO-8601 UTC timestamp, e.g.
+  // "2026-08-12T14:57:41Z" (needs >=21 bytes). Always UTC (no user timezone offset
+  // applied), matching how syncFromNTP() stores the RTC. Returns false if the RTC is
+  // not available and no time has been cached yet.
+  bool formatTimestamp(char* buf, size_t bufSize) const;
 
   // Sync the RTC from an NTP server. Requires WiFi to be connected.
   // Blocks for up to ~5s while waiting for SNTP response.
