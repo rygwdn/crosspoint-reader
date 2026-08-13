@@ -225,7 +225,11 @@ std::string getPanicInfo(bool full) {
     // HalSystem::begin()). Fall back to the live buffer if no snapshot was taken.
     std::string logs = getBootLogSnapshot();
     if (logs.empty()) {
-      logs = getLastLogs();
+      // static: this only runs once, right after a panic reboot, but a 4KB local would
+      // still blow past the <256-byte stack-local guidance for no reason.
+      static char buf[LOG_DUMP_BUFFER_SIZE];
+      getLastLogs(buf, sizeof(buf));
+      logs = buf;
     }
     info += "\n\nLast logs:\n" + logs;
     info += "\n\nStack memory:\n";

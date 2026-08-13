@@ -65,7 +65,21 @@ void logPrintf(const char* level, const char* origin, const char* format, ...);
 #define LOG_INF(origin, format, ...)
 #endif
 
-std::string getLastLogs();
+// Must match MAX_LOG_LINES/MAX_ENTRY_LEN in Logging.cpp -- shared here (rather than
+// duplicated as a magic number) because callers need it to size a buffer correctly,
+// not just as documentation.
+inline constexpr size_t LOG_RING_BUFFER_LINES = 16;
+inline constexpr size_t LOG_RING_BUFFER_LINE_LEN = 256;
+// Upper bound on getLastLogs()'s output, including the terminating NUL.
+inline constexpr size_t LOG_DUMP_BUFFER_SIZE = LOG_RING_BUFFER_LINES * LOG_RING_BUFFER_LINE_LEN + 1;
+
+// Copies the ring buffer's contents (oldest to newest) into out, truncating safely if
+// it doesn't fit rather than growing out -- this runs from DiskLogger's periodic flush,
+// which must not heap-allocate: a prior std::string-based version allocated up to ~4KB
+// per flush and called abort() (via operator new's -fno-exceptions failure path) when a
+// long-running WebDAV request had fragmented the heap down to a couple KB of contiguous
+// space. out is always NUL-terminated (even if outSize is 0, as long as outSize > 0).
+void getLastLogs(char* out, size_t outSize);
 void clearLastLogs();
 // Validates the RTC log state (magic word + logHead range). Returns true if
 // corruption was detected (magic mismatch or logHead out of range), meaning

@@ -4,6 +4,7 @@
 #include <Logging.h>
 #include <freertos/semphr.h>
 
+#include <cstring>
 #include <string>
 
 #include "CrossPointSettings.h"
@@ -93,8 +94,17 @@ void DiskLogger::writeRingBufferToFile() {
   // (which would re-enter logLine → here) are caught and short-circuited above.
   reentrant = true;
 
-  std::string content = getLastLogs();
-  if (!content.empty()) {
+  // static + fixed-size rather than the std::string this used to build: a growing
+  // std::string here needed a fresh, up-to-~4KB contiguous heap block on every flush,
+  // and with -fno-exceptions a failed operator new calls abort() instead of throwing.
+  // A long-stalled WebDAV PROPFIND (see WebDAVHandler.cpp's PROPFIND_MAX_TOTAL_MS
+  // comment) fragmented the heap down to ~2KB of contiguous free space, and the next
+  // flush aborted right here -- this is the crash that fix was chasing. A static buffer
+  // can't fail to allocate.
+  static char content[LOG_DUMP_BUFFER_SIZE];
+  getLastLogs(content, sizeof(content));
+  const size_t contentLen = strlen(content);
+  if (contentLen > 0) {
     HalFile check = Storage.open(LOG_BASE_PATH);
     if (check) {
       const size_t sz = check.fileSize();
@@ -107,7 +117,7 @@ void DiskLogger::writeRingBufferToFile() {
     HalFile file = Storage.open(LOG_BASE_PATH, O_WRITE | O_CREAT);
     if (file) {
       file.seek(file.fileSize());
-      file.write(content.c_str(), content.size());
+      file.write(content, contentLen);
       file.flush();
       // file closes automatically via DESTRUCTOR_CLOSES_FILE
     }
