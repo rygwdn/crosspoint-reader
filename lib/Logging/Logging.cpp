@@ -3,10 +3,11 @@
 #include <BoardConfig.h>
 #include <esp_rom_sys.h>
 
+#include <cstring>
 #include <string>
 
-#define MAX_ENTRY_LEN 256
-#define MAX_LOG_LINES 16
+#define MAX_ENTRY_LEN LOG_RING_BUFFER_LINE_LEN
+#define MAX_LOG_LINES LOG_RING_BUFFER_LINES
 
 // Simple ring buffer log, useful for error reporting when we encounter a crash
 RTC_NOINIT_ATTR char logMessages[MAX_LOG_LINES][MAX_ENTRY_LEN];
@@ -55,7 +56,7 @@ void logPrintf(const char* level, const char* origin, const char* format, ...) {
       return;
     }
     // clamp c to be in buffer range
-    c += std::min(len, MAX_ENTRY_LEN);
+    c += std::min<size_t>(len, MAX_ENTRY_LEN);
   }
   // add the user message
   {
@@ -82,19 +83,23 @@ void logPrintf(const char* level, const char* origin, const char* format, ...) {
   }
 }
 
-std::string getLastLogs() {
-  if (rtcLogMagic != LOG_RTC_MAGIC) {
-    return {};
-  }
-  std::string output;
-  for (size_t i = 0; i < MAX_LOG_LINES; i++) {
+void getLastLogs(char* out, size_t outSize) {
+  if (outSize == 0) return;
+  out[0] = '\0';
+  if (rtcLogMagic != LOG_RTC_MAGIC) return;
+
+  size_t pos = 0;
+  for (size_t i = 0; i < MAX_LOG_LINES && pos + 1 < outSize; i++) {
     size_t idx = (logHead + i) % MAX_LOG_LINES;
     if (logMessages[idx][0] != '\0') {
       const size_t len = strnlen(logMessages[idx], MAX_ENTRY_LEN);
-      output.append(logMessages[idx], len);
+      const size_t room = outSize - 1 - pos;
+      const size_t n = len < room ? len : room;
+      memcpy(out + pos, logMessages[idx], n);
+      pos += n;
     }
   }
-  return output;
+  out[pos] = '\0';
 }
 
 // Checks whether the RTC log state is consistent: rtcLogMagic must equal
@@ -125,7 +130,11 @@ static std::string bootLogSnapshot;
 static bool bootLogSnapshotTaken = false;
 
 void snapshotBootLogs() {
-  bootLogSnapshot = getLastLogs();
+  // static: this runs once at boot, well before the heap gets fragmented, but a 4KB
+  // local would still blow past the <256-byte stack-local guidance for no reason.
+  static char buf[LOG_DUMP_BUFFER_SIZE];
+  getLastLogs(buf, sizeof(buf));
+  bootLogSnapshot = buf;
   bootLogSnapshotTaken = true;
 }
 
