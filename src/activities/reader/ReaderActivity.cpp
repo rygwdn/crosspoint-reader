@@ -1,5 +1,6 @@
 #include "ReaderActivity.h"
 
+#include <DiskLogger.h>
 #include <FsHelpers.h>
 #include <HalStorage.h>
 #include <Memory.h>

@@ -269,6 +269,11 @@ void enterDeepSleep(bool fromTimeout = false) {
     Storage.remove(SLEEP_FRAME_FILE);
   }
 
+  // Force any log lines buffered since the last 16-line flush out to disk now --
+  // deep sleep is the natural end of a session, and otherwise they'd sit in the
+  // RTC ring buffer until the next qualifying log line crosses that threshold.
+  DiskLogger::flushNow();
+
   // Tear down WiFi so the modem power domain isn't held alive across deep sleep.
   // Wake from deep sleep is effectively a chip reset, so no state needs to survive.
   if (WiFi.getMode() != WIFI_MODE_NULL) {
@@ -552,7 +557,13 @@ void loop() {
 
   renderer.setFadingFix(SETTINGS.fadingFix);
 
-  if (Serial && millis() - lastMemPrint >= 10000) {
+  if (millis() - lastMemPrint >= 10000) {
+    // MaxAlloc (largest free block) matters as much as Free here: a big gap between
+    // the two means fragmentation, not exhaustion -- Free can look fine while a
+    // single large allocation (JPEG decoder, CSS parse buffer, NimBLE controller
+    // init) still fails. Previously gated on `Serial`, so this never reached the SD
+    // disk log (see DiskLogger) or the RTC crash-report ring buffer unless a USB
+    // monitor happened to be attached -- logPrintf() feeds both regardless of Serial.
     LOG_INF("MEM", "Free: %d bytes, Total: %d bytes, Min Free: %d bytes, MaxAlloc: %d bytes", ESP.getFreeHeap(),
             ESP.getHeapSize(), ESP.getMinFreeHeap(), ESP.getMaxAllocHeap());
     lastMemPrint = millis();
