@@ -252,7 +252,13 @@ std::string getPanicInfo(bool full) {
 
 bool isRebootFromPanic() {
   const auto resetReason = esp_reset_reason();
-  if (resetReason == ESP_RST_PANIC || resetReason == ESP_RST_CPU_LOCKUP) {
+  // Brownout is reported unconditionally, same as a true panic/lockup: SD write
+  // current spikes stacking on weak-WiFi TX retries can dip the rail enough to
+  // trip the brownout detector, which previously reset with no crash_report.txt
+  // at all. panicMessage/panicStack are only ever populated by the
+  // __wrap_panic_abort path, which a brownout never goes through -- but the
+  // reset-reason + last-logs snapshot are still useful even with no panic message.
+  if (resetReason == ESP_RST_PANIC || resetReason == ESP_RST_CPU_LOCKUP || resetReason == ESP_RST_BROWNOUT) {
     return true;
   }
 
