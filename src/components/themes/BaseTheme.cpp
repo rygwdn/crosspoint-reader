@@ -968,7 +968,16 @@ void BaseTheme::drawStatusBar(GfxRenderer& renderer, const float bookProgress, c
   // Draw Clock (X3 only — DS3231 RTC)
   if (sb.showsClock() && halClock.isAvailable()) {
     char timeBuf[9];
-    if (halClock.formatTime(timeBuf, sizeof(timeBuf), sb.clockUtcOffsetQ, sb.clock12h)) {
+    // formatTime() fails when the RTC has never been synced or lost its backup
+    // power (DS3231_STATUS_OSF set — see Rtc.cpp). Show a dashed placeholder
+    // instead of silently omitting the clock, so the user can tell "no time set"
+    // apart from "clock disabled in settings".
+    const bool haveTime = halClock.formatTime(timeBuf, sizeof(timeBuf), sb.clockUtcOffsetQ, sb.clock12h);
+    if (!haveTime) {
+      const char* placeholder = sb.clock12h ? "--:-- --" : "--:--";
+      snprintf(timeBuf, sizeof(timeBuf), "%s", placeholder);
+    }
+    {
       int clockTextWidth = renderer.getTextWidth(SMALL_FONT_ID, timeBuf);
       int clockX = 0;
       // Position to the left or right of the progress text (with a small gap)

@@ -419,6 +419,22 @@ void setup() {
   // Both boot-time consumers of the frozen ring-buffer snapshot (checkPanic() above and
   // DiskLogger::begin() above) have run; release the transient heap copy.
   clearBootLogSnapshot();
+
+  // Reconcile the persisted "clock has been synced" flag with the RTC's actual
+  // state: if it lost backup power since the last sync, halClock.getTime() now
+  // fails (see Rtc.cpp OSF check), so the flag would otherwise keep claiming
+  // "Clock Synced" in Settings > Customise Status Bar for a clock that isn't.
+  // This only ever clears the flag (never sets it) — WifiSelectionActivity's own
+  // getTime() check is what actually triggers a re-sync.
+  if (SETTINGS.clockHasBeenSynced && halClock.isAvailable()) {
+    uint8_t rtcHour = 0;
+    uint8_t rtcMinute = 0;
+    if (!halClock.getTime(rtcHour, rtcMinute)) {
+      SETTINGS.clockHasBeenSynced = 0;
+      SETTINGS.saveToFile();
+    }
+  }
+
   APP_STATE.loadFromFile();
   RECENT_BOOKS.loadFromFile();
   I18N.setLanguage(static_cast<Language>(SETTINGS.language));
