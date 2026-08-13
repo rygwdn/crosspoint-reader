@@ -1,5 +1,6 @@
 #include "XtcReaderActivity.h"
 
+#include <DiskLogger.h>
 #include <FsHelpers.h>
 #include <GfxRenderer.h>
 #include <HalStorage.h>
@@ -26,6 +27,11 @@ bool XtcReaderActivity::loadBook() {
     LOG_ERR("XTR", "Failed to load XTC");
     return false;
   }
+  // Flush now rather than waiting for the next FLUSH_INTERVAL batch: entering
+  // the reader activity and decoding page 0 is where a hang has been observed
+  // with compressed (.xtcbz/.xtcbzh) pages, and losing this checkpoint to
+  // unflushed ring-buffer lines would hide exactly where it got to.
+  DiskLogger::flushNow();
   xtc = std::move(loadedXtc);
   xtc->setupCacheDir();
   loadProgress();

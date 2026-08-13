@@ -355,7 +355,8 @@ void Epub::parseCssFiles() const {
 
 // load in the meta data for the epub file
 bool Epub::load(const bool buildIfMissing, const bool skipLoadingCss) {
-  LOG_DBG("EBP", "Loading ePub: %s", filepath.c_str());
+  LOG_DBG("EBP", "Loading ePub: %s (heap: %u, maxAlloc: %u)", filepath.c_str(), (unsigned)ESP.getFreeHeap(),
+          (unsigned)ESP.getMaxAllocHeap());
 
   // Initialize spine/TOC cache
   bookMetadataCache.reset(new BookMetadataCache(cachePath));
@@ -393,7 +394,8 @@ bool Epub::load(const bool buildIfMissing, const bool skipLoadingCss) {
     // resident pins tens of KB for the whole reading session (more on warm resume into
     // an already-cached chapter, where createSectionFile never runs to clear it).
     cssParser->clear();
-    LOG_DBG("EBP", "Loaded ePub: %s", filepath.c_str());
+    LOG_DBG("EBP", "Loaded ePub: %s (warm cache, heap: %u, maxAlloc: %u)", filepath.c_str(),
+            (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
     return true;
   }
 
@@ -430,7 +432,8 @@ bool Epub::load(const bool buildIfMissing, const bool skipLoadingCss) {
     LOG_ERR("EBP", "Could not end writing content.opf pass");
     return false;
   }
-  LOG_DBG("EBP", "OPF pass completed in %lu ms", millis() - opfStart);
+  LOG_DBG("EBP", "OPF pass completed in %lu ms (heap: %u, maxAlloc: %u)", millis() - opfStart,
+          (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
 
   // TOC Pass - try EPUB 3 nav first, fall back to NCX
   const uint32_t tocStart = millis();
@@ -462,7 +465,8 @@ bool Epub::load(const bool buildIfMissing, const bool skipLoadingCss) {
     LOG_ERR("EBP", "Could not end writing toc pass");
     return false;
   }
-  LOG_DBG("EBP", "TOC pass completed in %lu ms", millis() - tocStart);
+  LOG_DBG("EBP", "TOC pass completed in %lu ms (heap: %u, maxAlloc: %u)", millis() - tocStart,
+          (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
 
   // Close the cache files
   if (!bookMetadataCache->endWrite()) {
@@ -476,7 +480,8 @@ bool Epub::load(const bool buildIfMissing, const bool skipLoadingCss) {
     LOG_ERR("EBP", "Could not update mappings and sizes");
     return false;
   }
-  LOG_DBG("EBP", "buildBookBin completed in %lu ms", millis() - buildStart);
+  LOG_DBG("EBP", "buildBookBin completed in %lu ms (heap: %u, maxAlloc: %u)", millis() - buildStart,
+          (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
   LOG_DBG("EBP", "Total indexing completed in %lu ms", millis() - indexingStart);
 
   if (!bookMetadataCache->cleanupTmpFiles()) {
@@ -488,6 +493,8 @@ bool Epub::load(const bool buildIfMissing, const bool skipLoadingCss) {
     bookMetadataCache.reset();
     parseCssFiles();
     Storage.removeDir((cachePath + "/sections").c_str());
+    LOG_DBG("EBP", "CSS parsing completed (heap: %u, maxAlloc: %u)", (unsigned)ESP.getFreeHeap(),
+            (unsigned)ESP.getMaxAllocHeap());
   }
 
   // Reload the cache from disk so it's in the correct state
@@ -497,7 +504,8 @@ bool Epub::load(const bool buildIfMissing, const bool skipLoadingCss) {
     return false;
   }
 
-  LOG_DBG("EBP", "Loaded ePub: %s", filepath.c_str());
+  LOG_DBG("EBP", "Loaded ePub: %s (cold build, heap: %u, maxAlloc: %u)", filepath.c_str(),
+          (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
   return true;
 }
 

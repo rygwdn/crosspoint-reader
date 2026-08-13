@@ -9,6 +9,7 @@
 #include "esp_private/esp_cpu_internal.h"
 #include "esp_private/esp_system_attr.h"
 #include "esp_private/panic_internal.h"
+#include "esp_task_wdt.h"
 
 #define MAX_PANIC_STACK_DEPTH 32
 #define PANIC_CAPTURE_MAGIC 0x50414E49u
@@ -18,6 +19,60 @@ RTC_NOINIT_ATTR HalSystem::StackFrame panicStack[MAX_PANIC_STACK_DEPTH];
 // RTC_NOINIT is uninitialized on cold boot, so only this exact marker proves a
 // panic diagnostic was captured before the reset.
 RTC_NOINIT_ATTR volatile uint32_t panicCaptureMarker;
+
+namespace {
+// The vendored WebServer library blocks for up to 5000ms on a single socket
+// write/close with no watchdog resets of its own (HTTP_MAX_SEND_WAIT /
+// HTTP_MAX_CLOSE_WAIT in WebServer.h). The sdkconfig task watchdog timeout is
+// also 5000ms (CONFIG_ESP_TASK_WDT_TIMEOUT_S=5), so a single slow send over
+// weak WiFi races the watchdog and can reset the device before the library
+// gives up on its own. This bit the multipart /upload path before (see the
+// "critical 1% crash point" comment in CrossPointWebServer.cpp::handleUpload)
+// and was observed again right after a WebDAV PUT completed on weak WiFi
+// (RSSI around -90dBm). Give the watchdog enough headroom that the library's
+// own 5s timeouts always lose the race and fail cleanly instead of racing a
+// hardware reset. A genuine infinite hang still gets caught, just 5s later.
+constexpr uint32_t EXTENDED_TASK_WDT_TIMEOUT_MS = 10000;
+
+const char* resetReasonName(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_UNKNOWN:
+      return "UNKNOWN";
+    case ESP_RST_POWERON:
+      return "POWERON";
+    case ESP_RST_EXT:
+      return "EXT";
+    case ESP_RST_SW:
+      return "SW";
+    case ESP_RST_PANIC:
+      return "PANIC";
+    case ESP_RST_INT_WDT:
+      return "INT_WDT";
+    case ESP_RST_TASK_WDT:
+      return "TASK_WDT";
+    case ESP_RST_WDT:
+      return "WDT";
+    case ESP_RST_DEEPSLEEP:
+      return "DEEPSLEEP";
+    case ESP_RST_BROWNOUT:
+      return "BROWNOUT";
+    case ESP_RST_SDIO:
+      return "SDIO";
+    case ESP_RST_USB:
+      return "USB";
+    case ESP_RST_JTAG:
+      return "JTAG";
+    case ESP_RST_EFUSE:
+      return "EFUSE";
+    case ESP_RST_PWR_GLITCH:
+      return "PWR_GLITCH";
+    case ESP_RST_CPU_LOCKUP:
+      return "CPU_LOCKUP";
+    default:
+      return "?";
+  }
+}
+}  // namespace
 
 extern "C" {
 
@@ -83,6 +138,21 @@ void IRAM_ATTR __wrap_panic_print_backtrace(const void* frame, int core) {
 namespace HalSystem {
 
 void begin() {
+  LOG_INF("SYS", "Reset reason: %s", resetReasonName(esp_reset_reason()));
+
+  // The Arduino core auto-initializes the TWDT from sdkconfig defaults
+  // (5000ms) before setup() runs, so reconfigure rather than init. See the
+  // comment on EXTENDED_TASK_WDT_TIMEOUT_MS above for why.
+  const esp_task_wdt_config_t wdtConfig = {
+      .timeout_ms = EXTENDED_TASK_WDT_TIMEOUT_MS,
+      .idle_core_mask = 0,
+      .trigger_panic = true,
+  };
+  const esp_err_t wdtErr = esp_task_wdt_reconfigure(&wdtConfig);
+  if (wdtErr != ESP_OK) {
+    LOG_ERR("SYS", "Failed to extend task watchdog timeout: %d", (int)wdtErr);
+  }
+
   // On a panic reboot, preserve diagnostics until checkPanic() has tried to write them to the SD card.
   // Ordinary boots clear any stale retained diagnostics.
   if (!isRebootFromPanic()) {
@@ -135,6 +205,7 @@ std::string getPanicInfo(bool full) {
     std::string info;
 
     info += "CrossPoint version: " CROSSPOINT_VERSION;
+    info += "\n\nReset reason: " + std::string(resetReasonName(esp_reset_reason()));
     info += "\n\nPanic reason: " + std::string(panicMessage);
     info += "\n\nLast logs:\n" + getLastLogs();
     info += "\n\nStack memory:\n";
