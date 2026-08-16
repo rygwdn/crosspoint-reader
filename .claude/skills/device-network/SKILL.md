@@ -74,13 +74,13 @@ touching the user's place in the book.
 
 ## Reading logs
 
-The **live** debug log is `/.crosspoint/debug.log`, NOT a root-level
-`/debug.log` -- that path can exist as a stale leftover from an old session
-and will quietly mislead you if you fetch it instead. Older sessions are kept
-as `/.crosspoint/debug.log.1` through `.4` (oldest last; see
+The **live** debug log is root-level `/debug.log`, NOT `/.crosspoint/debug.log`
+-- the latter path can exist as a stale leftover from an old build and will
+quietly mislead you if you fetch it instead. Older sessions are kept as
+`/debug.1.log` through `.4.log` (oldest last; see
 `DiskLogger::getGenerationCount()` in `src/DiskLogger.h`), rotated one boot at
-a time -- `.1` is the previous boot, not necessarily the previous crash. Check
-line counts / timestamps across generations before trusting one.
+a time -- `.1.log` is the previous boot, not necessarily the previous crash.
+Check line counts / timestamps across generations before trusting one.
 
 Logging to this file is only flushed every ~16 log calls (see
 `src/DiskLogger.h`), and only if `SETTINGS.diskLogsEnabled`. If you add
@@ -90,7 +90,7 @@ immediately after a single action can show nothing new even though logging is
 working.
 
 ```bash
-curl -s -o debug.log "http://<ip>/.crosspoint/debug.log"
+curl -s -o debug.log "http://<ip>/debug.log"
 grep "whatever you're chasing" debug.log
 ```
 

@@ -21,13 +21,14 @@ class DiskLogger {
   static void clear();
 
   // Path for a given generation: 0 = the currently active log, 1..getGenerationCount()-1
-  // = rotated-out backups, oldest last (debug.log, debug.log.1, debug.log.2, ...).
-  // Used by the log viewer to enumerate files; doesn't check the file actually exists.
+  // = rotated-out backups, oldest last. Backups keep the ".log" suffix rather than
+  // appending the generation after it (debug.log, debug.1.log, debug.2.log, ...), so
+  // file managers/log tools that filter by extension still pick them up.
   static std::string getLogFilePath(int generation);
   static constexpr int getGenerationCount() { return MAX_LOG_GENERATIONS; }
 
  private:
-  static constexpr const char* LOG_BASE_PATH = "/.crosspoint/debug.log";
+  static constexpr const char* LOG_BASE_PATH = "/debug.log";
   static constexpr size_t MAX_LOG_FILE_SIZE = 512UL * 1024UL;
   // debug.log (active) + this many rotated backups.
   static constexpr int MAX_LOG_GENERATIONS = 5;

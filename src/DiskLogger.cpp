@@ -20,7 +20,12 @@ std::string DiskLogger::getLogFilePath(int generation) {
   if (generation <= 0) {
     return LOG_BASE_PATH;
   }
-  return std::string(LOG_BASE_PATH) + "." + std::to_string(generation);
+  // Insert the generation before the ".log" suffix (debug.1.log, debug.2.log, ...)
+  // instead of appending it after, so rotated backups still carry a .log extension.
+  std::string path(LOG_BASE_PATH);
+  const size_t extPos = path.rfind(".log");
+  path.insert(extPos, "." + std::to_string(generation));
+  return path;
 }
 
 void DiskLogger::begin() {
