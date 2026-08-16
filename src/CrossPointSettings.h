@@ -317,7 +317,7 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
   uint8_t language = 0;
   // Quick Resume: keep current content visible with moon icon instead of showing a static sleep screen.
   uint8_t quickResumeSleepScreen = QUICK_RESUME_NEVER;
-  // Capture log lines to SD card (/.crosspoint/debug.log) for offline debugging.
+  // Capture log lines to SD card (/debug.log) for offline debugging.
   uint8_t diskLogsEnabled = 0;
 
   static constexpr uint8_t MIN_SLEEP_TIMEOUT_MINUTES = 1;
