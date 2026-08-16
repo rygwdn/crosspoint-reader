@@ -93,6 +93,14 @@ class HalFile : public Print {
   void rewindDirectory();
   bool close();
   HalFile openNextFile();
+  // Same as `out = openNextFile()`, but reuses `out`'s existing heap
+  // allocation instead of allocating a new one on every call. `openNextFile()`
+  // heap-allocates a fresh HalFile::Impl each time (see HalStorage.cpp); for
+  // callers iterating many entries (e.g. WebDAV PROPFIND directory listings),
+  // that's a repeated alloc/free per entry that fragments the heap. Use this
+  // instead for any loop that calls openNextFile() more than once or twice.
+  // Returns false (and leaves `out` closed) once there are no more entries.
+  bool openNextFileInto(HalFile& out);
   bool isOpen() const;
   operator bool() const;
 };

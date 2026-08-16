@@ -527,6 +527,22 @@ void WifiSelectionActivity::checkConnectionStatus() {
       }
     }
 
+    // Sync RTC from NTP whenever the RTC doesn't currently hold a trustworthy time.
+    // The DS3231 drifts ~2 ppm, so once it has a valid time one sync lasts a long
+    // while — but if its backup power was ever interrupted (e.g. weak/depleted
+    // backup cap while the device sat unpowered), Rtc::now() reports invalid
+    // (see Rtc.cpp DS3231_STATUS_OSF check) and getTime() below returns false,
+    // so this re-syncs automatically instead of requiring a manual trip to
+    // Settings > Customise Status Bar > Sync clock now.
+    uint8_t currentHour = 0;
+    uint8_t currentMinute = 0;
+    if (halClock.isAvailable() && !halClock.getTime(currentHour, currentMinute)) {
+      if (halClock.syncFromNTP()) {
+        SETTINGS.clockHasBeenSynced = 1;
+        SETTINGS.saveToFile();
+      }
+    }
+
     // Save this as the last connected network - SD card operations need lock as
     // we use SPI for both
     {

@@ -4,6 +4,7 @@
 #include <HalStorage.h>
 #include <Logging.h>
 
+#include "CrossPointSettings.h"
 #include "util/BookCacheUtils.h"
 #include "util/TaskWatchdog.h"
 
@@ -221,14 +222,18 @@ void WebDAVHandler::handlePropfind(WebServer& s) {
 
   // If depth > 0 and it's a directory, list children
   if (depth > 0) {
-    HalFile file = root.openNextFile();
+    // file is reused across iterations by openNextFileInto() (one heap alloc
+    // for the whole listing instead of one per entry -- see HalStorage.h).
+    HalFile file;
     char name[500];
-    while (file) {
+    while (root.openNextFileInto(file)) {
       file.getName(name, sizeof(name));
       String fileName(name);
 
-      // Skip hidden/protected items
-      bool shouldHide = fileName.startsWith(".");
+      // Skip hidden/protected items. Dotfiles are only hidden when the user hasn't
+      // opted in via Settings > File Browser > Show Hidden Files (matches
+      // CrossPointWebServer's file-listing endpoint).
+      bool shouldHide = !SETTINGS.showHiddenFiles && fileName.startsWith(".");
       if (!shouldHide) {
         for (const auto* item : HIDDEN_ITEMS) {
           if (fileName.equals(item)) {
@@ -250,10 +255,8 @@ void WebDAVHandler::handlePropfind(WebServer& s) {
         }
       }
 
-      file.close();
       yield();
       resetTaskWatchdogIfSubscribed();
-      file = root.openNextFile();
     }
   }
 
@@ -328,7 +331,29 @@ void WebDAVHandler::handleGet(WebServer& s) {
   s.send(200, contentType.c_str(), "");
 
   NetworkClient client = s.client();
-  client.write(file);
+  // Stream in chunks with a watchdog reset between each write, instead of one
+  // blocking client.write(file) call — a large file over a merely-slow (not
+  // dead) link can otherwise hold the task watchdog window hostage for the
+  // whole transfer. Bail out (rather than looping forever) the first time a
+  // write reports 0 bytes accepted, since that means the peer stopped reading.
+  constexpr size_t CHUNK = 4096;
+  uint8_t buffer[CHUNK];
+  bool sendOk = true;
+  while (sendOk && file.available()) {
+    int result = file.read(buffer, CHUNK);
+    if (result <= 0) break;
+    size_t bytesRead = static_cast<size_t>(result);
+    size_t totalWritten = 0;
+    while (totalWritten < bytesRead) {
+      resetTaskWatchdogIfSubscribed();
+      size_t wrote = client.write(buffer + totalWritten, bytesRead - totalWritten);
+      if (wrote == 0) {
+        sendOk = false;
+        break;
+      }
+      totalWritten += wrote;
+    }
+  }
   file.close();
 }
 

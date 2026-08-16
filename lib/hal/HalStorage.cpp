@@ -169,5 +169,25 @@ HalFile HalFile::openNextFile() {
   assert(impl != nullptr);
   return HalFile(std::make_unique<Impl>(impl->file.openNextFile()));
 }
+bool HalFile::openNextFileInto(HalFile& out) {
+  HalStorage::StorageLock lock;
+  assert(impl != nullptr);
+  FsFile next = impl->file.openNextFile();
+  if (!next) {
+    if (out.impl) out.close();
+    return false;
+  }
+  if (!out.impl) {
+    out.impl = std::make_unique<Impl>(std::move(next));
+  } else {
+    // FsBaseFile::move()/operator= overwrite the destination's internal file
+    // pointers without closing whatever it currently holds open first (see
+    // SdFat's FsFile.cpp move()/copy()) -- close explicitly or the previous
+    // entry's SdFat-level open-file slot leaks.
+    out.impl->file.close();
+    out.impl->file = std::move(next);
+  }
+  return true;
+}
 bool HalFile::isOpen() const { return impl != nullptr && impl->file.isOpen(); }  // already thread-safe, no need to wrap
 HalFile::operator bool() const { return isOpen(); }
