@@ -100,7 +100,7 @@ Large uploads (firmware `.bin`, tens of KB+) need the WebSocket protocol on
 port 81, not WebDAV PUT. Use the bundled script:
 
 ```bash
-python3 .claude/skills/device-network/scripts/ws_upload.py <ip> <local_path> <remote_filename> [remote_dir]
+python3 .skills/device-network/scripts/ws_upload.py <ip> <local_path> <remote_filename> [remote_dir]
 ```
 
 This reimplements the exact protocol the device's own "Files" web UI uses:
