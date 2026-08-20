@@ -89,10 +89,11 @@ KOReaderSyncClient::Error KOReaderSyncClient::authenticate() {
   }
   applyAuthHeaders(http);
   const int httpCode = http.GET();
+  const std::string authRespBody = http.getString();
   http.end();
   lastHttpCode = httpCode;
-
-  LOG_DBG("KOSync", "Auth response: %d", httpCode);
+  LOG_DBG("KOSync", "Auth request: GET %s | user=%s response=%d body=[%s]", url.c_str(),
+          KOREADER_STORE.getUsername().c_str(), httpCode, authRespBody.c_str());
 
   if (httpCode <= 0) return NETWORK_ERROR;
   // Any 2xx is success. The reference kosync server answers 200, but
@@ -129,10 +130,11 @@ KOReaderSyncClient::Error KOReaderSyncClient::createUser() {
   http.addHeader("Accept", "application/vnd.koreader.v1+json");
   http.addHeader("Content-Type", "application/json");
   const int httpCode = http.sendRequest("POST", body);
+  const std::string createRespBody = http.getString();
   http.end();
   lastHttpCode = httpCode;
-
-  LOG_DBG("KOSync", "Create user response: %d", httpCode);
+  LOG_DBG("KOSync", "Create user request: POST %s | user=%s response=%d body=[%s]", url.c_str(),
+          KOREADER_STORE.getUsername().c_str(), httpCode, createRespBody.c_str());
 
   if (httpCode <= 0) return NETWORK_ERROR;
   if (httpCode >= 200 && httpCode < 300) return OK;  // 2xx: created (see #2876)
@@ -158,11 +160,11 @@ KOReaderSyncClient::Error KOReaderSyncClient::getProgress(const std::string& doc
     LOG_ERR("KOSync", "Bad URL: %s", url.c_str());
     return NETWORK_ERROR;
   }
-  applyAuthHeaders(http);
   const int httpCode = http.GET();
+  const std::string getRespBody = http.getString();
   lastHttpCode = httpCode;
-
-  LOG_DBG("KOSync", "Get progress response: %d", httpCode);
+  LOG_DBG("KOSync", "Get progress request: GET %s | user=%s response=%d body=[%s]", url.c_str(),
+          KOREADER_STORE.getUsername().c_str(), httpCode, getRespBody.c_str());
 
   if (httpCode <= 0) {
     http.end();
@@ -275,10 +277,11 @@ KOReaderSyncClient::Error KOReaderSyncClient::updateProgress(const KOReaderProgr
   applyAuthHeaders(http);
   http.addHeader("Content-Type", "application/json");
   const int httpCode = http.sendRequest("PUT", body);
+  const std::string updateRespBody = http.getString();
   http.end();
   lastHttpCode = httpCode;
-
-  LOG_DBG("KOSync", "Update progress response: %d", httpCode);
+  LOG_DBG("KOSync", "Update progress request: PUT %s | user=%s | body=%s | response=%d body=[%s]", url.c_str(),
+          KOREADER_STORE.getUsername().c_str(), body.c_str(), httpCode, updateRespBody.c_str());
 
   if (httpCode <= 0) return NETWORK_ERROR;
   // Any 2xx accepts the progress. The reference kosync server answers 200,
