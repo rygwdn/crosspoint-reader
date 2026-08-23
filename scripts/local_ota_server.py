@@ -6,19 +6,28 @@ OtaUpdater's OTA_MANIFEST_URL override instead of GitHub Releases.
 
 The device only compares the numeric major.minor.patch prefix of tag_name
 against its compiled-in CROSSPOINT_VERSION (see OtaUpdater::isUpdateNewer in
-src/network/OtaUpdater.cpp), and the `default` env's version is always
-"<base>-<date>-<branch>-<sha>" with the base's patch taken verbatim from
-platformio.ini's [crosspoint] version -- so a static tag_name would only
-trigger an update once, the first time the base version happens to be
-lower. To make every changed build look newer, this server hashes
+src/network/OtaUpdater.cpp). The full CROSSPOINT_VERSION -- e.g.
+"1.5.0-20260823-personal-integration-b5de1586" -- is baked into firmware.bin
+itself: HttpDownloader.cpp concatenates "CrossPoint-ESP32-" CROSSPOINT_VERSION
+into a single string literal for its HTTP User-Agent, which the compiler
+always links in as one fixed, NUL-terminated anchor in .rodata regardless of
+build env. This server reads that string back out of the built binary on
+each manifest request instead of re-deriving it from the source tree's git
+state, so the served tag always matches exactly what this firmware.bin will
+report as its own version once flashed -- including when the repo has since
+moved on to a different commit/branch than what was actually built.
+
+Because the embedded major.minor.patch only changes when someone bumps
+platformio.ini's [crosspoint] version, a static tag_name would only trigger
+an update once, the first time that number happens to be lower than what's
+on the device. To make every changed build look newer, this server hashes
 firmware.bin on each manifest request and bumps a persisted patch counter
 (stored in .pio/ota_server_state.json, itself already gitignored via .pio/)
-only when the hash actually changes, starting one patch above the repo's
+only when the hash actually changes, starting one patch above the embedded
 base version. Restarting the server does not reset or regress the counter.
-The rest of the tag (date/branch/sha, same shape as scripts/git_branch.py's
-CROSSPOINT_VERSION) is cosmetic -- it makes the served build identifiable on
-the device's OTA screen, but only the bumped major.minor.patch drives the
-update-available check.
+The rest of the tag (date/branch/sha suffix) is taken verbatim from the
+embedded string and is purely cosmetic -- only the bumped major.minor.patch
+drives the update-available check.
 
 Usage:
   python3 scripts/local_ota_server.py                  # serves .pio/build/default/firmware.bin on :8091
@@ -30,13 +39,11 @@ adding to [env:default] build_flags (see OtaUpdater.cpp's own comment):
   -DOTA_MANIFEST_URL=\\"http://<this-machine-ip>:8091/latest.json\\"
 """
 import argparse
-import datetime
 import hashlib
 import http.server
 import json
 import re
 import socket
-import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -54,54 +61,21 @@ FIRMWARE_PATH = "/firmware.bin"
 state_lock = threading.Lock()
 
 
-def find_repo_root(build_dir: Path) -> Path:
-    """Walk up from --build-dir to the repo that actually produced the
-    firmware (identified by platformio.ini), falling back to the script's
-    own location. --build-dir/--state-file can point at a different
-    checkout than this script lives in (e.g. a dev-tooling worktree serving
-    a firmware built in the main personal-integration tree) -- REPO_ROOT
-    would silently report the wrong branch/sha/base-version in that case.
-    """
-    for candidate in [build_dir.resolve(), *build_dir.resolve().parents]:
-        if (candidate / "platformio.ini").is_file():
-            return candidate
-    return REPO_ROOT
+_EMBEDDED_VERSION_RE = re.compile(rb"CrossPoint-ESP32-([\x20-\x7e]+?)\x00")
 
 
-def run_git_value(repo_root: Path, args: list[str], fallback: str = "unknown") -> str:
-    try:
-        value = subprocess.check_output(
-            ["git", *args], text=True, stderr=subprocess.DEVNULL, cwd=repo_root
-        ).strip()
-        # Strip characters that would break a C string literal / JSON string.
-        return "".join(c for c in value if c not in '"\\')
-    except (OSError, subprocess.CalledProcessError):
-        return fallback
+class MissingEmbeddedVersion(RuntimeError):
+    """firmware.bin has no CrossPoint-ESP32-<version> User-Agent literal."""
 
 
-def get_git_branch(repo_root: Path) -> str:
-    branch = run_git_value(repo_root, ["rev-parse", "--abbrev-ref", "HEAD"])
-    return "detached" if branch == "HEAD" else branch
-
-
-def get_git_short_sha(repo_root: Path) -> str:
-    return run_git_value(repo_root, ["rev-parse", "--short", "HEAD"])
-
-
-def get_base_version(repo_root: Path) -> str:
-    ini_text = (repo_root / "platformio.ini").read_text()
-    match = re.search(r"^\[crosspoint\]\s*\nversion\s*=\s*(\S+)", ini_text, re.MULTILINE)
+def extract_embedded_version(firmware_bytes: bytes) -> str:
+    match = _EMBEDDED_VERSION_RE.search(firmware_bytes)
     if not match:
-        sys.exit("Could not find [crosspoint] version in platformio.ini")
-    return match.group(1)
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+        raise MissingEmbeddedVersion(
+            "no \"CrossPoint-ESP32-<version>\" literal found in firmware.bin -- "
+            "is this a HttpDownloader-less build, or a stale/corrupt binary?"
+        )
+    return match.group(1).decode("ascii")
 
 
 def load_state(state_file: Path):
@@ -121,17 +95,23 @@ def save_state(state_file: Path, state: dict) -> None:
 _NUMERIC_PREFIX_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)")
 
 
-def resolve_version(base_version: str, state: dict | None, firmware_hash: str, repo_root: Path) -> tuple[str, dict]:
+def resolve_version(embedded_version: str, state: dict | None, firmware_hash: str) -> tuple[str, dict]:
     """Return (tag_name, new_state), bumping the patch only when the hash changed.
 
-    The emitted tag embeds the build date, git branch, and short SHA (same
-    shape as scripts/git_branch.py's CROSSPOINT_VERSION) so the OTA screen
-    shows which build is on offer. isUpdateNewer only compares the numeric
-    major.minor.patch prefix, so the patch still has to be bumped on every
-    hash change -- otherwise two same-day builds on the same branch would
-    look identical to that comparison.
+    `embedded_version` is CROSSPOINT_VERSION as extracted from this exact
+    firmware.bin (see extract_embedded_version) -- e.g.
+    "1.5.0-20260823-personal-integration-b5de1586", or plain "1.5.0" for a
+    gh_release-style build with no date/branch/sha suffix. isUpdateNewer only
+    compares the numeric major.minor.patch prefix, so the patch still has to
+    be bumped on every hash change -- otherwise two same-day builds on the
+    same branch would look identical to that comparison. The suffix (if any)
+    is carried through verbatim onto the bumped tag.
     """
-    base_major, base_minor, base_patch = (int(part) for part in base_version.split(".")[:3])
+    prefix_match = _NUMERIC_PREFIX_RE.match(embedded_version)
+    if not prefix_match:
+        raise MissingEmbeddedVersion(f"embedded version {embedded_version!r} has no major.minor.patch prefix")
+    embedded_major, embedded_minor, embedded_patch = (int(g) for g in prefix_match.groups())
+    suffix = embedded_version[prefix_match.end():]
 
     if state and state.get("sha256") == firmware_hash:
         return state["version"], state
@@ -143,18 +123,15 @@ def resolve_version(base_version: str, state: dict | None, firmware_hash: str, r
     else:
         prev_major = prev_minor = prev_patch = None
 
-    if prev_major == base_major and prev_minor == base_minor:
+    if prev_major == embedded_major and prev_minor == embedded_minor:
         new_patch = prev_patch + 1
     else:
-        # First run, or platformio.ini's base version moved -- reset just
-        # above the current base so it's still guaranteed newer than a
+        # First run, or the embedded base version moved -- reset just above
+        # the current base so it's still guaranteed newer than a
         # freshly-flashed device.
-        new_patch = base_patch + 1
+        new_patch = embedded_patch + 1
 
-    date_stamp = datetime.date.today().strftime("%Y%m%d")
-    branch = get_git_branch(repo_root)
-    short_sha = get_git_short_sha(repo_root)
-    new_version = f"{base_major}.{base_minor}.{new_patch}-{date_stamp}-{branch}-{short_sha}"
+    new_version = f"{embedded_major}.{embedded_minor}.{new_patch}{suffix}"
     return new_version, {"sha256": firmware_hash, "version": new_version}
 
 
@@ -169,7 +146,7 @@ def local_ip() -> str:
         s.close()
 
 
-def make_handler(firmware_path: Path, state_file: Path, base_version: str, repo_root: Path):
+def make_handler(firmware_path: Path, state_file: Path):
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
             sys.stderr.write("[local_ota_server] " + (fmt % args) + "\n")
@@ -177,10 +154,12 @@ def make_handler(firmware_path: Path, state_file: Path, base_version: str, repo_
         def _manifest_body(self) -> bytes | None:
             if not firmware_path.exists():
                 return None
+            data = firmware_path.read_bytes()
+            firmware_hash = hashlib.sha256(data).hexdigest()
+            embedded_version = extract_embedded_version(data)
             with state_lock:
-                firmware_hash = sha256_file(firmware_path)
                 state = load_state(state_file)
-                version, new_state = resolve_version(base_version, state, firmware_hash, repo_root)
+                version, new_state = resolve_version(embedded_version, state, firmware_hash)
                 if new_state != state:
                     save_state(state_file, new_state)
             manifest = {
@@ -189,7 +168,7 @@ def make_handler(firmware_path: Path, state_file: Path, base_version: str, repo_
                     {
                         "name": "firmware.bin",
                         "browser_download_url": f"http://{self.headers.get('Host', 'localhost')}{FIRMWARE_PATH}",
-                        "size": firmware_path.stat().st_size,
+                        "size": len(data),
                         "sha256": firmware_hash,
                     }
                 ],
@@ -198,7 +177,11 @@ def make_handler(firmware_path: Path, state_file: Path, base_version: str, repo_
 
         def do_GET(self):
             if self.path == MANIFEST_PATH:
-                body = self._manifest_body()
+                try:
+                    body = self._manifest_body()
+                except MissingEmbeddedVersion as exc:
+                    self.send_error(500, str(exc))
+                    return
                 if body is None:
                     self.send_error(404, f"{firmware_path} not built yet -- run: pio run -e default")
                     return
@@ -235,17 +218,19 @@ def main():
 
     firmware_path = Path(args.build_dir) / "firmware.bin"
     state_file = Path(args.state_file)
-    repo_root = find_repo_root(Path(args.build_dir))
-    base_version = get_base_version(repo_root)
 
-    handler = make_handler(firmware_path, state_file, base_version, repo_root)
+    handler = make_handler(firmware_path, state_file)
     server = http.server.ThreadingHTTPServer((args.host, args.port), handler)
 
     ip = local_ip()
     print(f"[local_ota_server] serving {firmware_path}")
-    print(f"[local_ota_server] firmware repo: {repo_root}")
-    print(f"[local_ota_server] base version (platformio.ini): {base_version}")
-    print(f"[local_ota_server] build tag: {get_git_branch(repo_root)}/{get_git_short_sha(repo_root)} (date-stamped per manifest request)")
+    if firmware_path.exists():
+        try:
+            print(f"[local_ota_server] embedded version: {extract_embedded_version(firmware_path.read_bytes())}")
+        except MissingEmbeddedVersion as exc:
+            print(f"[local_ota_server] warning: {exc}")
+    else:
+        print("[local_ota_server] firmware.bin not built yet -- run: pio run -e default")
     print(f"[local_ota_server] listening on {args.host}:{args.port}")
     print()
     print("Add to [env:default] build_flags in the gitignored platformio.local.ini:")
