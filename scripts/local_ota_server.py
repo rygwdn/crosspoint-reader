@@ -7,7 +7,7 @@ OtaUpdater's OTA_MANIFEST_URL override instead of GitHub Releases.
 The device only compares the numeric major.minor.patch prefix of tag_name
 against its compiled-in CROSSPOINT_VERSION (see OtaUpdater::isUpdateNewer in
 src/network/OtaUpdater.cpp), and the `default` env's version is always
-"<base>-dev-<branch>-<sha>" with the base's patch taken verbatim from
+"<base>-<date>-<branch>-<sha>" with the base's patch taken verbatim from
 platformio.ini's [crosspoint] version -- so a static tag_name would only
 trigger an update once, the first time the base version happens to be
 lower. To make every changed build look newer, this server hashes
@@ -15,6 +15,10 @@ firmware.bin on each manifest request and bumps a persisted patch counter
 (stored in .pio/ota_server_state.json, itself already gitignored via .pio/)
 only when the hash actually changes, starting one patch above the repo's
 base version. Restarting the server does not reset or regress the counter.
+The rest of the tag (date/branch/sha, same shape as scripts/git_branch.py's
+CROSSPOINT_VERSION) is cosmetic -- it makes the served build identifiable on
+the device's OTA screen, but only the bumped major.minor.patch drives the
+update-available check.
 
 Usage:
   python3 scripts/local_ota_server.py                  # serves .pio/build/default/firmware.bin on :8091
@@ -26,11 +30,13 @@ adding to [env:default] build_flags (see OtaUpdater.cpp's own comment):
   -DOTA_MANIFEST_URL=\\"http://<this-machine-ip>:8091/latest.json\\"
 """
 import argparse
+import datetime
 import hashlib
 import http.server
 import json
 import re
 import socket
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -46,6 +52,26 @@ FIRMWARE_PATH = "/firmware.bin"
 # Guards concurrent GETs against the state file (ThreadingHTTPServer runs one
 # thread per request).
 state_lock = threading.Lock()
+
+
+def run_git_value(args: list[str], fallback: str = "unknown") -> str:
+    try:
+        value = subprocess.check_output(
+            ["git", *args], text=True, stderr=subprocess.DEVNULL, cwd=REPO_ROOT
+        ).strip()
+        # Strip characters that would break a C string literal / JSON string.
+        return "".join(c for c in value if c not in '"\\')
+    except (OSError, subprocess.CalledProcessError):
+        return fallback
+
+
+def get_git_branch() -> str:
+    branch = run_git_value(["rev-parse", "--abbrev-ref", "HEAD"])
+    return "detached" if branch == "HEAD" else branch
+
+
+def get_git_short_sha() -> str:
+    return run_git_value(["rev-parse", "--short", "HEAD"])
 
 
 def get_base_version() -> str:
@@ -78,16 +104,28 @@ def save_state(state_file: Path, state: dict) -> None:
     state_file.write_text(json.dumps(state))
 
 
+_NUMERIC_PREFIX_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)")
+
+
 def resolve_version(base_version: str, state: dict | None, firmware_hash: str) -> tuple[str, dict]:
-    """Return (tag_name, new_state), bumping the patch only when the hash changed."""
+    """Return (tag_name, new_state), bumping the patch only when the hash changed.
+
+    The emitted tag embeds the build date, git branch, and short SHA (same
+    shape as scripts/git_branch.py's CROSSPOINT_VERSION) so the OTA screen
+    shows which build is on offer. isUpdateNewer only compares the numeric
+    major.minor.patch prefix, so the patch still has to be bumped on every
+    hash change -- otherwise two same-day builds on the same branch would
+    look identical to that comparison.
+    """
     base_major, base_minor, base_patch = (int(part) for part in base_version.split(".")[:3])
 
     if state and state.get("sha256") == firmware_hash:
         return state["version"], state
 
     prev_version = state.get("version") if state else None
-    if prev_version:
-        prev_major, prev_minor, prev_patch = (int(part) for part in prev_version.split(".")[:3])
+    prev_match = _NUMERIC_PREFIX_RE.match(prev_version) if prev_version else None
+    if prev_match:
+        prev_major, prev_minor, prev_patch = (int(g) for g in prev_match.groups())
     else:
         prev_major = prev_minor = prev_patch = None
 
@@ -99,7 +137,10 @@ def resolve_version(base_version: str, state: dict | None, firmware_hash: str) -
         # freshly-flashed device.
         new_patch = base_patch + 1
 
-    new_version = f"{base_major}.{base_minor}.{new_patch}"
+    date_stamp = datetime.date.today().strftime("%Y%m%d")
+    branch = get_git_branch()
+    short_sha = get_git_short_sha()
+    new_version = f"{base_major}.{base_minor}.{new_patch}-{date_stamp}-{branch}-{short_sha}"
     return new_version, {"sha256": firmware_hash, "version": new_version}
 
 
@@ -188,6 +229,7 @@ def main():
     ip = local_ip()
     print(f"[local_ota_server] serving {firmware_path}")
     print(f"[local_ota_server] base version (platformio.ini): {base_version}")
+    print(f"[local_ota_server] build tag: {get_git_branch()}/{get_git_short_sha()} (date-stamped per manifest request)")
     print(f"[local_ota_server] listening on {args.host}:{args.port}")
     print()
     print("Add to [env:default] build_flags in the gitignored platformio.local.ini:")

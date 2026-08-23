@@ -1,12 +1,13 @@
 """
-PlatformIO pre-build script: inject git branch and short SHA into
+PlatformIO pre-build script: inject git branch, short SHA, and build date into
 CROSSPOINT_VERSION for development environments.
 
-Results in a version string like:  1.1.0-dev-feat-kosync-xpath-05c6cf8
+Results in a version string like:  1.1.0-20260823-feat-kosync-xpath-05c6cf8
 Release environments are unaffected; they set CROSSPOINT_VERSION in the ini.
 """
 
 import configparser
+import datetime
 import os
 import subprocess
 import sys
@@ -86,7 +87,8 @@ def inject_version(env):
     base_version = get_base_version(project_dir)
     branch = get_git_branch(project_dir)
     short_sha = get_git_short_sha(project_dir)
-    version_string = f'{base_version}-dev-{branch}-{short_sha}'
+    date_stamp = datetime.date.today().strftime('%Y%m%d')
+    version_string = f'{base_version}-{date_stamp}-{branch}-{short_sha}'
 
     env.Append(CPPDEFINES=[('CROSSPOINT_VERSION', f'\\"{version_string}\\"')])
     print(f'CrossPoint build version: {version_string}')
