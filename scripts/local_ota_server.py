@@ -54,10 +54,24 @@ FIRMWARE_PATH = "/firmware.bin"
 state_lock = threading.Lock()
 
 
-def run_git_value(args: list[str], fallback: str = "unknown") -> str:
+def find_repo_root(build_dir: Path) -> Path:
+    """Walk up from --build-dir to the repo that actually produced the
+    firmware (identified by platformio.ini), falling back to the script's
+    own location. --build-dir/--state-file can point at a different
+    checkout than this script lives in (e.g. a dev-tooling worktree serving
+    a firmware built in the main personal-integration tree) -- REPO_ROOT
+    would silently report the wrong branch/sha/base-version in that case.
+    """
+    for candidate in [build_dir.resolve(), *build_dir.resolve().parents]:
+        if (candidate / "platformio.ini").is_file():
+            return candidate
+    return REPO_ROOT
+
+
+def run_git_value(repo_root: Path, args: list[str], fallback: str = "unknown") -> str:
     try:
         value = subprocess.check_output(
-            ["git", *args], text=True, stderr=subprocess.DEVNULL, cwd=REPO_ROOT
+            ["git", *args], text=True, stderr=subprocess.DEVNULL, cwd=repo_root
         ).strip()
         # Strip characters that would break a C string literal / JSON string.
         return "".join(c for c in value if c not in '"\\')
@@ -65,17 +79,17 @@ def run_git_value(args: list[str], fallback: str = "unknown") -> str:
         return fallback
 
 
-def get_git_branch() -> str:
-    branch = run_git_value(["rev-parse", "--abbrev-ref", "HEAD"])
+def get_git_branch(repo_root: Path) -> str:
+    branch = run_git_value(repo_root, ["rev-parse", "--abbrev-ref", "HEAD"])
     return "detached" if branch == "HEAD" else branch
 
 
-def get_git_short_sha() -> str:
-    return run_git_value(["rev-parse", "--short", "HEAD"])
+def get_git_short_sha(repo_root: Path) -> str:
+    return run_git_value(repo_root, ["rev-parse", "--short", "HEAD"])
 
 
-def get_base_version() -> str:
-    ini_text = (REPO_ROOT / "platformio.ini").read_text()
+def get_base_version(repo_root: Path) -> str:
+    ini_text = (repo_root / "platformio.ini").read_text()
     match = re.search(r"^\[crosspoint\]\s*\nversion\s*=\s*(\S+)", ini_text, re.MULTILINE)
     if not match:
         sys.exit("Could not find [crosspoint] version in platformio.ini")
@@ -107,7 +121,7 @@ def save_state(state_file: Path, state: dict) -> None:
 _NUMERIC_PREFIX_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)")
 
 
-def resolve_version(base_version: str, state: dict | None, firmware_hash: str) -> tuple[str, dict]:
+def resolve_version(base_version: str, state: dict | None, firmware_hash: str, repo_root: Path) -> tuple[str, dict]:
     """Return (tag_name, new_state), bumping the patch only when the hash changed.
 
     The emitted tag embeds the build date, git branch, and short SHA (same
@@ -138,8 +152,8 @@ def resolve_version(base_version: str, state: dict | None, firmware_hash: str) -
         new_patch = base_patch + 1
 
     date_stamp = datetime.date.today().strftime("%Y%m%d")
-    branch = get_git_branch()
-    short_sha = get_git_short_sha()
+    branch = get_git_branch(repo_root)
+    short_sha = get_git_short_sha(repo_root)
     new_version = f"{base_major}.{base_minor}.{new_patch}-{date_stamp}-{branch}-{short_sha}"
     return new_version, {"sha256": firmware_hash, "version": new_version}
 
@@ -155,7 +169,7 @@ def local_ip() -> str:
         s.close()
 
 
-def make_handler(firmware_path: Path, state_file: Path, base_version: str):
+def make_handler(firmware_path: Path, state_file: Path, base_version: str, repo_root: Path):
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
             sys.stderr.write("[local_ota_server] " + (fmt % args) + "\n")
@@ -166,7 +180,7 @@ def make_handler(firmware_path: Path, state_file: Path, base_version: str):
             with state_lock:
                 firmware_hash = sha256_file(firmware_path)
                 state = load_state(state_file)
-                version, new_state = resolve_version(base_version, state, firmware_hash)
+                version, new_state = resolve_version(base_version, state, firmware_hash, repo_root)
                 if new_state != state:
                     save_state(state_file, new_state)
             manifest = {
@@ -221,15 +235,17 @@ def main():
 
     firmware_path = Path(args.build_dir) / "firmware.bin"
     state_file = Path(args.state_file)
-    base_version = get_base_version()
+    repo_root = find_repo_root(Path(args.build_dir))
+    base_version = get_base_version(repo_root)
 
-    handler = make_handler(firmware_path, state_file, base_version)
+    handler = make_handler(firmware_path, state_file, base_version, repo_root)
     server = http.server.ThreadingHTTPServer((args.host, args.port), handler)
 
     ip = local_ip()
     print(f"[local_ota_server] serving {firmware_path}")
+    print(f"[local_ota_server] firmware repo: {repo_root}")
     print(f"[local_ota_server] base version (platformio.ini): {base_version}")
-    print(f"[local_ota_server] build tag: {get_git_branch()}/{get_git_short_sha()} (date-stamped per manifest request)")
+    print(f"[local_ota_server] build tag: {get_git_branch(repo_root)}/{get_git_short_sha(repo_root)} (date-stamped per manifest request)")
     print(f"[local_ota_server] listening on {args.host}:{args.port}")
     print()
     print("Add to [env:default] build_flags in the gitignored platformio.local.ini:")
