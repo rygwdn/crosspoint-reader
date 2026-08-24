@@ -77,6 +77,12 @@ void SettingsActivity::rebuildSettingsLists() {
       }
       controlsSettings.push_back(setting);
     } else if (setting.category == StrId::STR_CAT_SYSTEM) {
+      // Only meaningful on boards with an I2C fuel gauge: the ADC voltage
+      // path already estimates from voltage unconditionally.
+      if (setting.valuePtr == &CrossPointSettings::batteryUseVoltageEstimate &&
+          BoardConfig::ACTIVE.batteryGauge.gaugeAddr == 0) {
+        continue;
+      }
       systemSettings.push_back(setting);
     }
   }

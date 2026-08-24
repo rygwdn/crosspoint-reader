@@ -415,6 +415,7 @@ void setup() {
   HalSystem::checkPanic();
 
   SETTINGS.loadFromFile();
+  powerManager.setBatteryVoltageEstimateQuery([]() -> bool { return SETTINGS.batteryUseVoltageEstimate != 0; });
   DiskLogger::begin();
   // Both boot-time consumers of the frozen ring-buffer snapshot (checkPanic() above and
   // DiskLogger::begin() above) have run; release the transient heap copy.

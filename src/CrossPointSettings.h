@@ -268,6 +268,12 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
   uint8_t opdsFilenameFormat = 0;
   // Hide battery percentage
   uint8_t hideBatteryPercentage = HIDE_NEVER;
+  // Bypass the gauge's SoC register and estimate percentage from raw cell
+  // voltage instead. Opt-in escape hatch for gauge chips (e.g. BQ27220) whose
+  // CEDV algorithm can hard-correct SoC in a single abrupt step; voltage
+  // declines smoothly and is immune to that failure mode. Default off: the
+  // debounced gauge-SoC path remains the default behavior.
+  uint8_t batteryUseVoltageEstimate = 0;
   // Long-press page turn button behavior
   uint8_t longPressButtonBehavior = OFF;
   // Long-press Confirm function in EPUB reader (cycles through LONG_PRESS_MENU_FUNCTION values).
