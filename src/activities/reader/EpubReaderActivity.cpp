@@ -1,3 +1,4 @@
+#include <WakeMetrics.h>
 #include "EpubReaderActivity.h"
 
 #include <Epub/Page.h>
@@ -1597,6 +1598,7 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
     renderer.displayBuffer(HalDisplay::FAST_REFRESH);
     renderer.clearScreen();
   }
+  wakeMetricReaderTextStart(bookPath.c_str(), section && section->isBuilding());
 
   // Real content check (not just "has an image element" or "AA is on"):
   // render the BW frame once, tracking whether any pixel actually needed a

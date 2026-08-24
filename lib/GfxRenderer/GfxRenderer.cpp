@@ -1,3 +1,4 @@
+#include <WakeMetrics.h>
 #include "GfxRenderer.h"
 
 #include <BidiUtils.h>
@@ -22,6 +23,7 @@ namespace {
 uint8_t resolveSdCardStyle(const SdCardFont& font, const EpdFontFamily::Style style) {
   return font.resolveStyle(static_cast<uint8_t>(style));
 }
+constexpr int WAKE_MODE_GRAYSCALE_BASE = 3;
 }  // namespace
 
 namespace {
@@ -1685,21 +1687,28 @@ void GfxRenderer::displayBuffer(HalDisplay::RefreshMode refreshMode) const {
   auto elapsed = millis() - start_ms;
   LOG_DBG("GFX", "Time = %lu ms from clearScreen to displayBuffer", elapsed);
   refreshMode = applyPromotedRefresh(refreshMode);
+  wakeMetricWaveformStart(static_cast<int>(refreshMode));
   display.displayBuffer(refreshMode, fadingFix);
+  wakeMetricWaveformComplete(static_cast<int>(refreshMode));
 }
 
 void GfxRenderer::displayBufferAsync(HalDisplay::RefreshMode refreshMode) const {
   refreshMode = applyPromotedRefresh(refreshMode);
   // The async path has no turn-off-screen hook, which the sunlight fading fix
   // relies on; keep those users on the blocking path.
+  wakeMetricWaveformStart(static_cast<int>(refreshMode));
   if (fadingFix) {
     display.displayBuffer(refreshMode, fadingFix);
+    wakeMetricWaveformComplete(static_cast<int>(refreshMode));
     return;
   }
   display.displayBufferAsync(refreshMode);
 }
 
-void GfxRenderer::waitRefreshComplete() const { display.waitRefreshComplete(); }
+void GfxRenderer::waitRefreshComplete() const {
+  display.waitRefreshComplete();
+  wakeMetricWaveformComplete(static_cast<int>(HalDisplay::FAST_REFRESH));
+}
 
 bool GfxRenderer::supportsAsyncRefresh() const { return !fadingFix && display.supportsAsyncRefresh(); }
 
@@ -2203,7 +2212,9 @@ size_t GfxRenderer::getBufferSize() const { return frameBufferSize; }
 // void GfxRenderer::grayscaleRevert() const { display.grayscaleRevert(); }
 
 void GfxRenderer::displayGrayscaleBase(HalDisplay::RefreshMode fallback) const {
+  wakeMetricWaveformStart(WAKE_MODE_GRAYSCALE_BASE);
   display.displayGrayscaleBase(fallback, fadingFix);
+  wakeMetricWaveformComplete(WAKE_MODE_GRAYSCALE_BASE);
 }
 
 void GfxRenderer::preconditionGrayscale() const { display.preconditionGrayscale(); }

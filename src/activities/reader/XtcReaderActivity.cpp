@@ -1,3 +1,4 @@
+#include <WakeMetrics.h>
 #include "XtcReaderActivity.h"
 
 #include <DiskLogger.h>
@@ -407,6 +408,7 @@ void XtcReaderActivity::renderPage() {
     bitmapSourcePage = xtc->getSubpageGroups()[groupIndex].startPage;
   }
 
+
   if (bitDepth == 2) {
     // XTH needs the whole decoded canvas resident in RAM -- its grayscale
     // rendering below reads the same pixels across four separate passes, so
@@ -473,6 +475,7 @@ void XtcReaderActivity::renderPage() {
       free(patchBuffer);
     }
 
+    wakeMetricReaderTextStart(bookPath.c_str(), false);
     // Clear screen first
     renderer.clearScreen();
 
@@ -607,6 +610,7 @@ void XtcReaderActivity::renderPage() {
     }
   }
 
+  wakeMetricReaderTextStart(bookPath.c_str(), false);
   if (SETTINGS.statusBarSpec().xtcMode == CrossPointSettings::XTC_STATUS_BAR_MODE::XTC_STATUS_BAR_TOP) {
     renderStatusBarOverlay(renderer, StatusBarOverlayPosition::Top);
   } else {

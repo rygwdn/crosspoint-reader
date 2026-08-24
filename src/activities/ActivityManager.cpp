@@ -1,6 +1,7 @@
 #include "ActivityManager.h"
 
 #include <FontCacheManager.h>
+#include <WakeMetrics.h>
 #include <FsHelpers.h>
 #include <HalDisplay.h>
 #include <HalPowerManager.h>
@@ -10,6 +11,7 @@
 
 #include "CrossPointSettings.h"
 #include "OpdsServerStore.h"
+#include "RecentBooksStore.h"
 #include "boot_sleep/BootActivity.h"
 #include "boot_sleep/SleepActivity.h"
 #include "browser/OpdsBookBrowserActivity.h"
@@ -236,6 +238,7 @@ void ActivityManager::goToBrowser() {
 
 void ActivityManager::goToReader(std::string path, const bool allowFastInitialRefresh) {
   if (path.empty()) {
+    wakeMetricReaderConstructionFailed();
     goToFileBrowser("/");
     return;
   }
@@ -243,19 +246,24 @@ void ActivityManager::goToReader(std::string path, const bool allowFastInitialRe
   if (FsHelpers::hasBmpExtension(path) || FsHelpers::hasPngExtension(path)) {
     auto activity = makeUniqueNoThrow<BmpViewerActivity>(renderer, mappedInput, std::move(path));
     if (!activity) {
+      wakeMetricReaderConstructionFailed();
       LOG_ERR("ACT", "OOM: bitmap viewer activity");
       return;
     }
+    wakeMetricReaderConstructionFailed();
     replaceActivity(std::move(activity));
     return;
   }
 
   auto activity = ReaderActivity::create(renderer, mappedInput, std::move(path), allowFastInitialRefresh);
   if (activity) {
+    wakeMetricReaderConstructed(nullptr, allowFastInitialRefresh);
     replaceActivity(std::move(activity));
+  } else {
+    wakeMetricReaderConstructionFailed();
   }
-}
 
+}
 void ActivityManager::goToSleep(bool fromTimeout) {
   replaceActivity(std::make_unique<SleepActivity>(renderer, mappedInput, fromTimeout));
   loop();  // Important: sleep screen must be rendered immediately, the caller will go to sleep right after this returns
@@ -268,6 +276,7 @@ void ActivityManager::goToFullScreenMessage(std::string message, EpdFontFamily::
 }
 
 void ActivityManager::goHome(HomeMenuItem initialMenuItem, bool cleanInitialRefresh) {
+  wakeMetricHomeRouteRequested();
   if (initialMenuItem == HomeMenuItem::NONE && currentActivity) {
     const auto& activityName = currentActivity->name;
     if (activityName == "FileBrowser") {

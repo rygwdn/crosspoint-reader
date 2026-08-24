@@ -1,3 +1,4 @@
+#include <WakeMetrics.h>
 #include "TxtReaderActivity.h"
 
 #include <BidiUtils.h>
@@ -261,9 +262,10 @@ void TxtReaderActivity::renderBook() {
   size_t offset = pageOffsets[currentPage];
   size_t nextOffset;
   currentPageLines.clear();
-  loadPageAtOffset(renderer, offset, currentPageLines, nextOffset);
+  const bool pageLoaded = loadPageAtOffset(renderer, offset, currentPageLines, nextOffset);
 
   renderer.clearScreen();
+  if (pageLoaded && !currentPageLines.empty()) wakeMetricReaderTextStart(bookPath.c_str(), false);
   renderPage(renderer);
 
   // Save progress

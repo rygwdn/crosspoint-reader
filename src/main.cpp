@@ -14,6 +14,7 @@
 #include <HalTiltSensor.h>
 #include <I18n.h>
 #include <Logging.h>
+#include <WakeMetrics.h>
 #include <SPI.h>
 #include <WiFi.h>
 #include <XteinkDetect.h>
@@ -37,7 +38,6 @@
 #include "activities/settings/SdFirmwareUpdateActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
-#include "images/LoadingIcon.h"
 #include "util/ButtonNavigator.h"
 #include "util/ScreenshotUtil.h"
 
@@ -247,10 +247,6 @@ void enterDeepSleep(bool fromTimeout = false) {
   HalPowerManager::Lock powerLock;  // Ensure we are at normal CPU frequency for sleep preparation
   APP_STATE.lastSleepFromReader = activityManager.isReaderActivity();
 
-  const bool isQuickResumeSleep =
-      SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::QUICK_RESUME ||
-      (fromTimeout &&
-       SETTINGS.quickResumeSleepScreen == CrossPointSettings::QUICK_RESUME_SLEEP_SCREEN::QUICK_RESUME_AFTER_TIMEOUT);
   // Every sleep mode leaves a complete retained frame on the e-ink panel. Keep
   // it visible until the first useful reader or home paint replaces it.
   APP_STATE.showBootScreen = false;
@@ -262,12 +258,13 @@ void enterDeepSleep(bool fromTimeout = false) {
   deepSleepInProgress = true;
   activityManager.goToSleep(fromTimeout);
 
-  if (isQuickResumeSleep) {
-    saveSleepFrameBuffer();
-  } else if (Storage.exists(SLEEP_FRAME_FILE)) {
-    // A stale Quick Resume frame must not replace the selected sleep screen during wake.
-    Storage.remove(SLEEP_FRAME_FILE);
-  }
+  // Persist whatever SleepActivity just painted: deep sleep never touches
+  // the panel, so on wake it is still physically showing exactly this
+  // frame. The SplashlessWake case below uses the saved frame to resync
+  // the display controller's differential baseline against the real
+  // on-panel content, so the reader's first page after wake can use a
+  // fast partial refresh instead of a full-quality one.
+  saveSleepFrameBuffer();
 
   // Force any log lines buffered since the last 16-line flush out to disk now --
   // deep sleep is the natural end of a session, and otherwise they'd sit in the
@@ -287,7 +284,6 @@ void enterDeepSleep(bool fromTimeout = false) {
 
   powerManager.startDeepSleep(gpio);
 }
-
 void setupDisplayAndFonts(bool seamless = false) {
 #if !FREEINK_MCU_C3
   // C3 resolves its controller in HalGPIO::begin() before SPI claims the
@@ -303,6 +299,7 @@ void setupDisplayAndFonts(bool seamless = false) {
 #endif
 
   display.begin(seamless);
+  wakeMetricDisplayBeginComplete(seamless);
   renderer.begin();
   activityManager.begin();
   LOG_DBG("MAIN", "Display initialized");
@@ -335,6 +332,7 @@ void setupDisplayAndFonts(bool seamless = false) {
 }
 
 void setup() {
+  wakeMetricBootStart(static_cast<int>(esp_reset_reason()));
   BoardConfig::holdPowerRails();
 
 #ifdef ENABLE_SERIAL_LOG
@@ -366,6 +364,7 @@ void setup() {
   powerManager.begin();
 
   const auto wakeupReason = gpio.getWakeupReason();
+  wakeMetricGpioClassified(static_cast<int>(wakeupReason));
   if (wakeupReason == HalGPIO::WakeupReason::PowerButton && !gpio.verifyPowerButtonWakeup()) {
     powerManager.startDeepSleep(gpio);
   }
@@ -395,35 +394,14 @@ void setup() {
 
   HalSystem::checkPanic();
 
+  // Only what's actually needed to verify the wake and paint the restored-page /
+  // splash screen loads here. DiskLogger, clock reconciliation, RECENT_BOOKS,
+  // KOREADER_STORE, OPDS_STORE, and ButtonNavigator wiring are all SD reads (or
+  // paired with one) that nothing before the first paint touches, so they're
+  // deferred to right after the paint below — see the block following the
+  // `switch (resume)` paint below.
+  SETTINGS.loadFromFile();
   powerManager.setBatteryVoltageEstimateQuery([]() -> bool { return SETTINGS.batteryUseVoltageEstimate != 0; });
-  DiskLogger::begin();
-  // Both boot-time consumers of the frozen ring-buffer snapshot (checkPanic() above and
-  // DiskLogger::begin() above) have run; release the transient heap copy.
-  clearBootLogSnapshot();
-
-  // Single combined line (not several): the RTC ring buffer only holds 16 lines total,
-  // so multiple boot-info lines here would crowd out genuine crash context. LOG_INF (not
-  // LOG_DBG) so this survives in gh_release/gh_release_rc builds (LOG_LEVEL=1). Placed
-  // after DiskLogger::begin() so it flows into the live disk-log path for this boot.
-  LOG_INF("BOOT", "CrossPoint %s | %s | heap free=%u/%u min=%u maxAlloc=%u", CROSSPOINT_VERSION,
-          gpio.deviceIsX3() ? "X3" : "X4", ESP.getFreeHeap(), ESP.getHeapSize(), ESP.getMinFreeHeap(),
-          ESP.getMaxAllocHeap());
-
-  // Reconcile the persisted "clock has been synced" flag with the RTC's actual
-  // state: if it lost backup power since the last sync, halClock.getTime() now
-  // fails (see Rtc.cpp OSF check), so the flag would otherwise keep claiming
-  // "Clock Synced" in Settings > Customise Status Bar for a clock that isn't.
-  // This only ever clears the flag (never sets it) — WifiSelectionActivity's own
-  // getTime() check is what actually triggers a re-sync.
-  if (SETTINGS.clockHasBeenSynced && halClock.isAvailable()) {
-    uint8_t rtcHour = 0;
-    uint8_t rtcMinute = 0;
-    if (!halClock.getTime(rtcHour, rtcMinute)) {
-      SETTINGS.clockHasBeenSynced = 0;
-      SETTINGS.saveToFile();
-    }
-  }
-
   APP_STATE.loadFromFile();
   const bool isSleepWake = wakeupReason == HalGPIO::WakeupReason::PowerButton;
   const bool isPersistedSleepWake = isSleepWake && !APP_STATE.showBootScreen;
@@ -431,14 +409,8 @@ void setup() {
   if (recoveryFirmwareMode) {
     LOG_INF("MAIN", "Recovery firmware mode (%s + POWER held at boot)", BoardConfig::isX4Pro() ? "DOWN" : "UP");
   }
-
-  SETTINGS.loadFromFile();
-  RECENT_BOOKS.loadFromFile();
   I18N.setLanguage(static_cast<Language>(SETTINGS.language));
-  KOREADER_STORE.loadFromFile();
-  OPDS_STORE.loadFromFile();
   UITheme::getInstance().reload();
-  ButtonNavigator::setMappedInputManager(mappedInputManager);
 
   // Brightness and warmth are always restored. A normal wake starts with the
   // light off unless Restore Light on Wake is enabled; silent maintenance
@@ -470,10 +442,9 @@ void setup() {
 
   LOG_DBG("MAIN", "Starting CrossPoint version " CROSSPOINT_VERSION);
 
-  // Resolve the single boot-presentation decision. Skipping the splash also
-  // skips the panel-clearing pass and the X3 initial-full-sync arming (see
-  // HalDisplay::begin), so the first paint is FAST_REFRESH (~500ms) over the
-  // retained frame and input dispatches against a visible UI.
+  // Skipping the splash avoids an intermediate splash paint. The retained-frame
+  // path lets the reader route paint directly; the display driver decides the
+  // first waveform and may promote it based on synchronization state.
   // Only a verified deep-sleep wake may use the one-shot persisted flag.
   // Otherwise a stale flag could suppress the splash on a cold boot.
   const BootResume resume = isSilentReboot         ? BootResume::Silent
@@ -496,20 +467,17 @@ void setup() {
       APP_STATE.showBootScreen = true;
       APP_STATE.saveToFile();
       if (Storage.exists(SLEEP_FRAME_FILE) && loadSleepFrameBuffer()) {
-        const bool useDifferentialRefresh = gpio.deviceIsX3();
-        if (useDifferentialRefresh) {
-          // begin() clears the X3 controller RAM, so restore the saved frame as
-          // the baseline before replacing the moon with the loading icon.
+        // Deep sleep never touches the panel, so it is still physically
+        // showing this exact frame right now; no paint is needed to make
+        // it visible again. The real activity's own first paint below
+        // replaces this frame shortly.
+        if (gpio.deviceIsX3()) {
+          // begin() clears the X3 controller RAM; resync its differential
+          // baseline from the restored frame (a RAM write over SPI, not a
+          // physical refresh) so later differential refreshes have a valid
+          // baseline. The first wake paint is still driver-promoted to HALF.
           renderer.cleanupGrayscaleWithFrameBuffer();
-        }
-
-        const auto pageHeight = renderer.getScreenHeight();
-        renderer.drawImage(LoadingIcon, 0, pageHeight - LOADINGICON_HEIGHT, LOADINGICON_WIDTH, LOADINGICON_HEIGHT);
-        if (useDifferentialRefresh) {
-          renderer.displayGrayscaleBase(HalDisplay::FAST_REFRESH);
           allowFastInitialReaderRefresh = true;
-        } else {
-          renderer.displayBuffer(HalDisplay::HALF_REFRESH);
         }
       } else {
         // The first Home/Reader paint is followed by an explicit clean refresh
@@ -525,29 +493,66 @@ void setup() {
   // Output polarity is resolved per render by ActivityManager (night mode
   // inverts only the reading surfaces), so nothing to restore here.
 
+  // Deferred from before the paint above (see the comment there): none of this is
+  // needed to verify the wake or paint the restored-page / splash screen, only for
+  // the routing decision and activities below.
+  DiskLogger::begin();
+  // Both boot-time consumers of the frozen ring-buffer snapshot (checkPanic() above and
+  // DiskLogger::begin() above) have run; release the transient heap copy.
+  clearBootLogSnapshot();
+
+  // Single combined line (not several): the RTC ring buffer only holds 16 lines total,
+  // so multiple boot-info lines here would crowd out genuine crash context. LOG_INF (not
+  // LOG_DBG) so this survives in gh_release/gh_release_rc builds (LOG_LEVEL=1). Placed
+  // after DiskLogger::begin() so it flows into the live disk-log path for this boot.
+  LOG_INF("BOOT", "CrossPoint %s | %s | heap free=%u/%u min=%u maxAlloc=%u", CROSSPOINT_VERSION,
+          gpio.deviceIsX3() ? "X3" : "X4", ESP.getFreeHeap(), ESP.getHeapSize(), ESP.getMinFreeHeap(),
+          ESP.getMaxAllocHeap());
+
+  // Reconcile the persisted "clock has been synced" flag with the RTC's actual
+  // state: if it lost backup power since the last sync, halClock.getTime() now
+  // fails (see Rtc.cpp OSF check), so the flag would otherwise keep claiming
+  // "Clock Synced" in Settings > Customise Status Bar for a clock that isn't.
+  // This only ever clears the flag (never sets it) — WifiSelectionActivity's own
+  // getTime() check is what actually triggers a re-sync.
+  if (SETTINGS.clockHasBeenSynced && halClock.isAvailable()) {
+    uint8_t rtcHour = 0;
+    uint8_t rtcMinute = 0;
+    if (!halClock.getTime(rtcHour, rtcMinute)) {
+      SETTINGS.clockHasBeenSynced = 0;
+      SETTINGS.saveToFile();
+    }
+  }
+
+  RECENT_BOOKS.loadFromFile();
+  KOREADER_STORE.loadFromFile();
+  OPDS_STORE.loadFromFile();
+  ButtonNavigator::setMappedInputManager(mappedInputManager);
+
   if (recoveryFirmwareMode) {
     // Skip normal home/reader routing: jump straight into the SD firmware picker.
+    wakeMetricRoute("recovery", "-", resume == BootResume::SplashlessWake ? "splashless_wake" : resume == BootResume::Silent ? "silent" : "splash");
     activityManager.replaceActivity(
         std::make_unique<SdFirmwareUpdateActivity>(renderer, mappedInputManager, /*recoveryMode=*/true));
   } else if (rebootedFromPanic) {
-    // If we rebooted from a panic, go to crash report screen to show the panic info
+    wakeMetricRoute("crash", "-", resume == BootResume::SplashlessWake ? "splashless_wake" : resume == BootResume::Silent ? "silent" : "splash");
     activityManager.goToCrashReport();
   } else if (resume == BootResume::Silent && snapshotTarget == SILENT_REBOOT_TARGET_READER &&
              !APP_STATE.openEpubPath.empty()) {
+    wakeMetricRoute("reader", APP_STATE.openEpubPath.c_str(), "silent");
     activityManager.goToReader(APP_STATE.openEpubPath);
   } else if (resume == BootResume::Silent) {
-    // target == home (or reader with no open book): land on home — don't fall
-    // through to the sleep-wake "resume reader" logic, which fires on stale
-    // openEpubPath + lastSleepFromReader from a prior session.
+    wakeMetricRoute("home", "-", "silent");
     activityManager.goHome();
   } else if (APP_STATE.openEpubPath.empty() || !APP_STATE.lastSleepFromReader ||
              mappedInputManager.isPressed(MappedInputManager::Button::Back) || APP_STATE.readerActivityLoadCount > 0) {
     // Boot to home screen if no book is open, last sleep was not from reader, back button is held, or reader activity
     // crashed (indicated by readerActivityLoadCount > 0)
+    wakeMetricRoute("home", "-", resume == BootResume::SplashlessWake ? "splashless_wake" : "splash");
     activityManager.goHome(HomeMenuItem::NONE, needsWakeRefresh);
   } else {
-    // Clear app state to avoid getting into a boot loop if the epub doesn't load
     const auto path = APP_STATE.openEpubPath;
+    wakeMetricRoute("reader", path.c_str(), resume == BootResume::SplashlessWake ? "splashless_wake" : "splash");
     APP_STATE.openEpubPath = "";
     APP_STATE.readerActivityLoadCount++;
     APP_STATE.saveToFile();

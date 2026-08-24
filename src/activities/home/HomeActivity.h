@@ -71,11 +71,14 @@ class HomeActivity final : public Activity {
   void loadRecentCovers(int coverHeight);
 
  public:
+  // Both declared here, defined out-of-line in the .cpp after
+  // RecentBooksStore.h is visible: the constructor's exception-unwind path
+  // for already-constructed members (recentBooks) and the destructor both
+  // need RecentBook's complete type, and RecentBook is only forward-declared
+  // above.
   explicit HomeActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
-                        HomeMenuItem initialMenuItemValue = HomeMenuItem::NONE, bool cleanInitialRefresh = false)
-      : Activity("Home", renderer, mappedInput),
-        initialMenuItem(initialMenuItemValue),
-        cleanInitialRefresh(cleanInitialRefresh) {}
+                        HomeMenuItem initialMenuItemValue = HomeMenuItem::NONE, bool cleanInitialRefresh = false);
+  ~HomeActivity() override;
   void onEnter() override;
   void onExit() override;
   void loop() override;
