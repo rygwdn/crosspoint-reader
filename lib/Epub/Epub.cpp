@@ -343,8 +343,16 @@ void Epub::parseCssFiles() const {
     Storage.remove(tmpCssPath.c_str());
   }
 
-  // Save to cache for next time
-  if (!cssParser->saveToCache()) {
+  // Save to cache for next time. Skip persisting when CSS files existed but
+  // parsing yielded zero rules (e.g. hit the heap gate or size cap above) --
+  // that degenerate result should be retried on the next load, not calcified
+  // as a permanently "valid" empty cache. A book with genuinely no CSS files
+  // still caches 0 rules as before.
+  const bool degenerateEmptyParse = !cssFiles.empty() && cssParser->ruleCount() == 0;
+  if (degenerateEmptyParse) {
+    LOG_DBG("EBP", "Not caching degenerate 0-rule CSS parse (had %zu CSS files); will retry next load",
+            cssFiles.size());
+  } else if (!cssParser->saveToCache()) {
     LOG_ERR("EBP", "Failed to save CSS rules to cache");
   }
 
