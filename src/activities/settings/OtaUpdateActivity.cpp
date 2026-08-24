@@ -106,7 +106,14 @@ void OtaUpdateActivity::render(RenderLock&&) {
 
   renderer.clearScreen();
 
-  GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, tr(STR_UPDATE));
+  // Self-hosted manifest server (scripts/local_ota_server.py) instead of the
+  // upstream GitHub release feed -- surface which one so it's obvious this
+  // isn't checking the real release channel.
+  const std::string manifestServerLabel = OtaUpdater::usesCustomManifestServer()
+                                              ? std::string(tr(STR_OTA_SERVER)) + OtaUpdater::manifestServerHost()
+                                              : std::string();
+  GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, tr(STR_UPDATE),
+                 manifestServerLabel.empty() ? nullptr : manifestServerLabel.c_str());
   const auto height = renderer.getLineHeight(UI_10_FONT_ID);
   const auto top = (pageHeight - height) / 2;
 

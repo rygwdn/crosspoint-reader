@@ -37,4 +37,12 @@ class OtaUpdater {
   const std::string& getLatestVersion() const;
   OtaUpdaterError checkForUpdate();
   OtaUpdaterError installUpdate(ProgressCallback onProgress = nullptr, void* ctx = nullptr);
+
+  // True when OTA_MANIFEST_URL was overridden away from the upstream GitHub
+  // Releases API (see scripts/local_ota_server.py), i.e. this build checks a
+  // self-hosted manifest server instead.
+  static bool usesCustomManifestServer();
+  // host[:port] parsed out of the configured manifest URL, for UI display
+  // when usesCustomManifestServer() is true.
+  static std::string manifestServerHost();
 };
