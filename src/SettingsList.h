@@ -345,6 +345,8 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
                             "moveFinishedToReadFolder", StrId::STR_CAT_SYSTEM),
         SettingInfo::Toggle(StrId::STR_DISK_LOGS, &CrossPointSettings::diskLogsEnabled, "diskLogsEnabled",
                             StrId::STR_CAT_SYSTEM),
+        SettingInfo::Toggle(StrId::STR_BATTERY_VOLTAGE_ESTIMATE, &CrossPointSettings::batteryUseVoltageEstimate,
+                            "batteryUseVoltageEstimate", StrId::STR_CAT_SYSTEM),
 
         // OPDS download folder: persisted + web-exposed, but category-less so it
         // is hidden from the on-device Settings screen (edited via OPDS UI).
