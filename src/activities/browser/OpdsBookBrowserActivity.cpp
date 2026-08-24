@@ -490,6 +490,14 @@ void OpdsBookBrowserActivity::downloadBook(const OpdsEntry& book) {
   filename += opdsBookFilename(book.author, book.title, static_cast<OpdsFilenameFormat>(SETTINGS.opdsFilenameFormat));
   LOG_DBG("OPDS", "Downloading: %s -> %s", downloadUrl.c_str(), filename.c_str());
 
+  // Snapshot the pre-existing file's size (if any) before downloadToFile()
+  // deletes+overwrites it, so a re-download of unchanged content doesn't
+  // unconditionally nuke an already-warm book cache below.
+  HalFile existingFile;
+  const bool hadExistingFile = Storage.openFileForRead("OPDS", filename, existingFile);
+  const size_t existingFileSize = hadExistingFile ? existingFile.fileSize() : 0;
+  if (hadExistingFile) existingFile.close();
+
   int lastRenderedPercent = -1;
   unsigned long lastProgressUpdateMs = 0;
   const auto result = HttpDownloader::downloadToFile(
@@ -522,7 +530,13 @@ void OpdsBookBrowserActivity::downloadBook(const OpdsEntry& book) {
       &cancelDownload, server.username, server.password);
 
   if (result == HttpDownloader::OK) {
-    clearBookCache(filename);
+    // Only invalidate the book cache when the downloaded content actually
+    // changed size from what was already on disk at this path; an unchanged
+    // re-download (e.g. re-fetching an already-owned OPDS title) should not
+    // force a full cold rebuild of an already-warm cache.
+    if (!hadExistingFile || existingFileSize != downloadProgress) {
+      clearBookCache(filename);
+    }
     state = BrowserState::BROWSING;
   } else if (result == HttpDownloader::ABORTED) {
     // User cancelled; the partial file is already removed. Back to the list,
