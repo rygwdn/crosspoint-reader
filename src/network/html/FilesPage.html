@@ -5395,6 +5395,11 @@ async function squashCssToClasses(xhtmlString, chapterPath, cssTextByPath) {
     for (const el of elements) {
       if (el.hasAttribute('class')) { el.removeAttribute('class'); changed = true; }
     }
+    // `elements` only walks body's descendants (querySelectorAll('*') never
+    // includes the element it was called on) - body's own class attribute
+    // is otherwise never visited, leaving dead cruft behind once the
+    // original stylesheet it referenced is gone.
+    if (doc.body.hasAttribute('class')) { doc.body.removeAttribute('class'); changed = true; }
 
     // Styling is now fully baked into style="" attributes — the only
     // per-element CSS the device actually parses (see the block comment
